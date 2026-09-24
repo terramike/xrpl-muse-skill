@@ -43,7 +43,7 @@ FAUCETS = {
     "testnet": "https://faucet.altnet.rippletest.net/accounts",
     "devnet": "https://faucet.devnet.rippletest.net/accounts",
 }
-# RLUSD issuer (Ripple's stablecoin issuer on mainnet)
+# RLUSD issuer from grid-wizard's own .env (terramike/grid-wizard)
 RLUSD_ISSUER = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
 
 try:
@@ -114,7 +114,7 @@ def dec(s, name):
 
 def currency_code(code: str) -> str:
     # 3-char codes pass through; anything else (e.g. RLUSD) is hex160-encoded
-    # per the XRP Ledger convention for non-3-char currency codes.
+    # the same way grid-wizard does it.
     code = code.upper()
     if len(code) == 3 and code.isascii() and code.isalnum():
         return code
@@ -276,8 +276,8 @@ def cmd_buy(args, cfg, client):
     cost = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
     tx = OfferCreate(
         account=wallet.classic_address,
-        taker_pays=iou_amount("RLUSD", issuer, cost),
-        taker_gets=xrp_amount(amt),
+        taker_pays=xrp_amount(amt),
+        taker_gets=iou_amount("RLUSD", issuer, cost),
     )
     print(f"BUY {amt} XRP @ {price} RLUSD = {cost} RLUSD [{cfg['network']}]")
     submit_and_report(tx, client, wallet, args.dry_run)
@@ -291,8 +291,8 @@ def cmd_sell(args, cfg, client):
     proceeds = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
     tx = OfferCreate(
         account=wallet.classic_address,
-        taker_pays=xrp_amount(amt),
-        taker_gets=iou_amount("RLUSD", issuer, proceeds),
+        taker_pays=iou_amount("RLUSD", issuer, proceeds),
+        taker_gets=xrp_amount(amt),
     )
     print(f"SELL {amt} XRP @ {price} RLUSD = {proceeds} RLUSD [{cfg['network']}]")
     submit_and_report(tx, client, wallet, args.dry_run)
