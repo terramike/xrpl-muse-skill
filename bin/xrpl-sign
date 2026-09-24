@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""xrpl-sign v0.2: the POLICY-GATED SIGNER half of the hardened XRPL skill.
+
+This is the only program that ever sees the wallet seed. It signs NOTHING
+unless ALL of these hold:
+
+  1. A proposal built by `xrpl-trade` exists, its hash recomputes exactly,
+     and it is younger than the policy TTL (no stale approvals).
+  2. The proposal's network matches the policy's network_lock
+     (default: testnet — mainnet proposals hard-fail until you opt in).
+  3. Every non-XRP token in the transaction is in the approved allowlist,
+     extracted from the TX JSON itself (raw-issuer bypass impossible).
+  4. Fee <= max_fee_drops. Offers carry an Expiration.
+  5. Offer limit price is within max_deviation_bps of the live book mid.
+  6. Payments go only to destination_allowlist addresses.
+  7. Per-transaction and daily XRP caps hold.
+  8. A human passed --approve for THIS EXACT hash. Without it, this program
+     only checks policy and prints the summary — it never signs.
+
+Seed: read from the XRPL_SEED environment variable (preferred — never hits
+disk) or legacy ~/.xrpl/config.json (mode 0600). The derived address must
+match the proposal's account, or signing is refused.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from decimal import Decimal
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import xrpl_common as C
+
+try:
+    from xrpl.models.currencies import IssuedCurrency, XRP
+    from xrpl.models.requests import BookOffers
+    from xrpl.transaction import submit_and_wait
+    from xrpl.utils import drops_to_xrp
+    from xrpl.wallet import Wallet
+except ImportError:
+    sys.exit("xrpl-py not installed. Run: pip install -r requirements.txt")
+
+
+# ---------- policy ----------
+
+def cmd_init_policy(_args):
+    if C.POLICY_PATH.exists():
+        sys.exit(f"Policy already exists: {C.POLICY_PATH} (edit it directly)")
+    C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
+    C.POLICY_PATH.write_text(json.dumps(C.DEFAULT_POLICY, indent=2))
+    os.chmod(C.POLICY_PATH, 0o600)
+    print(f"Wrote default policy to {C.POLICY_PATH}:")
+    print(json.dumps(C.DEFAULT_POLICY, indent=2))
+    print("\nMainnet is LOCKED OUT by default (network_lock=testnet).")
+    print("To allow mainnet, set \"network_lock\": \"mainnet\" — and fund a")
+    print("dedicated limited-funds wallet. Lower the XRP caps to taste.")
+
+
+def check_policy(proposal, policy, client):
+    """Return a list of denial reasons (empty = pass). Never signs."""
+    denials = []
+    tx = proposal["tx"]
+    ttype = tx.get("TransactionType")
+
+    # 1. network lock
+    if proposal["network"] != policy["network_lock"]:
+        denials.append(
+            f"network {proposal['network']!r} != policy network_lock "
+            f"{policy['network_lock']!r}")
+
+    # 2. allowlist: token identities from the TX JSON itself
+    allowed = C.approved_token_set()
+    for ccy, iss in C.tx_tokens(tx):
+        if (ccy, iss) not in allowed:
+            denials.append(f"token {ccy}.{str(iss)[:12]}… not in approved allowlist")
+
+    # 3. fee cap
+    fee_drops = int(tx.get("Fee", "0"))
+    if fee_drops > policy["max_fee_drops"]:
+        denials.append(f"fee {fee_drops} drops > max {policy['max_fee_drops']}")
+
+    # 4. offers must expire
+    if ttype == "OfferCreate" and "Expiration" not in tx:
+        denials.append("OfferCreate without Expiration")
+
+    # 5. offer price vs live mid
+    if ttype == "OfferCreate":
+        meta = proposal.get("meta", {})
+        if not meta.get("price"):
+            denials.append("offer proposal missing price metadata")
+        else:
+            dev_denial = check_deviation(client, meta, policy)
+            if dev_denial:
+                denials.append(dev_denial)
+
+    # 6. payment destination allowlist
+    if ttype == "Payment":
+        dest = tx.get("Destination", "")
+        if dest not in policy["destination_allowlist"]:
+            denials.append(
+                f"destination {dest[:12]}… not in destination_allowlist "
+                f"({len(policy['destination_allowlist'])} entries)")
+
+    # 7. XRP caps
+    at_risk = C.tx_xrp_at_risk(tx) + C.tx_fee_xrp(tx)
+    if at_risk > Decimal(str(policy["per_tx_max_xrp"])):
+        denials.append(f"tx risk {at_risk} XRP > per_tx_max {policy['per_tx_max_xrp']}")
+    st = C.load_state()
+    day_spent = Decimal(st.get("spent_xrp", "0"))
+    if day_spent + at_risk > Decimal(str(policy["daily_max_xrp"])):
+        denials.append(
+            f"daily spend would be {day_spent + at_risk} XRP "
+            f"> daily_max {policy['daily_max_xrp']} (already spent {day_spent})")
+
+    return denials, at_risk
+
+
+def check_deviation(client, meta, policy):
+    """Offer limit vs live book mid. Fail closed when the book is empty."""
+    base, bi = meta["base"], meta.get("base_issuer")
+    quote, qi = meta["quote"], meta.get("quote_issuer")
+    price = Decimal(meta["price"])
+
+    def cur(ccy, iss):
+        if ccy == "XRP":
+            return XRP()
+        return IssuedCurrency(currency=C.currency_code(ccy), issuer=iss)
+
+    base_c, quote_c = cur(base, bi), cur(quote, qi)
+    asks = client.request(BookOffers(taker_gets=base_c, taker_pays=quote_c,
+                                     limit=5, ledger_index="validated"))
+    bids = client.request(BookOffers(taker_gets=quote_c, taker_pays=base_c,
+                                     limit=5, ledger_index="validated"))
+    if not (asks.is_successful() and bids.is_successful()):
+        return "could not fetch book for deviation check (fail closed)"
+    ao, bo = asks.result.get("offers", []), bids.result.get("offers", [])
+
+    def px(o, pay_f, get_f):
+        pay, get = o[pay_f], o[get_f]
+        qv = Decimal(pay["value"]) if isinstance(pay, dict) else Decimal(drops_to_xrp(pay))
+        bv = Decimal(get["value"]) if isinstance(get, dict) else Decimal(drops_to_xrp(get))
+        return qv / bv
+
+    mids = []
+    if ao:
+        mids.append(px(ao[0], "TakerPays", "TakerGets"))
+    if bo:
+        mids.append(px(bo[0], "TakerGets", "TakerPays"))
+    if not mids:
+        return "empty book — cannot verify price (fail closed)"
+    mid = sum(mids) / len(mids)
+    dev_bps = abs(price - mid) / mid * 10000
+    if dev_bps > policy["max_deviation_bps"]:
+        return (f"limit {price} deviates {dev_bps:.0f} bps from mid {mid:.6f} "
+                f"> max {policy['max_deviation_bps']} bps")
+    return None
+
+
+# ---------- signing ----------
+
+def load_seed():
+    seed = os.environ.get("XRPL_SEED")
+    if seed:
+        return seed, "XRPL_SEED"
+    if C.CONFIG_PATH.exists():
+        cfg = json.loads(C.CONFIG_PATH.read_text())
+        if cfg.get("seed"):
+            return cfg["seed"], str(C.CONFIG_PATH)
+    sys.exit("No seed. Set XRPL_SEED (preferred) or keep a seed in "
+             f"{C.CONFIG_PATH}.")
+
+
+def cmd_sign(args):
+    proposal, path = C.load_proposal(args.hash)
+    tx = proposal["tx"]
+
+    # hash recomputes? (tamper check)
+    if C.canonical_hash(tx) != proposal["proposal_hash"]:
+        sys.exit("Proposal file was modified after creation — refusing.")
+
+    # proposal TTL
+    policy = C.load_policy()
+    age = int(time.time()) - proposal["created_at"]
+    if age > policy["proposal_ttl_seconds"]:
+        sys.exit(f"Proposal is {age // 3600}h old (TTL "
+                 f"{policy['proposal_ttl_seconds'] // 3600}h) — rebuild it.")
+
+    client = C.make_client(proposal["network"])
+    denials, at_risk = check_policy(proposal, policy, client)
+
+    print("=" * 60)
+    print(f"PROPOSAL {proposal['proposal_hash'][:16]}… "
+          f"({age // 60}m old, {proposal['network']})")
+    print("=" * 60)
+    for ln in proposal["summary"]:
+        print("  " + ln)
+    print(f"  xrp at risk (incl. fee): {at_risk}")
+    print("=" * 60)
+
+    if denials:
+        print("POLICY DENIED:")
+        for d in denials:
+            print(f"  ✗ {d}")
+        C.audit(proposal["action"], proposal["proposal_hash"], None,
+                proposal["network"], tx["Account"], "policy_denied",
+                "; ".join(denials))
+        sys.exit(1)
+    print("policy: PASS")
+
+    if not args.approve:
+        print("\nNot approved. Re-run with --approve to sign & submit.")
+        print("Only do this after a human has reviewed the exact hash above.")
+        return
+
+    # --- the point of no return: independent human approval was given ---
+    seed, src = load_seed()
+    try:
+        wallet = Wallet.from_seed(seed)
+    except Exception:
+        sys.exit("Seed invalid.")
+    if wallet.classic_address != tx["Account"]:
+        sys.exit(f"Seed derives {wallet.classic_address}, but proposal is for "
+                 f"{tx['Account']} — refusing (wallet/config mismatch).")
+    del seed
+
+    from xrpl.models.transactions import Transaction
+    tx_obj = Transaction.from_xrpl(tx)  # tx stored in PascalCase wire format
+    print(f"\nSigning with {src} as {wallet.classic_address} …")
+    resp = submit_and_wait(tx_obj, client, wallet)
+    res = resp.result
+    meta = res.get("meta", {})
+    tres = meta.get("TransactionResult", "?")
+    validated = res.get("validated", False)
+    thash = res.get("hash", "?")
+    net = "livenet" if proposal["network"] == "mainnet" else "testnet"
+    print(f"validated: {validated}")
+    print(f"result:    {tres}")
+    print(f"hash:      {thash}")
+    print(f"explorer:  https://{net}.xrpl.org/transactions/{thash}")
+
+    ok = validated and tres == "tesSUCCESS"
+    C.audit(proposal["action"], proposal["proposal_hash"], thash,
+            proposal["network"], tx["Account"],
+            "applied" if ok else f"failed:{tres}", "")
+    if ok:
+        st = C.load_state()
+        st["spent_xrp"] = str(Decimal(st.get("spent_xrp", "0")) + at_risk)
+        C.save_state(st)
+        path.unlink()  # proposal consumed
+    else:
+        sys.exit(f"Not applied: {tres}")
+
+
+def cmd_list(_args):
+    if not C.PROPOSALS_DIR.exists():
+        print("No proposals.")
+        return
+    for p in sorted(C.PROPOSALS_DIR.glob("*.json")):
+        d = json.loads(p.read_text())
+        age_m = (int(time.time()) - d["created_at"]) // 60
+        print(f"{d['proposal_hash'][:16]}…  {d['action']:10} "
+              f"{d['network']:8} {age_m}m old")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="xrpl-sign",
+                                 description="Policy-gated XRPL signer.")
+    ap.add_argument("--hash", default=None, help="proposal hash (prefix ok)")
+    ap.add_argument("--approve", action="store_true",
+                    help="HUMAN approval of this exact hash: sign & submit")
+    ap.add_argument("--list", action="store_true", help="pending proposals")
+    ap.add_argument("cmd", nargs="?", choices=["init-policy"],
+                    help="init-policy: write the default policy file")
+    args = ap.parse_args()
+    if args.cmd == "init-policy":
+        cmd_init_policy(args)
+    elif args.list:
+        cmd_list(args)
+    elif args.hash:
+        cmd_sign(args)
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
