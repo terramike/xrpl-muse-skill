@@ -1,88 +1,68 @@
-# XRPL Trading Skill for Muse
+# xrpl-muse-skill v0.2
 
-Trade on the XRP Ledger from your terminal, with your Muse as co-pilot:
-check XRP and token balances, view RLUSD/XRP order books, manage
-trustlines, place and cancel offers, send payments. Built on the official
-[`xrpl-py`](https://github.com/XRPLF/xrpl-py) library.
+Trade the XRP Ledger from the terminal — any token pair — with a hard safety
+boundary between **proposing** a trade and **signing** it.
 
-## Safety first
+Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
+terminal), but safe for humans too.
 
-- **Read-only commands** (`balance`, `quote`, `offers`) run freely.
-- **Every write** (`trustline`, `buy`, `sell`, `cancel`, `send`) needs your
-  explicit approval in the moment — side, amount, price/total, network —
-  before anything is submitted. A general "go trade" never covers a
-  specific order.
-- **Start on testnet.** Only move to mainnet deliberately, with a
-  **dedicated, limited-funds wallet** — never your main holdings.
-- Your seed is typed hidden, verified against your address, and stored at
-  `~/.xrpl/config.json` with mode `0600`. It never appears in chat, logs,
-  or shared files. Back it up yourself (password manager) — nobody else
-  can recover it for you.
-- `--dry-run` prints the exact transaction JSON without submitting
-  anything. Use it for previews.
+## The idea
+
+Most trading tools ask the agent to "ask the human first" and hope it does.
+This skill splits the job in two:
+
+- **`xrpl-trade`** builds the transaction, autofills it against the live
+  network, shows you *everything* (account, network, assets + issuers,
+  amounts, limit price, max spend, fee, expiry), hashes the exact bytes, and
+  stops. It never sees your seed. It cannot submit.
+- **`xrpl-sign`** is the only program that touches the seed (from the
+  `XRPL_SEED` env var). It re-verifies the proposal hash, enforces a policy
+  file (network lock, approved issuers, spend caps, fee caps, price-deviation
+  checks, destination allowlist), and signs **only** with explicit human
+  `--approve` of that exact hash.
+
+```bash
+xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
+# → full proposal + hash. Nothing submitted.
+
+xrpl-sign --hash a2c72140d080ca0f --approve
+# → policy checks → sign → validated ledger result → audit log
+```
+
+## Why the allowlist matters
+
+Tickers mean nothing on the XRP Ledger — anyone can mint a fake "ARMY".
+This skill trades **pair names mapped to vetted issuer addresses**, and the
+signer extracts token identities from the transaction JSON itself, so raw
+issuer arguments can't bypass it.
+
+Live at launch: `XRP/RLUSD, BTC/XRP, XLM/XRP, ARMY/XRP, PHNIX/XRP, BCHAMP/XRP,
+FUZZY/XRP`
 
 ## Install
 
 ```bash
-git clone https://github.com/terramike/xrpl-muse-skill.git ~/workspace/skills/xrpl
-pip install -r ~/workspace/skills/xrpl/requirements.txt
+pip install -r requirements.txt
+xrpl-trade setup            # address + network (no seed stored)
+export XRPL_SEED='s…'       # only the signer reads this
+xrpl-sign init-policy       # policy file, testnet-locked by default
 ```
 
-Then tell your Muse: *"set up my XRPL wallet on testnet"* — or run it
-yourself:
+Testnet funds: `xrpl-trade faucet --network testnet`
 
-```bash
-~/workspace/skills/xrpl/bin/xrpl-trade setup
-```
+## What it does
 
-## Testnet walkthrough (do this first)
+- **Read:** balances, order books for any pair, open offers, issuer risk
+  inspection (domain, transfer fees, freeze flags), trade planning
+  (estimated fill, price impact, max spend), transaction reconciliation.
+- **Write (all gated):** limit buys/sells, trustlines, offer cancels, payments
+  with destination-tag and X-address support.
 
-```bash
-bin/xrpl-trade faucet            # fresh testnet wallet + test XRP (prints seed once — save it)
-bin/xrpl-trade setup             # choose testnet, paste address + seed
-bin/xrpl-trade balance           # check it
-bin/xrpl-trade quote             # live XRP/RLUSD order book
-bin/xrpl-trade quote --pair ARMY/XRP  # any approved pair
-bin/xrpl-trade --dry-run buy --amount 10 --price 1.50   # preview only, submits nothing
-```
+## Security
 
-## Mainnet
-
-When you're ready — and only with a dedicated limited-funds wallet:
-
-```bash
-bin/xrpl-trade setup             # choose mainnet this time
-bin/xrpl-trade --network mainnet balance
-bin/xrpl-trade --network mainnet trustline --currency RLUSD   # needs your approval each run
-bin/xrpl-trade --network mainnet buy --amount 10 --price 1.50 # needs your approval each run
-```
-
-Global flags go before the subcommand: `--network mainnet`,
-`--dry-run`.
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| `setup` | Interactive wallet setup (hidden seed prompt, verifies seed ↔ address) |
-| `balance [address]` | XRP + trustline balances |
-| `quote [--pair NAME] [--limit N]` | Top-of-book bids & asks for any pair |
-| `trustline --currency RLUSD [--issuer ADDR] [--limit N]` | Create/adjust a trustline (TrustSet) |
-| `buy --amount <BASE> --price <QUOTE/BASE> [--pair NAME]` | Buy BASE with QUOTE at a limit price |
-| `sell --amount <BASE> --price <QUOTE/BASE> [--pair NAME]` | Sell BASE for QUOTE at a limit price |
-| `offers [address]` | Open offers with sequence numbers |
-| `cancel --seq N` | Cancel an open offer |
-| `send --to <addr> --amount <n> [--ccy XRP]` | Send XRP or an IOU |
-| `faucet` | Fund a fresh testnet/devnet wallet |
-
-RLUSD issuer default: `rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De`.
-
-## Companion dashboard
-
-A read-only web dashboard (live order book, wallet panel, trade-ticket
-previews that copy exact CLI commands): it pairs with this skill and
-needs no backend. Host the single HTML file anywhere static.
+See [SECURITY.md](SECURITY.md) — including the advisory that versions before
+commit `c3273e59` shipped inverted buy/sell and must not be used for trading.
 
 ## License
 
-MIT — do your own diligence; trading real assets carries real risk.
+MIT — see [LICENSE](LICENSE).
