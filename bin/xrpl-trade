@@ -49,7 +49,7 @@ RLUSD_ISSUER = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
 try:
     from xrpl.clients import JsonRpcClient
     from xrpl.models.amounts import IssuedCurrencyAmount
-    from xrpl.models.currencies import XRP
+    from xrpl.models.currencies import IssuedCurrency, XRP
     from xrpl.models.requests import (
         AccountInfo, AccountLines, AccountOffers, BookOffers, ServerInfo,
     )
@@ -153,6 +153,67 @@ def fmt_amt(a):
     return f"{drops_to_xrp(a)} XRP"
 
 
+APPROVED_PATH = Path.home() / ".xrpl" / "approved.json"
+
+
+def load_approved():
+    try:
+        return json.loads(APPROVED_PATH.read_text()).get("pairs", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def resolve_pair(args):
+    """Return (base, base_issuer, quote, quote_issuer).
+
+    --pair NAME resolves through ~/.xrpl/approved.json (vetted issuers only).
+    Otherwise --base/--quote with explicit issuers; RLUSD defaults to its
+    known issuer on whichever side it appears.
+    """
+    if getattr(args, "pair", None):
+        name = args.pair.upper()
+        pairs = load_approved()
+        if name not in pairs:
+            known = ", ".join(sorted(pairs)) or "none"
+            sys.exit(f"unknown pair {name!r}. Approved: {known} (see {APPROVED_PATH})")
+        p = pairs[name]
+        return p["base"].upper(), p.get("base_issuer"), p["quote"].upper(), p.get("quote_issuer")
+    base = args.base.upper()
+    quote = args.quote.upper()
+    base_issuer = getattr(args, "base_issuer", None)
+    quote_issuer = getattr(args, "quote_issuer", None)
+    legacy = getattr(args, "issuer", None)
+    if legacy and not (base_issuer or quote_issuer):
+        # old single --issuer flag: applies to the non-XRP side
+        if base != "XRP" and quote == "XRP":
+            base_issuer = legacy
+        else:
+            quote_issuer = legacy
+    if base == "RLUSD" and not base_issuer:
+        base_issuer = RLUSD_ISSUER
+    if quote == "RLUSD" and not quote_issuer:
+        quote_issuer = RLUSD_ISSUER
+    return base, base_issuer, quote, quote_issuer
+
+
+def make_amount(ccy, issuer, value: Decimal):
+    if ccy == "XRP":
+        return xrp_amount(value)
+    if not issuer:
+        sys.exit(f"issuer required for {ccy} "
+                 f"(pass --base-issuer/--quote-issuer or use --pair)")
+    return iou_amount(ccy, issuer, value)
+
+
+def make_currency(ccy, issuer):
+    if ccy == "XRP":
+        return XRP()
+    if not issuer:
+        sys.exit(f"issuer required for {ccy} "
+                 f"(pass --base-issuer/--quote-issuer or use --pair)")
+    return IssuedCurrency(currency=currency_code(ccy), issuer=issuer)
+
+
 def submit_and_report(tx, client, wallet, dry_run):
     if dry_run:
         print(json.dumps(tx.to_dict(), indent=2, default=str))
@@ -233,13 +294,10 @@ def amt_value(a):
 
 
 def cmd_quote(args, cfg, client):
-    issuer = args.issuer or RLUSD_ISSUER
-    base, quote = args.base.upper(), args.quote.upper()
+    base, base_issuer, quote, quote_issuer = resolve_pair(args)
     lim = args.limit
-    base_is_xrp = base == "XRP"
-    quote_is_xrp = quote == "XRP"
-    base_amt = XRP() if base_is_xrp else iou_amount(base, issuer, Decimal(1))
-    quote_amt = XRP() if quote_is_xrp else iou_amount(quote, issuer, Decimal(1))
+    base_amt = make_currency(base, base_issuer)
+    quote_amt = make_currency(quote, quote_issuer)
     # asks: offers selling BASE (taker gets BASE, pays QUOTE)
     asks = book_side(client, base_amt, quote_amt, lim)
     # bids: offers buying BASE (taker gets QUOTE, pays BASE)
@@ -258,44 +316,64 @@ def cmd_quote(args, cfg, client):
 
 def cmd_trustline(args, cfg, client):
     wallet = get_wallet(cfg)
-    issuer = args.issuer or RLUSD_ISSUER
+    if getattr(args, "pair", None):
+        base, base_issuer, _, _ = resolve_pair(args)
+        if base == "XRP":
+            sys.exit("XRP needs no trustline; use --pair with a token base.")
+        currency, issuer = base, base_issuer
+    else:
+        currency, issuer = args.currency, args.issuer or RLUSD_ISSUER
     limit = dec(args.limit, "limit")
     tx = TrustSet(
         account=wallet.classic_address,
-        limit_amount=iou_amount(args.currency, issuer, limit),
+        limit_amount=iou_amount(currency, issuer, limit),
     )
-    print(f"TrustSet {args.currency}.{issuer[:8]}… limit {limit} [{cfg['network']}]")
+    print(f"TrustSet {currency}.{issuer[:8]}… limit {limit} [{cfg['network']}]")
     submit_and_report(tx, client, wallet, args.dry_run)
 
 
 def cmd_buy(args, cfg, client):
     wallet = get_wallet(cfg)
-    issuer = args.issuer or RLUSD_ISSUER
-    amt = dec(args.amount, "amount")      # amount of XRP to buy
-    price = dec(args.price, "price")      # RLUSD per XRP
+    base, base_issuer, quote, quote_issuer = resolve_pair(args)
+    amt = dec(args.amount, "amount")      # amount of BASE to buy
+    price = dec(args.price, "price")      # QUOTE per BASE
     cost = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
     tx = OfferCreate(
         account=wallet.classic_address,
-        taker_pays=xrp_amount(amt),
-        taker_gets=iou_amount("RLUSD", issuer, cost),
+        taker_pays=make_amount(base, base_issuer, amt),
+        taker_gets=make_amount(quote, quote_issuer, cost),
     )
-    print(f"BUY {amt} XRP @ {price} RLUSD = {cost} RLUSD [{cfg['network']}]")
+    print(f"BUY {amt} {base} @ {price} {quote} = {cost} {quote} [{cfg['network']}]")
     submit_and_report(tx, client, wallet, args.dry_run)
 
 
 def cmd_sell(args, cfg, client):
     wallet = get_wallet(cfg)
-    issuer = args.issuer or RLUSD_ISSUER
-    amt = dec(args.amount, "amount")      # amount of XRP to sell
-    price = dec(args.price, "price")      # RLUSD per XRP
+    base, base_issuer, quote, quote_issuer = resolve_pair(args)
+    amt = dec(args.amount, "amount")      # amount of BASE to sell
+    price = dec(args.price, "price")      # QUOTE per BASE
     proceeds = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
     tx = OfferCreate(
         account=wallet.classic_address,
-        taker_pays=iou_amount("RLUSD", issuer, proceeds),
-        taker_gets=xrp_amount(amt),
+        taker_pays=make_amount(quote, quote_issuer, proceeds),
+        taker_gets=make_amount(base, base_issuer, amt),
     )
-    print(f"SELL {amt} XRP @ {price} RLUSD = {proceeds} RLUSD [{cfg['network']}]")
+    print(f"SELL {amt} {base} @ {price} {quote} = {proceeds} {quote} [{cfg['network']}]")
     submit_and_report(tx, client, wallet, args.dry_run)
+
+
+def cmd_pairs(args, cfg, client):
+    pairs = load_approved()
+    if not pairs:
+        print(f"No approved pairs. Create {APPROVED_PATH}, e.g.:")
+        print('{"pairs": {"ARMY/XRP": {"base": "ARMY", "base_issuer": "r...", '
+              '"quote": "XRP", "quote_issuer": null}}}')
+        return
+    for name in sorted(pairs):
+        p = pairs[name]
+        bi = (p.get("base_issuer") or "native")[:12]
+        qi = (p.get("quote_issuer") or "native")[:12]
+        print(f"{name}: {p['base']} ({bi}) / {p['quote']} ({qi})")
 
 
 def cmd_offers(args, cfg, client):
@@ -366,21 +444,33 @@ def main():
     sub.add_parser("setup", help="store wallet (hidden seed prompt, mode 0600)")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
-    p = sub.add_parser("quote", help="order book top-of-book")
+    p = sub.add_parser("quote", help="order book top-of-book for any pair")
+    p.add_argument("--pair", default=None, help="approved pair name, e.g. ARMY/XRP")
     p.add_argument("--base", default="XRP"); p.add_argument("--quote", default="RLUSD")
-    p.add_argument("--issuer", default=None, help="IOU issuer (default: RLUSD issuer)")
+    p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
+    p.add_argument("--issuer", default=None, help="legacy: IOU issuer for the non-XRP side")
     p.add_argument("--limit", type=int, default=5)
+    p = sub.add_parser("pairs", help="list approved trading pairs")
     p = sub.add_parser("trustline", help="create/adjust a trustline")
+    p.add_argument("--pair", default=None, help="approved pair name (trustlines the base token)")
     p.add_argument("--currency", default="RLUSD"); p.add_argument("--issuer", default=None)
     p.add_argument("--limit", default="1000000")
-    p = sub.add_parser("buy", help="buy XRP with RLUSD at a limit price")
-    p.add_argument("--amount", required=True, help="XRP to buy")
-    p.add_argument("--price", required=True, help="RLUSD per XRP")
-    p.add_argument("--issuer", default=None)
-    p = sub.add_parser("sell", help="sell XRP for RLUSD at a limit price")
-    p.add_argument("--amount", required=True, help="XRP to sell")
-    p.add_argument("--price", required=True, help="RLUSD per XRP")
-    p.add_argument("--issuer", default=None)
+    p = sub.add_parser("buy", help="buy BASE with QUOTE at a limit price")
+    p.add_argument("--pair", default=None, help="approved pair name, e.g. ARMY/XRP")
+    p.add_argument("--base", default="XRP", help="asset to buy (default XRP)")
+    p.add_argument("--quote", default="RLUSD", help="asset to pay with (default RLUSD)")
+    p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
+    p.add_argument("--amount", required=True, help="amount of BASE to buy")
+    p.add_argument("--price", required=True, help="QUOTE per BASE")
+    p.add_argument("--issuer", default=None, help="legacy: IOU issuer for the non-XRP side")
+    p = sub.add_parser("sell", help="sell BASE for QUOTE at a limit price")
+    p.add_argument("--pair", default=None, help="approved pair name, e.g. ARMY/XRP")
+    p.add_argument("--base", default="XRP", help="asset to sell (default XRP)")
+    p.add_argument("--quote", default="RLUSD", help="asset to receive (default RLUSD)")
+    p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
+    p.add_argument("--amount", required=True, help="amount of BASE to sell")
+    p.add_argument("--price", required=True, help="QUOTE per BASE")
+    p.add_argument("--issuer", default=None, help="legacy: IOU issuer for the non-XRP side")
     p = sub.add_parser("offers", help="list open offers")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
     p = sub.add_parser("cancel", help="cancel an open offer")
@@ -403,6 +493,7 @@ def main():
         "setup": lambda: cmd_setup(args),
         "balance": lambda: cmd_balance(args, cfg, client),
         "quote": lambda: cmd_quote(args, cfg, client),
+        "pairs": lambda: cmd_pairs(args, cfg, client),
         "trustline": lambda: cmd_trustline(args, cfg, client),
         "buy": lambda: cmd_buy(args, cfg, client),
         "sell": lambda: cmd_sell(args, cfg, client),
