@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xrpl-trade v0.3: the PROPOSER half of the hardened XRPL skill.
+"""xrpl-trade v0.4: the PROPOSER half of the hardened XRPL skill.
 
 This program NEVER sees the wallet seed and NEVER submits a transaction.
 Write commands (buy/sell/trustline/cancel/send) build the transaction,
@@ -123,6 +123,10 @@ def propose(tx, client, cfg, action, summary_lines):
     """Autofill, hash into a bound envelope, save. Never submits."""
     filled = autofill(tx, client)
     txd = filled.to_xrpl()  # PascalCase wire format (to_dict() is snake_case)
+    # Unsigned proposals must not carry signature material — autofill adds
+    # an empty SigningPubKey, which the signer's envelope invariants reject.
+    txd.pop("SigningPubKey", None)
+    txd.pop("TxnSignature", None)
     lines = [
         f"network:  {cfg['network']}",
         f"account:  {txd['Account']}",
@@ -401,15 +405,15 @@ def cmd_send(args, cfg, client):
 
 
 def cmd_setup(_args):
-    print("XRPL setup (v0.3). This stores ONLY your address and network.")
+    print("XRPL setup (v0.4). This stores ONLY your address and network.")
     print("The seed is never stored by xrpl-trade. In production the Muse")
     print("vault provides XRPL_SEED to the signer after human approval.\n")
     net = input("network [mainnet/testnet/devnet] (testnet): ").strip() or "testnet"
     if net not in C.NETWORKS:
         sys.exit("unknown network")
     address = input("classic address (r...): ").strip()
-    if not address.startswith("r"):
-        sys.exit("address must start with 'r'")
+    if not C.is_valid_classic_address(address):
+        sys.exit("not a valid XRPL classic address (base58 checksum failed)")
     C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
     cfg = {}
     if C.CONFIG_PATH.exists():

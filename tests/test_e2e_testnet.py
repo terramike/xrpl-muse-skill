@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""v0.3 testnet end-to-end: propose -> policy-check -> approve -> sign ->
+"""v0.4 testnet end-to-end: propose -> policy-check -> approve -> sign ->
 persist -> submit -> validated. Uses throwaway faucet wallets only.
 
-Swaps ~/.xrpl/{config,policy,audit.log,state}.json aside and restores them
-after, so Mike's mainnet setup is untouched. Seeds stay in process memory
-and are passed to the signer via XRPL_SEED env — never printed or logged.
+Isolation (v0.4): the test runs with HOME pointed at a fresh
+tempfile.TemporaryDirectory(), so it never touches the operator's real
+~/.xrpl — no file swapping, no fixed /tmp backup dir. It tests the
+repository checkout it lives in (BIN resolved from __file__), not whatever
+happens to be installed. Seeds stay in process memory and are passed to
+the signer via XRPL_SEED env — never printed or logged.
 """
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,11 +28,9 @@ for _k in ("no_proxy", "NO_PROXY"):
     if _v:
         os.environ[_k] = ",".join(p for p in _v.split(",") if "[" not in p)
 
-HOME = Path.home()
-XRPL = HOME / ".xrpl"
-SKILL_BIN = HOME / "workspace" / "skills" / "xrpl" / "bin"
-PYP = str(HOME / "workspace" / "tools" / "xrpl-pkgs")
-BAK = Path("/tmp/xrpl-e2e-bak")
+# The checkout under test — not an installed copy.
+SKILL_BIN = Path(__file__).resolve().parent.parent / "bin"
+PYP = str(Path.home() / "workspace" / "tools" / "xrpl-pkgs")
 
 CHECKS = []
 
@@ -39,8 +40,9 @@ def check(name, cond):
     print(("PASS " if cond else "FAIL ") + name)
 
 
-def run(cmd, **kw):
+def run(cmd, home, **kw):
     env = dict(os.environ)
+    env["HOME"] = str(home)  # isolate: signer sees an empty ~/.xrpl
     env["PYTHONPATH"] = PYP + os.pathsep + env.get("PYTHONPATH", "")
     env.update(kw.pop("extra_env", {}))
     p = subprocess.run(cmd, capture_output=True, text=True, env=env,
@@ -75,16 +77,13 @@ def balance_xrp(addr):
 
 
 def main():
-    BAK.mkdir(exist_ok=True)
-    saved = {}
-    for f in ("config.json", "policy.json", "audit.log", "state.json"):
-        src = XRPL / f
-        if src.exists():
-            dst = BAK / f
-            shutil.copy2(src, dst)
-            saved[f] = dst
+    with tempfile.TemporaryDirectory(prefix="xrpl-e2e-") as td:
+        home = Path(td)
+        xrpl = home / ".xrpl"
+        xrpl.mkdir(parents=True)
+        check("isolated HOME has no pre-existing state",
+              not (xrpl / "policy.json").exists())
 
-    try:
         print("== faucet wallets ==")
         addr_a, seed_a = faucet()
         addr_b, _seed_b = faucet()
@@ -92,8 +91,9 @@ def main():
               addr_a.startswith("r") and addr_b.startswith("r")
               and addr_a != addr_b)
 
-        (XRPL / "config.json").write_text(json.dumps(
+        (xrpl / "config.json").write_text(json.dumps(
             {"network": "testnet", "address": addr_a}))
+        (xrpl / "config.json").chmod(0o600)
         policy = {
             "policy_version": 3,
             "network_lock": "testnet",
@@ -102,15 +102,22 @@ def main():
             "destination_allowlist": [
                 {"address": addr_b, "destination_tag": None}],
             "max_deviation_bps": 1000,
+            "max_spread_bps": 1000,
+            "min_book_depth": "5",
+            "max_offer_lifetime_seconds": 86400,
             "proposal_ttl_seconds": 86400,
             "allowed_tx_types": ["OfferCreate", "OfferCancel",
                                  "TrustSet", "Payment"],
         }
-        (XRPL / "policy.json").write_text(json.dumps(policy))
+        (xrpl / "policy.json").write_text(json.dumps(policy))
+        (xrpl / "policy.json").chmod(0o600)
+        (xrpl / "approved.json").write_text(json.dumps({"pairs": {}}))
+        (xrpl / "approved.json").chmod(0o600)
 
         print("== propose ==")
         p = run([sys.executable, str(SKILL_BIN / "xrpl-trade"),
-                 "send", "--to", addr_b, "--amount", "1", "--ccy", "XRP"])
+                 "send", "--to", addr_b, "--amount", "1", "--ccy", "XRP"],
+                home)
         m = re.search(r"proposal hash: ([0-9a-f]{64})", p.stdout)
         check("propose exits 0", p.returncode == 0)
         check("proposal hash emitted", bool(m))
@@ -118,14 +125,16 @@ def main():
             print(p.stdout[-2000:]); print(p.stderr[-2000:])
             return 1
         h = m.group(1)
-        prop_path = XRPL / "proposals" / (h + ".json")
+        prop_path = xrpl / "proposals" / (h + ".json")
         check("proposal file saved", prop_path.exists())
 
         print("== policy check, no approval ==")
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", h[:16]])
+                 "--hash", h[:16]], home)
         check("no-approve run exits 0", p.returncode == 0)
         check("policy PASS shown", "policy: PASS" in p.stdout)
+        check("full signing account displayed",
+              addr_a in p.stdout)
         check("nothing signed without approval",
               "Signed" not in p.stdout and "submitting" not in p.stdout)
 
@@ -133,7 +142,7 @@ def main():
         bal_before = balance_xrp(addr_b)
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
                  "--hash", h[:16], "--approve"],
-                extra_env={"XRPL_SEED": seed_a}, timeout=180)
+                home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         tm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("approve run exits 0", p.returncode == 0)
         check("signed hash reported", bool(tm))
@@ -146,7 +155,7 @@ def main():
 
         print("== reconcile ==")
         check("proposal consumed", not prop_path.exists())
-        audit = (XRPL / "audit.log").read_text()
+        audit = (xrpl / "audit.log").read_text()
         check("audit has signed entry",
               f'"result": "signed"' in audit and thash in audit)
         check("audit has applied entry",
@@ -162,27 +171,33 @@ def main():
                 pass
         check("recipient balance increased by 1 XRP",
               balance_xrp(addr_b) >= bal_before + 1 - 1e-9)
-        state = json.loads((XRPL / "state.json").read_text())
-        check("daily spend tracked",
-              float(state["totals"].get("XRP", 0)) >= 1.0)
+        state = json.loads((xrpl / "state.json").read_text())
+        spent = sum(float(e["amount"]) for e in state["entries"]
+                    if e["asset"] == "XRP")
+        check("daily spend tracked (rolling entries)",
+              spent >= 1.0)
+        check("confirmed entry references the tx hash",
+              any(e.get("tx_hash") == thash and e["status"] == "confirmed"
+                  for e in state["entries"]))
+        st_mode = (xrpl / "state.json").stat().st_mode & 0o777
+        check("state file is owner-only", st_mode == 0o600)
 
         print("== hostile proposal still denied ==")
         evil = {"TransactionType": "AccountSet", "Account": addr_a,
-                "Fee": "12", "Sequence": 1}
+                "Fee": "12", "Sequence": 1, "LastLedgerSequence": 999}
         sys.path.insert(0, str(SKILL_BIN))
         import xrpl_common as C
+        # point the module at the isolated dir (it read HOME at import)
+        C.XRPL_DIR = xrpl
+        C.PROPOSALS_DIR = xrpl / "proposals"
         eh, epath = C.save_proposal(evil, "testnet", addr_a, "evil")
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
                  "--hash", eh[:16], "--approve"],
-                extra_env={"XRPL_SEED": seed_a})
+                home, extra_env={"XRPL_SEED": seed_a})
         check("AccountSet denied even with --approve",
-              p.returncode != 0 and "DENIED" in p.stdout)
+              p.returncode != 0 and ("DENIED" in p.stdout
+                                     or "rejected" in p.stderr))
         epath.unlink(missing_ok=True)
-    finally:
-        for f, dst in saved.items():
-            shutil.copy2(dst, XRPL / f)
-        shutil.rmtree(BAK, ignore_errors=True)
-        print("== mainnet config/policy/audit/state restored ==")
 
     n_fail = sum(1 for _, ok in CHECKS if not ok)
     print(f"\n{len(CHECKS) - n_fail}/{len(CHECKS)} e2e checks passed")

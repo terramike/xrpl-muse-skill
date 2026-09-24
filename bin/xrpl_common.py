@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xrpl_common v0.3: shared helpers for xrpl-trade (proposer) and xrpl-sign.
+"""xrpl_common v0.4: shared helpers for xrpl-trade (proposer) and xrpl-sign.
 
 No network, no seeds here — parsing, encoding, hashing, summaries, policy
 loading, and the concurrency-safe spend tracker.
@@ -12,6 +12,16 @@ v0.3 hardening (see SECURITY.md):
   - Strict transaction-type allowlist + per-type field schemas.
   - Per-asset spend limits and exact-pair allowlist enforcement.
   - Atomic daily-limit reservation (crash/race safe).
+
+v0.4 hardening:
+  - True rolling-24h spend window: timestamped entries, not one bucket.
+  - Reservations stay PENDING through ambiguous submission outcomes;
+    released only on proven failure / proven non-inclusion (sweep_pending).
+  - Envelope invariants: account match, action<->type/orientation match,
+    required fields, no signature material in unsigned proposals,
+    created_at not from the future.
+  - NaN/Infinity amounts rejected (they poison limit comparisons).
+  - Signer refuses to run unless state files are owner-only.
 """
 import contextlib
 import fcntl
@@ -40,7 +50,7 @@ NETWORKS = {
 RIPPLE_EPOCH = 946684800  # unix seconds of 2000-01-01T00:00:00Z
 REQUIRE_DEST_TAG_FLAG = 0x00020000  # lsfRequireDestTag
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 POLICY_VERSION = 3
 ENVELOPE_FORMAT = "xrpl-proposal/3"
 # Fields covered by the proposal hash. Everything safety-critical lives here.
@@ -49,6 +59,10 @@ ENVELOPE_FORMAT = "xrpl-proposal/3"
 # them from the transaction.
 ENVELOPE_HASH_KEYS = ("format", "network", "account", "action",
                       "created_at", "policy_version", "tx_binary")
+# Rolling spend window, seconds.
+ROLLING_WINDOW = 86400
+# Max allowed clock skew for proposal created_at (seconds in the future).
+MAX_FUTURE_SKEW = 300
 
 
 def _sanitize_proxy_env():
@@ -73,6 +87,8 @@ def dec(s, name):
         d = Decimal(str(s))
     except (InvalidOperation, ValueError):
         sys.exit(f"Bad {name}: {s!r}")
+    if not d.is_finite():
+        sys.exit(f"{name} must be a finite number, got {s!r}.")
     if d <= 0:
         sys.exit(f"{name} must be positive.")
     return d
@@ -239,10 +255,69 @@ def verify_proposal(prop: dict, path) -> dict:
     tx = prop.get("tx")
     if not isinstance(tx, dict):
         raise ProposalError("proposal has no transaction")
-    if tx_binary(tx) != prop["tx_binary"]:
+    try:
+        encoded = tx_binary(tx)
+    except Exception as e:  # noqa: BLE001 — binary codec rejects NaN, etc.
+        raise ProposalError(
+            f"transaction cannot be canonically encoded ({e}) — refusing")
+    if encoded != prop["tx_binary"]:
         raise ProposalError(
             "transaction does not match the hash-bound binary — tampered")
     return tx
+
+
+def verify_envelope_invariants(prop: dict, tx: dict):
+    """Defense-in-depth checks on the envelope beyond the hash.
+
+    Raises ProposalError when the envelope is internally inconsistent:
+    account mismatch, action/type (or buy/sell orientation) mismatch,
+    missing required fields, signature material in an unsigned proposal,
+    or a created_at unreasonably far in the future.
+    """
+    if prop.get("account") != tx.get("Account"):
+        raise ProposalError(
+            f"envelope account {prop.get('account')!r} != transaction "
+            f"Account {tx.get('Account')!r} — refusing")
+    ttype = tx.get("TransactionType")
+    action = prop.get("action")
+    expected = {"OfferCreate": ("buy", "sell"), "TrustSet": ("trustline",),
+                "OfferCancel": ("cancel",), "Payment": ("send",)}
+    if action not in expected.get(ttype, ()):
+        raise ProposalError(
+            f"envelope action {action!r} does not match transaction type "
+            f"{ttype!r} — refusing")
+    for f in ("Account", "Fee", "Sequence", "LastLedgerSequence"):
+        if f not in tx:
+            raise ProposalError(
+                f"transaction missing required field {f!r} — refusing")
+    if "TxnSignature" in tx or "SigningPubKey" in tx:
+        raise ProposalError(
+            "unsigned proposal carries TxnSignature/SigningPubKey — refusing")
+    now = int(time.time())
+    if prop.get("created_at", 0) > now + MAX_FUTURE_SKEW:
+        raise ProposalError(
+            "proposal created_at is unreasonably far in the future — refusing")
+    if ttype == "OfferCreate" and action in ("buy", "sell"):
+        # orientation: buy <=> TakerPays is BASE, sell <=> TakerGets is BASE
+        pays, gets = tx.get("TakerPays"), tx.get("TakerGets")
+        pay_tok = norm_token(pays["currency"] if isinstance(pays, dict) else "XRP",
+                             pays.get("issuer") if isinstance(pays, dict) else None)
+        get_tok = norm_token(gets["currency"] if isinstance(gets, dict) else "XRP",
+                             gets.get("issuer") if isinstance(gets, dict) else None)
+        for p in load_approved().values():
+            base = norm_token(p["base"], p.get("base_issuer"))
+            quote = norm_token(p["quote"], p.get("quote_issuer"))
+            if base != quote and {base, quote} == {pay_tok, get_tok}:
+                want_buy = (pay_tok == base and get_tok == quote)
+                if action == "buy" and not want_buy:
+                    raise ProposalError(
+                        f"envelope says 'buy' but the offer gives BASE "
+                        f"({base[0]}) — orientation mismatch, refusing")
+                if action == "sell" and want_buy:
+                    raise ProposalError(
+                        f"envelope says 'sell' but the offer takes BASE "
+                        f"({base[0]}) — orientation mismatch, refusing")
+                break
 
 
 def load_proposal(prefix: str):
@@ -265,6 +340,15 @@ def fmt_amount(a) -> str:
 
 def short_addr(a: str) -> str:
     return a if len(a) <= 16 else f"{a[:8]}…{a[-4:]}"
+
+
+def is_valid_classic_address(addr: str) -> bool:
+    """Real XRPL base58-checksum validation, not startswith('r')."""
+    try:
+        from xrpl.core.addresscodec import is_valid_classic_address
+        return is_valid_classic_address(addr)
+    except ImportError:
+        return isinstance(addr, str) and addr.startswith("r")
 
 
 def describe_tx(tx: dict, action_hint: str = "?") -> list:
@@ -349,6 +433,55 @@ def validate_tx_shape(tx: dict, allowed_types) -> list:
     return problems
 
 
+def validate_amounts(tx: dict) -> list:
+    """Every amount/fee/sequence in the tx must be finite and sane.
+
+    NaN or Infinity would poison limit comparisons (NaN > limit is False),
+    so they are rejected outright — a fail-closed numeric boundary.
+    """
+    problems = []
+
+    def num(a, label, positive=True):
+        try:
+            v = amount_value(a)
+        except Exception:  # noqa: BLE001
+            return f"{label} is not a valid amount"
+        if not v.is_finite():
+            return f"{label} is not finite — refusing"
+        if positive and v <= 0:
+            return f"{label} must be positive"
+        return None
+
+    ttype = tx.get("TransactionType")
+    if ttype == "OfferCreate":
+        for f in ("TakerPays", "TakerGets"):
+            p = num(tx.get(f), f)
+            if p:
+                problems.append(p)
+    elif ttype == "Payment":
+        p = num(tx.get("Amount"), "Amount")
+        if p:
+            problems.append(p)
+    elif ttype == "TrustSet":
+        la = tx.get("LimitAmount", {})
+        try:
+            v = Decimal(str(la.get("value", "")))
+        except (InvalidOperation, ValueError, TypeError):
+            problems.append("LimitAmount value is not a valid number")
+            v = None
+        if v is not None and (not v.is_finite() or v < 0):
+            problems.append("LimitAmount must be a finite non-negative number")
+    for f in ("Fee", "Sequence", "LastLedgerSequence"):
+        raw = tx.get(f)
+        try:
+            iv = int(str(raw))
+            if iv <= 0:
+                problems.append(f"{f} must be a positive integer")
+        except (ValueError, TypeError):
+            problems.append(f"{f} must be a positive integer")
+    return problems
+
+
 # ---------- tx introspection (from tx JSON only) ----------
 
 def tx_tokens(tx):
@@ -407,6 +540,9 @@ DEFAULT_POLICY = {
     },
     "destination_allowlist": [],  # [{"address": "r…", "destination_tag": 7|null}]
     "max_deviation_bps": 1000,
+    "max_spread_bps": 1000,      # book bid/ask spread cap for price checks
+    "min_book_depth": "5",       # min pays-side depth per book side (base units)
+    "max_offer_lifetime_seconds": 86400,
     "proposal_ttl_seconds": 86400,
     "allowed_tx_types": DEFAULT_ALLOWED_TX_TYPES,
 }
@@ -427,11 +563,56 @@ def load_policy():
     return merged
 
 
+def check_protected_files():
+    """Fail closed unless signer state is owner-only.
+
+    The protected deployment boundary is: the xrpl-sign program itself,
+    policy.json, approved.json, state.json, state.lock, audit.log. (The
+    binary is a deployment concern — documented in SECURITY.md.) If the
+    agent can rewrite policy or delete state, daily limits are fiction.
+    Proposals stay agent-writable: they are treated as hostile input and
+    fully verified.
+    """
+    problems = []
+    try:
+        euid = os.geteuid()
+    except AttributeError:
+        return  # non-POSIX: deployment must protect these another way
+    for p in (POLICY_PATH, APPROVED_PATH, STATE_PATH, STATE_LOCK_PATH,
+              AUDIT_PATH):
+        if not p.exists():
+            continue
+        st = p.stat()
+        if st.st_uid != euid:
+            problems.append(f"{p} is not owned by the current user")
+        if st.st_mode & 0o077:
+            problems.append(
+                f"{p} is group/world-accessible "
+                f"(mode {oct(st.st_mode & 0o777)}) — run chmod 600")
+    if problems:
+        sys.exit("Signer state is not protected — refusing to sign:\n  "
+                 + "\n  ".join(problems))
+
+
 # ---------- concurrency-safe spend tracker ----------
 
 class SpentTracker:
-    """Rolling-24h per-asset spend totals with an exclusive file lock, so
-    concurrent signers cannot both slip under a daily cap."""
+    """True rolling-24h per-asset spend tracker with an exclusive file lock.
+
+    State is a list of timestamped entries (not one 24h bucket), so the
+    limit cannot be doubled around a reset boundary. Entries are
+    ``pending`` from reservation until the ledger outcome is known:
+
+    - validated tesSUCCESS -> ``confirmed`` (counts toward the limit)
+    - validated failure, or LastLedgerSequence passed with the tx provably
+      not included -> entry dropped (released)
+    - ambiguous submission error -> entry STAYS pending. It is never
+      released on a guess; sweep_pending() resolves it against the ledger
+      on the next signing run.
+
+    Concurrent signers cannot both slip under a cap: check+reserve is one
+    atomic section under the lock.
+    """
 
     def __init__(self, state_path=None, lock_path=None):
         self.state_path = Path(state_path) if state_path else STATE_PATH
@@ -440,7 +621,10 @@ class SpentTracker:
     @contextlib.contextmanager
     def _locked(self):
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        new_lock = not self.lock_path.exists()
         with open(self.lock_path, "w") as lf:
+            if new_lock:
+                os.chmod(self.lock_path, 0o600)
             fcntl.flock(lf, fcntl.LOCK_EX)
             try:
                 yield
@@ -450,84 +634,175 @@ class SpentTracker:
     def _load(self):
         try:
             st = json.loads(self.state_path.read_text())
-            if set(st) >= {"window_start", "totals"}:
-                return st
         except (FileNotFoundError, json.JSONDecodeError):
-            pass
-        return {"window_start": int(time.time()), "totals": {}}
+            return {"entries": []}
+        if isinstance(st.get("entries"), list):
+            return {"entries": st["entries"]}
+        if isinstance(st.get("totals"), dict):
+            # migrate the v0.3 single-bucket format: old totals become
+            # confirmed entries stamped at the old window start
+            w0 = int(st.get("window_start", 0))
+            return {"entries": [
+                {"rid": "migrated", "ts": w0, "asset": a,
+                 "amount": str(v), "status": "confirmed",
+                 "tx_hash": None, "last_ledger": None}
+                for a, v in st["totals"].items()]}
+        return {"entries": []}
 
     def _save(self, st):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(st))
+        os.chmod(tmp, 0o600)
         tmp.replace(self.state_path)
 
-    def _prune(self, st, now):
-        if now - st.get("window_start", 0) >= 86400:
-            return {"window_start": now, "totals": {}}
-        return st
+    @staticmethod
+    def _prune(entries, now):
+        return [e for e in entries
+                if now - int(e.get("ts", 0)) < ROLLING_WINDOW]
+
+    @staticmethod
+    def _totals(entries):
+        t = {}
+        for e in entries:
+            t[e["asset"]] = t.get(e["asset"], Decimal(0)) + Decimal(e["amount"])
+        return t
+
+    def _deny(self, spends, entries, policy):
+        denials = []
+        totals = self._totals(entries)
+        limits = policy.get("spend_limits", {})
+        for asset, amt in spends.items():
+            lim = limits.get(asset)
+            if lim is None:
+                denials.append(
+                    f"no spend limit configured for {asset} — fail closed "
+                    f"(add it to spend_limits or remove the asset)")
+                continue
+            if not amt.is_finite():
+                denials.append(f"{asset} spend {amt} is not finite — refusing")
+                continue
+            if amt > Decimal(lim["per_tx"]):
+                denials.append(
+                    f"{asset} spend {amt} > per-tx limit {lim['per_tx']}")
+            day = totals.get(asset, Decimal(0))
+            if day + amt > Decimal(lim["per_day"]):
+                denials.append(
+                    f"{asset} rolling-24h spend would be {day + amt} > "
+                    f"per-day limit {lim['per_day']} (used {day})")
+        return denials
 
     def check(self, spends: dict, policy) -> list:
         """Denial reasons if reserving `spends` now would breach limits.
         Does not mutate. `spends`: {asset_key: Decimal}."""
-        denials = []
         with self._locked():
-            st = self._prune(self._load(), int(time.time()))
-            limits = policy.get("spend_limits", {})
-            for asset, amt in spends.items():
-                lim = limits.get(asset)
-                if lim is None:
-                    denials.append(
-                        f"no spend limit configured for {asset} — fail closed "
-                        f"(add it to spend_limits or remove the asset)")
-                    continue
-                if amt > Decimal(lim["per_tx"]):
-                    denials.append(
-                        f"{asset} spend {amt} > per-tx limit {lim['per_tx']}")
-                day = Decimal(st["totals"].get(asset, "0"))
-                if day + amt > Decimal(lim["per_day"]):
-                    denials.append(
-                        f"{asset} daily spend would be {day + amt} > "
-                        f"per-day limit {lim['per_day']} (used {day})")
-        return denials
+            entries = self._prune(self._load()["entries"], int(time.time()))
+            return self._deny(spends, entries, policy)
 
-    def try_reserve(self, spends: dict, policy) -> list:
-        """Atomically check limits AND record the spend. Returns denials
-        (empty = reserved). This is the real enforcement point."""
-        denials = []
+    def try_reserve(self, spends: dict, policy):
+        """Atomically check limits AND record pending entries.
+
+        Returns (denials, reservation_id). Empty denials = reserved."""
+        import uuid
+        rid = uuid.uuid4().hex[:16]
         with self._locked():
             now = int(time.time())
-            st = self._prune(self._load(), now)
-            limits = policy.get("spend_limits", {})
-            for asset, amt in spends.items():
-                lim = limits.get(asset)
-                if lim is None:
-                    denials.append(f"no spend limit configured for {asset} — fail closed")
-                    continue
-                if amt > Decimal(lim["per_tx"]):
-                    denials.append(
-                        f"{asset} spend {amt} > per-tx limit {lim['per_tx']}")
-                day = Decimal(st["totals"].get(asset, "0"))
-                if day + amt > Decimal(lim["per_day"]):
-                    denials.append(
-                        f"{asset} daily spend would be {day + amt} > "
-                        f"per-day limit {lim['per_day']} (used {day})")
+            entries = self._prune(self._load()["entries"], now)
+            denials = self._deny(spends, entries, policy)
             if denials:
-                return denials
+                return denials, None
             for asset, amt in spends.items():
-                st["totals"][asset] = str(
-                    Decimal(st["totals"].get(asset, "0")) + amt)
-            self._save(st)
-        return []
+                entries.append({"rid": rid, "ts": now, "asset": asset,
+                                "amount": str(amt), "status": "pending",
+                                "tx_hash": None, "last_ledger": None})
+            self._save({"entries": entries})
+        return [], rid
 
-    def release(self, spends: dict):
-        """Refund a reservation (e.g. submission failed after signing)."""
+    def release_reservation(self, rid):
+        """Drop pending entries for a reservation that never got signed
+        (e.g. bad seed, wallet mismatch). Only unbound entries are dropped."""
+        if not rid:
+            return
         with self._locked():
-            st = self._prune(self._load(), int(time.time()))
-            for asset, amt in spends.items():
-                cur = Decimal(st["totals"].get(asset, "0")) - amt
-                st["totals"][asset] = str(max(cur, Decimal(0)))
+            st = self._load()
+            st["entries"] = [e for e in self._prune(st["entries"], int(time.time()))
+                             if not (e.get("rid") == rid
+                                     and e.get("status") == "pending"
+                                     and not e.get("tx_hash"))]
             self._save(st)
+
+    def bind_reservation(self, rid, tx_hash, last_ledger):
+        """Attach the signed transaction's identity to a reservation."""
+        with self._locked():
+            st = self._load()
+            for e in st["entries"]:
+                if e.get("rid") == rid and e.get("status") == "pending":
+                    e["tx_hash"] = tx_hash
+                    e["last_ledger"] = last_ledger
+            self._save(st)
+
+    def confirm(self, tx_hash):
+        """Validated tesSUCCESS: entries stay and count toward the limit."""
+        with self._locked():
+            st = self._load()
+            for e in st["entries"]:
+                if e.get("tx_hash") == tx_hash and e.get("status") == "pending":
+                    e["status"] = "confirmed"
+            self._save(st)
+
+    def release_tx(self, tx_hash):
+        """Validated failure: drop the entries, freeing the budget."""
+        with self._locked():
+            st = self._load()
+            st["entries"] = [e for e in st["entries"]
+                             if e.get("tx_hash") != tx_hash]
+            self._save(st)
+
+    def sweep_pending(self, client):
+        """Resolve ambiguous pending reservations against the ledger.
+
+        For each bound pending entry whose LastLedgerSequence has passed the
+        validated ledger: if the tx is on-ledger with tesSUCCESS it becomes
+        confirmed; if it failed validation or provably was never included,
+        the entry is dropped. Anything uncertain (RPC trouble, ledger not
+        yet past) stays pending — fail closed, never release on a guess.
+        """
+        from xrpl.models.requests import Ledger, Tx
+        with self._locked():
+            now = int(time.time())
+            entries = self._prune(self._load()["entries"], now)
+            bound = [e for e in entries
+                     if e.get("status") == "pending" and e.get("tx_hash")
+                     and e.get("last_ledger")]
+            if not bound:
+                self._save({"entries": entries})
+                return
+            try:
+                cur = client.request(
+                    Ledger(ledger_index="validated")).result["ledger_index"]
+            except Exception:  # noqa: BLE001
+                self._save({"entries": entries})
+                return  # cannot tell — keep everything pending
+            keep = []
+            for e in entries:
+                if (e.get("status") == "pending" and e.get("tx_hash")
+                        and e.get("last_ledger")
+                        and int(e["last_ledger"]) < int(cur)):
+                    try:
+                        r = client.request(Tx(transaction=e["tx_hash"]))
+                        ok = r.is_successful()
+                        res = (r.result.get("meta", {}) or {}
+                               ).get("TransactionResult") if ok else None
+                    except Exception:  # noqa: BLE001
+                        keep.append(e)  # uncertain — keep pending
+                        continue
+                    if ok and res == "tesSUCCESS":
+                        e["status"] = "confirmed"
+                        keep.append(e)
+                    # else: validated failure or never included -> release
+                else:
+                    keep.append(e)
+            self._save({"entries": keep})
 
 
 def audit(action, proposal_hash, tx_hash, network, account, result, note="",
@@ -545,8 +820,11 @@ def audit(action, proposal_hash, tx_hash, network, account, result, note="",
     }
     if spends:
         entry["spends"] = {k: str(v) for k, v in spends.items()}
+    new_file = not AUDIT_PATH.exists()
     with AUDIT_PATH.open("a") as f:
         f.write(json.dumps(entry) + "\n")
+    if new_file:
+        os.chmod(AUDIT_PATH, 0o600)
 
 
 # ---------- network client (lazy: imports xrpl-py only when called) ----------

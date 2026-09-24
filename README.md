@@ -60,6 +60,11 @@ issuer arguments can't bypass it.
 Live at launch: `XRP/RLUSD, BTC/XRP, XLM/XRP, ARMY/XRP, PHNIX/XRP, BCHAMP/XRP,
 FUZZY/XRP`
 
+The shipped `approved.example.json` contains two template pairs
+(`XRP/RLUSD`, `ARMY/XRP`) — copy it to `~/.xrpl/approved.json` and add
+only pairs whose issuers you have personally vetted. Tickers mean nothing
+on XRPL; the issuer address is the identity.
+
 ## Install
 
 ```bash

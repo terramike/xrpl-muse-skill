@@ -3,7 +3,7 @@
 Trade the XRP Ledger from the terminal — any token pair, with a hard safety
 boundary between proposing a trade and signing it.
 
-## Architecture: propose → approve → sign (v0.3)
+## Architecture: propose → approve → sign (v0.4)
 
 Two programs. The agent only ever runs the first.
 
@@ -32,32 +32,49 @@ rebuild them with the current `xrpl-trade`.
 
 ### What the signer enforces
 
+- **Envelope invariants**: envelope account == transaction `Account`,
+  action matches transaction type, buy/sell orientation matches the actual
+  `TakerPays`/`TakerGets` fields; `Account`, `Fee`, `Sequence`,
+  `LastLedgerSequence` required; no `TxnSignature`/`SigningPubKey` in
+  unsigned proposals; no far-future `created_at`.
 - **Transaction-type allowlist**: `OfferCreate`, `OfferCancel`, `TrustSet`,
   `Payment` only. Anything else is rejected.
 - **Strict per-type field schemas**: no `Paths`, `SendMax`, `DeliverMin`,
   `Memos`, partial-payment flags, or any other smuggled field.
+- **Numeric sanity**: NaN/Infinity amounts, fees, and sequences are rejected
+  before they can reach a limit comparison.
 - **Derived, never stored**: the summary, pair, side, amounts, and price are
   computed from the transaction inside the signer. There is no summary or
   metadata field to tamper with.
 - **Exact-pair enforcement**: offers must match an approved pair from
   `~/.xrpl/approved.json` exactly — token/token combinations that aren't
   listed are denied.
-- **Per-asset spend limits**: per-transaction and rolling-24h caps per asset
-  (`spend_limits`), reserved atomically under a file lock so concurrent
+- **Per-asset spend limits**: per-transaction and true rolling-24h caps per
+  asset (`spend_limits`), reserved atomically under a file lock so concurrent
   signers can't double-spend the daily budget. Assets with no configured
   limit are **blocked** (fail closed).
-- **Offer safety**: `Expiration` required; limit price within
-  `max_deviation_bps` of the live book mid (derived from the transaction,
-  orientation-agnostic; fail-closed on an empty book).
+- **Ambiguity-safe reservations**: a reserved spend stays reserved (never
+  double-spent, never released early) until the validated ledger result
+  proves what happened; proven non-inclusion releases it, validated success
+  confirms it.
+- **Offer safety**: `Expiration` required and bounded by
+  `max_offer_lifetime_seconds`; limit price within `max_deviation_bps` of a
+  depth-weighted book reference (up to 10 levels per side) that requires
+  both bid and ask sides, minimum depth (`min_book_depth`), and a maximum
+  spread (`max_spread_bps`) — fail-closed on thin, one-sided, or wide
+  books.
 - **Destination policy**: payments only to allowlisted `(address,
   destination_tag)` combinations; conflicting X-address/CLI tags are
-  rejected; destinations with `RequireDestTag` set refuse untagged payments.
+  rejected; destinations with `RequireDestTag` set refuse untagged payments
+  (fail-closed on lookup errors).
 - **Network lock**: default `testnet`. Mainnet proposals **hard-fail** until
   you explicitly opt in.
-- **Crash-safe submission**: sign → persist the signed hash and
-  `LastLedgerSequence` to the audit log → submit → wait for the validated
-  result. A crash between signing and submission still leaves a
-  reconciliation trail.
+- **Protected files**: the signer refuses to run if the policy, allowlist,
+  state, lock, or audit files are not owner-only `0600`. This catches
+  accidental exposure — it does not replace the privileged boundary below.
+- **Crash-safe submission**: sign → bind the reservation to the signed hash
+  and `LastLedgerSequence` → persist to the audit log → submit → wait for the
+  validated result. A crash anywhere still leaves a reconciliation trail.
 - **Seed-address match**: the seed's derived address must equal the
   proposal's account, or signing is refused.
 
@@ -66,7 +83,7 @@ Every signed transaction is appended to `~/.xrpl/audit.log`
 
 ### The platform boundary (read this)
 
-`--approve` is an *assertion*, not evidence of human approval. v0.3 is
+`--approve` is an *assertion*, not evidence of human approval. v0.4 is
 mainnet-ready **only** when all of these hold:
 
 - Muse requires real user confirmation for each signing use (a typed
@@ -76,7 +93,7 @@ mainnet-ready **only** when all of these hold:
 - The signer and the policy file sit behind a vault, separate OS identity,
   or privileged signing service the agent cannot rewrite.
 
-Without those platform guarantees, v0.3 is a hardened testnet tool — not
+Without those platform guarantees, v0.4 is a hardened testnet tool — not
 generically mainnet-safe. The design states this honestly; see `SECURITY.md`.
 
 ## The ceremony (every write)
@@ -108,9 +125,14 @@ transaction-derived summary — it never signs.
   (empty = no payments).
 - `max_fee_drops`, `max_deviation_bps`, `proposal_ttl_seconds`
   (proposals expire after 24h by default).
+- `max_spread_bps` (default 1000), `min_book_depth` (default "5", in QUOTE
+  units of funded depth per side), `max_offer_lifetime_seconds`
+  (default 86400) — the book-quality and offer-lifetime bounds.
 - Token (currency, issuer) identities are extracted from the transaction
   JSON itself, so passing a raw issuer can't bypass the allowlist. Tickers
   mean nothing on XRPL; issuers are the identity.
+- `xrpl-sign migrate-policy` upgrades a v2 or v3 file (keeping a
+  `.v3.bak`), filling in the new v0.4 fields with their defaults.
 
 ## Commands
 
@@ -167,6 +189,7 @@ wallet: `xrpl-trade faucet --network testnet`.
 - `bin/xrpl-trade` — proposer (builds + previews, never signs)
 - `bin/xrpl-sign` — policy-gated signer
 - `bin/xrpl_common.py` — shared helpers (envelopes, policy, allowlist, limits)
-- `tests/test_v03.py` — 40 adversarial logic tests, no network needed
-- `tests/test_e2e_testnet.py` — 17 end-to-end checks on testnet
-  (propose → approve → sign → persist → validated)
+- `tests/test_v04.py` — 78 adversarial logic tests, no network needed
+- `tests/test_e2e_testnet.py` — 21 end-to-end checks on testnet
+  (propose → approve → sign → persist → validated), fully isolated in a
+  temporary HOME — never touches the operator's real `~/.xrpl`

@@ -14,10 +14,11 @@ sell offer and `sell` placed a buy offer. Trade direction was corrected in
 commit `c3273e59` ("fix: buy/sell had TakerPays/TakerGets inverted").
 
 **If you cloned, forked, or downloaded this repository at commit `ed8fa202`,
-do not use it for trading.** Update to `c3273e59` or later and re-verify with
-`--dry-run` before submitting anything.
+do not use it for trading.** Update to `c3273e59` or later, rebuild the
+proposal, review the signer's derived ceremony output, and confirm the
+validated ledger result before relying on it.
 
-## Safety model (v0.3)
+## Safety model (v0.4)
 
 The skill is split into a proposer (`xrpl-trade`, never sees the seed) and a
 policy-gated signer (`xrpl-sign`, the only program that touches the seed).
@@ -27,20 +28,34 @@ XRPL binary of the complete transaction. The signer re-verifies the envelope,
 derives the summary from the transaction itself (nothing stored is trusted),
 and enforces:
 
+- envelope invariants: envelope account == transaction `Account`, action
+  matches transaction type, buy/sell orientation matches the actual
+  `TakerPays`/`TakerGets` fields; required fields (`Account`, `Fee`,
+  `Sequence`, `LastLedgerSequence`) present; no signature material in
+  unsigned proposals; no far-future `created_at`,
+
 - transaction-type allowlist (`OfferCreate`, `OfferCancel`, `TrustSet`,
   `Payment`) with strict per-type field schemas,
 - exact-pair enforcement from the approved-pairs allowlist,
-- per-asset per-transaction and rolling-24h spend limits (unconfigured
-  assets are blocked),
+- per-asset per-transaction and true rolling-24h spend limits (unconfigured
+  assets are blocked; NaN/Infinity amounts are rejected before they can
+  poison comparisons),
 - destination `(address, tag)` allowlisting plus `RequireDestTag`
-  enforcement,
-- offer expiry and book-deviation limits,
+  enforcement (fail-closed on lookup errors),
+- offer expiry within a bounded lifetime (`max_offer_lifetime_seconds`),
+- book-deviation checks against a depth-weighted reference requiring both
+  book sides, minimum depth, and a maximum spread,
 - network lock (testnet by default),
-- sign → persist (hash + `LastLedgerSequence`) → submit → validated result.
+- ambiguity-safe reservations: a reserved spend stays reserved (never
+  double-spent, never released early) until the validated ledger result
+  proves what happened,
+- protected files: the signer refuses to run if the policy, allowlist,
+  state, lock, or audit files are not owner-only (this catches accidental
+  exposure; it is not a substitute for the privileged boundary below).
 
 ## The platform boundary — read before mainnet
 
-`--approve` is an **assertion**, not evidence of human approval. v0.3 is
+`--approve` is an **assertion**, not evidence of human approval. v0.4 is
 mainnet-ready **only** when all of these hold:
 
 1. Muse requires real user confirmation for each signing use. A typed
@@ -54,7 +69,7 @@ mainnet-ready **only** when all of these hold:
    the agent must not be able to alter signing policy or activate signing
    merely by passing `--approve`.
 
-Without those platform guarantees, v0.3 is a hardened testnet tool. Do not
+Without those platform guarantees, v0.4 is a hardened testnet tool. Do not
 describe it as generically mainnet-safe.
 
 ## Operator rules (all versions)

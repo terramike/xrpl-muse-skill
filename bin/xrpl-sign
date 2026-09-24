@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
-"""xrpl-sign v0.3: the POLICY-GATED SIGNER half of the hardened XRPL skill.
+"""xrpl-sign v0.4: the POLICY-GATED SIGNER half of the hardened XRPL skill.
 
 This is the only program that ever sees the wallet seed. It signs NOTHING
 unless ALL of these hold:
 
   1. A proposal built by `xrpl-trade` exists, its hash-bound ENVELOPE
      verifies exactly (network, account, action, creation time, policy
-     version, canonical binary transaction), and it is younger than the
-     policy TTL. Old-format proposals are rejected — rebuild them.
-  2. The proposal's network matches the policy's network_lock
+     version, canonical binary transaction), it is younger than the
+     policy TTL, and its internal invariants hold (envelope account ==
+     tx Account, action matches type and buy/sell orientation, required
+     fields present, no signature material in the unsigned proposal,
+     created_at not from the future). Old-format proposals are rejected.
+  2. Signer state files (policy, allowlist, spend state, audit log) are
+     owner-only — otherwise signing is refused outright.
+  3. The proposal's network matches the policy's network_lock
      (default: testnet — mainnet proposals hard-fail until you opt in).
-  3. The transaction type is allowlisted (OfferCreate, OfferCancel,
-     TrustSet, Payment) and every field matches the strict per-type schema.
-     Unknown types and smuggled fields (Paths, SendMax, memos, partial-
-     payment flags…) are rejected.
-  4. Every non-XRP token is in the approved allowlist, extracted from the
+  4. The transaction type is allowlisted (OfferCreate, OfferCancel,
+     TrustSet, Payment), every field matches the strict per-type schema,
+     and every amount/fee/sequence is finite and sane. Unknown types,
+     smuggled fields (Paths, SendMax, memos, partial-payment flags…),
+     NaN/Infinity amounts are rejected.
+  5. Every non-XRP token is in the approved allowlist, extracted from the
      TX JSON itself; offers must match an approved PAIR exactly.
-  5. Fee <= max_fee_drops. Offers carry an Expiration and price within
-     max_deviation_bps of the live book mid (derived from the tx, fail-closed).
-  6. Payments go only to allowlisted (address, destination-tag) pairs;
-     destinations requiring a tag are enforced.
-  7. Per-asset per-transaction and rolling-24h daily caps hold, reserved
-     atomically at signing time.
-  8. A human passed --approve for THIS EXACT hash. Without it, this program
+  6. Fee <= max_fee_drops. Offers carry an Expiration inside the allowed
+     lifetime window and price within max_deviation_bps of the live
+     depth-weighted book mid (both sides present, spread and depth
+     checked, fail-closed).
+  7. Payments go only to allowlisted (address, destination-tag) pairs;
+     destinations requiring a tag are enforced (fail-closed on lookup
+     trouble).
+  8. Per-asset per-transaction and true rolling-24h caps hold, reserved
+     atomically at signing time. Reservations stay pending through
+     ambiguous submission outcomes and are released only on proven
+     failure or proof of non-inclusion.
+  9. A human passed --approve for THIS EXACT hash. Without it, this program
      only checks policy and prints the DERIVED summary — it never signs.
 
 Seed: read ONLY from the XRPL_SEED environment variable. In production the
@@ -30,10 +41,11 @@ Muse vault injects it after genuine human confirmation; it must never be a
 raw exported variable in a shared shell. The derived address must match the
 proposal's account, or signing is refused.
 
-Submission is crash-safe: the transaction is signed and the signed hash +
-LastLedgerSequence are persisted to the audit log BEFORE submit_and_wait,
-so a crash between signing and submission still leaves a reconciliation
-trail (XRPL reliable-submission guidance).
+Submission is crash-safe: the transaction is signed, the reservation is
+bound to the signed hash + LastLedgerSequence, and both are persisted to
+the audit log BEFORE submit_and_wait, so a crash between signing and
+submission still leaves a reconciliation trail (XRPL reliable-submission
+guidance).
 """
 import argparse
 import json
@@ -72,12 +84,31 @@ def cmd_init_policy(_args):
 
 
 def cmd_migrate_policy(_args):
-    """Upgrade a v2 policy file to v3 (keeps a .bak)."""
+    """Upgrade a v2 policy file to v3 (keeps a .bak), or backfill a v3
+    policy with the v0.4 defaults (max_spread_bps, min_book_depth,
+    max_offer_lifetime_seconds)."""
     if not C.POLICY_PATH.exists():
         sys.exit(f"No policy file at {C.POLICY_PATH}")
     old = json.loads(C.POLICY_PATH.read_text())
-    if old.get("policy_version", 2) == C.POLICY_VERSION:
-        sys.exit("Policy is already v3.")
+    ver = old.get("policy_version", 2)
+    if ver == C.POLICY_VERSION:
+        missing = [k for k in ("max_spread_bps", "min_book_depth",
+                               "max_offer_lifetime_seconds")
+                   if k not in old]
+        if not missing:
+            sys.exit("Policy is already up to date.")
+        bak = C.POLICY_PATH.with_suffix(".json.v3.bak")
+        bak.write_text(json.dumps(old, indent=2))
+        new = dict(old)
+        new["max_spread_bps"] = old.get("max_spread_bps", 1000)
+        new["min_book_depth"] = old.get("min_book_depth", "5")
+        new["max_offer_lifetime_seconds"] = old.get(
+            "max_offer_lifetime_seconds", 86400)
+        C.POLICY_PATH.write_text(json.dumps(new, indent=2))
+        os.chmod(C.POLICY_PATH, 0o600)
+        print(f"Backed up v3 policy to {bak}")
+        print(f"Backfilled v0.4 defaults: {', '.join(missing)}")
+        return
     new = dict(C.DEFAULT_POLICY)
     new["network_lock"] = old.get("network_lock", "testnet")
     new["max_fee_drops"] = old.get("max_fee_drops", 1000)
@@ -92,6 +123,10 @@ def cmd_migrate_policy(_args):
         for a in old.get("destination_allowlist", [])
     ]
     new["max_deviation_bps"] = old.get("max_deviation_bps", 1000)
+    new["max_spread_bps"] = old.get("max_spread_bps", 1000)
+    new["min_book_depth"] = old.get("min_book_depth", "5")
+    new["max_offer_lifetime_seconds"] = old.get("max_offer_lifetime_seconds",
+                                                86400)
     new["proposal_ttl_seconds"] = old.get("proposal_ttl_seconds", 86400)
     bak = C.POLICY_PATH.with_suffix(".json.v2.bak")
     bak.write_text(json.dumps(old, indent=2))
@@ -109,51 +144,105 @@ def _cur_from_amount(a):
     return IssuedCurrency(currency=a["currency"], issuer=a["issuer"])
 
 
+def book_reference(client, pays, gets, policy):
+    """Depth-weighted mid price (gets per pays) from the live book.
+
+    Requires BOTH sides present, spread within max_spread_bps, and minimum
+    funded depth per side — a book of dust offers cannot set the reference
+    price. Returns (dw_mid, None) or (None, denial_reason). Fail closed.
+    """
+    pays_c, gets_c = _cur_from_amount(pays), _cur_from_amount(gets)
+    try:
+        asks_r = client.request(BookOffers(taker_gets=pays_c, taker_pays=gets_c,
+                                           limit=10, ledger_index="validated"))
+        bids_r = client.request(BookOffers(taker_gets=gets_c, taker_pays=pays_c,
+                                           limit=10, ledger_index="validated"))
+    except Exception:  # noqa: BLE001
+        return None, "could not fetch book for price check (fail closed)"
+    if not (asks_r.is_successful() and bids_r.is_successful()):
+        return None, "could not fetch book for price check (fail closed)"
+    ao, bo = asks_r.result.get("offers", []), bids_r.result.get("offers", [])
+    if not ao or not bo:
+        return None, "one-sided or empty book — cannot verify price (fail closed)"
+
+    def side_dw(offers, num_f, den_f, qty_f):
+        """Depth-weighted price (num/den, i.e. gets per pays), weighting
+        each level by its pays-side quantity."""
+        tot_q = Decimal(0)
+        tot_pq = Decimal(0)
+        for o in offers:
+            try:
+                n = C.amount_value(o[num_f])
+                d = C.amount_value(o[den_f])
+                q = C.amount_value(o[qty_f])
+                sane = n.is_finite() and d.is_finite() and q.is_finite()
+            except Exception:  # noqa: BLE001 — malformed book level
+                continue
+            if not sane or n <= 0 or d <= 0 or q <= 0:
+                continue
+            tot_q += q
+            tot_pq += (n / d) * q
+        return (tot_pq / tot_q if tot_q > 0 else None), tot_q
+
+    # asks: offers selling pays for gets. price = TakerPays/TakerGets
+    # (gets per pays); pays-side qty = TakerGets.
+    dw_ask, ask_depth = side_dw(ao, "TakerPays", "TakerGets", "TakerGets")
+    # bids: offers buying gets with pays. price = TakerGets/TakerPays;
+    # pays-side qty = TakerPays.
+    dw_bid, bid_depth = side_dw(bo, "TakerGets", "TakerPays", "TakerPays")
+    if dw_ask is None or dw_bid is None:
+        return None, "book has no usable levels (fail closed)"
+    if dw_ask < dw_bid:
+        return None, "crossed book (bid above ask) — cannot verify price (fail closed)"
+    min_depth = Decimal(str(policy.get("min_book_depth", "5")))
+    if ask_depth < min_depth or bid_depth < min_depth:
+        return None, (f"book too thin — depth {min(ask_depth, bid_depth):f} < "
+                       f"min {min_depth:f} pays-side units (fail closed)")
+    mid = (dw_ask + dw_bid) / 2
+    spread_bps = (dw_ask - dw_bid) / mid * 10000
+    if spread_bps > Decimal(str(policy.get("max_spread_bps", 1000))):
+        return None, (f"book spread {spread_bps:.0f} bps > max "
+                       f"{policy.get('max_spread_bps', 1000)} bps (fail closed)")
+    return mid, None
+
+
 def check_deviation(client, tx, policy):
-    """Offer limit vs live book mid, derived from the TX — never from stored
-    metadata. Orientation-agnostic: compares gets-per-pays against the mid
-    of the same pair. Fail closed when the book is empty."""
+    """Offer limit vs live depth-weighted book mid, derived from the TX —
+    never from stored metadata. Fail closed on any book anomaly."""
     pays, gets = tx["TakerPays"], tx["TakerGets"]
     pv, gv = C.amount_value(pays), C.amount_value(gets)
     if pv <= 0 or gv <= 0:
         return "offer has a zero amount"
     implied = gv / pv  # gets per pays
-
-    pays_c, gets_c = _cur_from_amount(pays), _cur_from_amount(gets)
-    asks = client.request(BookOffers(taker_gets=pays_c, taker_pays=gets_c,
-                                     limit=5, ledger_index="validated"))
-    bids = client.request(BookOffers(taker_gets=gets_c, taker_pays=pays_c,
-                                     limit=5, ledger_index="validated"))
-    if not (asks.is_successful() and bids.is_successful()):
-        return "could not fetch book for deviation check (fail closed)"
-    ao, bo = asks.result.get("offers", []), bids.result.get("offers", [])
-
-    def px(o, pay_f, get_f):
-        return (C.amount_value(o[pay_f]) / C.amount_value(o[get_f]))
-
-    mids = []
-    if ao:
-        mids.append(px(ao[0], "TakerPays", "TakerGets"))  # gets per pays
-    if bo:
-        mids.append(px(bo[0], "TakerGets", "TakerPays"))  # gets per pays
-    if not mids:
-        return "empty book — cannot verify price (fail closed)"
-    mid = sum(mids) / len(mids)
+    mid, problem = book_reference(client, pays, gets, policy)
+    if problem:
+        return problem
     dev_bps = abs(implied - mid) / mid * 10000
     if dev_bps > policy["max_deviation_bps"]:
         return (f"limit {implied:.6f} (gets per pays) deviates {dev_bps:.0f} bps "
-                f"from mid {mid:.6f} > max {policy['max_deviation_bps']} bps")
+                f"from depth-weighted mid {mid:.6f} > max "
+                f"{policy['max_deviation_bps']} bps")
     return None
 
 
 def check_require_dest_tag(client, dest, tag):
-    """Deny when the destination account requires a tag and none is given."""
+    """Deny when the destination account requires a tag and none is given.
+
+    Fail CLOSED: if the flag cannot be verified (node error, unexpected
+    response), the payment is denied rather than risking a fee on a
+    ledger-rejected transaction. Only a proven-absent account (which cannot
+    carry the flag) passes silently.
+    """
     try:
         r = client.request(AccountInfo(account=dest, ledger_index="validated"))
     except Exception:  # noqa: BLE001
-        return None  # node trouble -> submit path will surface it
+        return ("could not verify RequireDestTag flag (node error) — "
+                "fail closed")
     if not r.is_successful():
-        return None  # account doesn't exist yet -> flag can't be set
+        if r.result.get("error") == "actNotFound":
+            return None  # account doesn't exist yet -> flag can't be set
+        return (f"could not verify RequireDestTag flag "
+                f"({r.result.get('error')}) — fail closed")
     flags = int(r.result["account_data"].get("Flags", 0))
     if flags & C.REQUIRE_DEST_TAG_FLAG and tag is None:
         return (f"destination {dest[:12]}… requires a destination tag "
@@ -171,6 +260,10 @@ def check_policy(prop, tx, policy, client, tracker):
 
     # 0. strict shape: unknown types and smuggled fields die here
     denials.extend(C.validate_tx_shape(tx, allowed_types))
+    # 0b. numeric sanity: NaN/Infinity would poison limit comparisons,
+    # so amounts are validated BEFORE any spend is measured
+    amount_problems = C.validate_amounts(tx)
+    denials.extend(amount_problems)
 
     # 1. network lock (network is hash-bound in the envelope)
     if prop["network"] != policy["network_lock"]:
@@ -203,14 +296,22 @@ def check_policy(prop, tx, policy, client, tracker):
     if fee_drops > policy["max_fee_drops"]:
         denials.append(f"fee {fee_drops} drops > max {policy['max_fee_drops']}")
 
-    # 4. offers: expiry + deviation (both tx-derived)
+    # 4. offers: bounded expiry + deviation (both tx-derived)
     if ttype == "OfferCreate":
         if "Expiration" not in tx:
             denials.append("OfferCreate without Expiration")
         else:
-            dev = check_deviation(client, tx, policy)
-            if dev:
-                denials.append(dev)
+            now_r = int(time.time()) - C.RIPPLE_EPOCH
+            exp = tx["Expiration"]
+            max_life = int(policy.get("max_offer_lifetime_seconds", 86400))
+            if isinstance(exp, int) and now_r < exp <= now_r + max_life:
+                dev = check_deviation(client, tx, policy)
+                if dev:
+                    denials.append(dev)
+            else:
+                denials.append(
+                    f"offer Expiration {exp} outside the allowed window "
+                    f"(now, now+{max_life}s) — refusing")
 
     # 5. payment destination allowlist: exact (address, tag) match
     if ttype == "Payment":
@@ -226,8 +327,11 @@ def check_policy(prop, tx, policy, client, tracker):
             denials.append(req)
 
     # 6. per-asset spend caps (provisional here; atomic reserve at signing)
-    spends = C.tx_spends(tx)
-    denials.extend(tracker.check(spends, policy))
+    # — skipped when amounts are insane, so NaN can never reach comparisons
+    spends = {}
+    if not amount_problems:
+        spends = C.tx_spends(tx)
+        denials.extend(tracker.check(spends, policy))
 
     return denials, spends
 
@@ -246,11 +350,16 @@ def load_seed():
 
 
 def cmd_sign(args):
+    # The protected deployment boundary: policy, allowlist, spend state,
+    # and audit log must be owner-only, or limits are fiction.
+    C.check_protected_files()
+
     prop, path = C.load_proposal(args.hash)
 
     # envelope verification: tamper evidence for everything the human reviewed
     try:
         tx = C.verify_proposal(prop, path)
+        C.verify_envelope_invariants(prop, tx)
     except C.ProposalError as e:
         C.audit("?", prop.get("proposal_hash", "?"), None,
                 prop.get("network", "?"), prop.get("account", "?"),
@@ -267,12 +376,15 @@ def cmd_sign(args):
                  f"{policy['proposal_ttl_seconds'] // 3600}h) — rebuild it.")
 
     client = C.make_client(prop["network"])
+    # Resolve any ambiguous past reservations before checking limits.
+    tracker.sweep_pending(client)
     denials, spends = check_policy(prop, tx, policy, client, tracker)
 
     # ---- the ceremony: everything below is DERIVED from the tx ----
     print("=" * 60)
     print(f"PROPOSAL {prop['proposal_hash'][:16]}… "
           f"({age // 60}m old, {prop['network']})")
+    print(f"  account:  {tx['Account']}")
     print("=" * 60)
     for ln in C.describe_tx(tx, prop.get("action", "?")):
         print("  " + ln)
@@ -298,7 +410,7 @@ def cmd_sign(args):
     # --- the point of no return: independent human approval was given ---
     # Atomic daily-limit reservation: concurrent signers can't double-spend
     # the daily budget between the check above and the signing below.
-    reserve_denials = tracker.try_reserve(spends, policy)
+    reserve_denials, rid = tracker.try_reserve(spends, policy)
     if reserve_denials:
         msg = "; ".join(reserve_denials)
         C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
@@ -310,10 +422,10 @@ def cmd_sign(args):
     try:
         wallet = Wallet.from_seed(seed)
     except Exception:
-        tracker.release(spends)
+        tracker.release_reservation(rid)
         sys.exit("Seed invalid.")
     if wallet.classic_address != tx["Account"]:
-        tracker.release(spends)
+        tracker.release_reservation(rid)
         sys.exit(f"Seed derives {wallet.classic_address}, but proposal is for "
                  f"{tx['Account']} — refusing (wallet mismatch).")
     del seed
@@ -324,8 +436,11 @@ def cmd_sign(args):
     thash = signed.get_hash()
     last_ledger = tx.get("LastLedgerSequence")
 
-    # Persist BEFORE submitting: crash between sign and submit still leaves
-    # a reconciliation trail (hash + last ledger).
+    # Bind the reservation to the signed tx, then persist BEFORE submitting:
+    # a crash between sign and submit still leaves a reconciliation trail
+    # (hash + last ledger), and the budget stays reserved until the ledger
+    # outcome is known.
+    tracker.bind_reservation(rid, thash, last_ledger)
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"], "signed",
             f"last_ledger={last_ledger}", spends)
@@ -336,11 +451,16 @@ def cmd_sign(args):
     try:
         resp = submit_and_wait(signed, client, autofill=False)
     except Exception as e:  # noqa: BLE001
-        tracker.release(spends)
+        # AMBIGUOUS: the tx may have reached the ledger before the network
+        # failed. The reservation is deliberately NOT released — releasing
+        # it could let a second tx exceed the daily cap while this one
+        # later validates. sweep_pending() resolves it on the next run.
         C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
-                prop["network"], tx["Account"], "submit_error", str(e)[:200],
+                prop["network"], tx["Account"], "submit_error",
+                f"{str(e)[:200]} — reservation HELD pending reconciliation",
                 spends)
-        sys.exit(f"Submission error: {e} (signed tx persisted for reconcile)")
+        sys.exit(f"Submission error: {e} (signed tx persisted; spending "
+                 f"reservation HELD until the ledger outcome is known)")
 
     res = resp.result
     meta = res.get("meta", {})
@@ -354,9 +474,10 @@ def cmd_sign(args):
             prop["network"], tx["Account"],
             "applied" if ok else f"failed:{tres}", "", spends)
     if ok:
+        tracker.confirm(thash)
         path.unlink()  # proposal consumed
     else:
-        tracker.release(spends)
+        tracker.release_tx(thash)
         sys.exit(f"Not applied: {tres}")
 
 
