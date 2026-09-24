@@ -1,62 +1,39 @@
 #!/usr/bin/env python3
-"""xrpl-trade: command-line XRPL trading for the Muse xrpl skill.
+"""xrpl-trade v0.2: the PROPOSER half of the hardened XRPL skill.
 
-Read-only: balance, quote, offers. Writes (need the wallet seed):
-trustline, buy, sell, cancel, send. All amounts validated as Decimal.
-XRP handled in drops on the wire, shown as XRP to humans.
+This program NEVER sees the wallet seed and NEVER submits a transaction.
+Write commands (buy/sell/trustline/cancel/send) build the transaction,
+autofill it against the live network, print the full ceremony summary
+(account, network, assets+issuers, amounts, limit price, max spend, fee,
+expiry), hash the exact bytes-to-be-approved, and save a proposal.
 
-Config: ~/.xrpl/config.json (mode 0600) via `xrpl-trade setup`.
-Env override: XRPL_SEED, XRPL_ADDRESS, XRPL_NETWORK.
+The separate `xrpl-sign` program enforces policy and signs — only after
+independent human approval of that exact hash.
+
+Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile.
 """
 import argparse
 import asyncio
-import getpass
 import json
 import os
 import sys
 import time
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-
-def _sanitize_proxy_env():
-    # This runtime's no_proxy contains bracketed IPv6 entries ([::1]) which
-    # httpx fails to parse ("Invalid port: ':1]'"). XRPL endpoints are public
-    # hosts, never matched by no_proxy, so dropping bracketed entries is safe.
-    for var in ("no_proxy", "NO_PROXY"):
-        val = os.environ.get(var)
-        if val:
-            os.environ[var] = ",".join(
-                p for p in val.split(",") if "[" not in p and "]" not in p)
-
-
-_sanitize_proxy_env()
-
-CONFIG_PATH = Path.home() / ".xrpl" / "config.json"
-
-NETWORKS = {
-    "mainnet": ["https://s1.ripple.com:51234", "https://s2.ripple.com:51234"],
-    "testnet": ["https://s.altnet.rippletest.net:51234"],
-    "devnet": ["https://s.devnet.rippletest.net:51234"],
-}
-FAUCETS = {
-    "testnet": "https://faucet.altnet.rippletest.net/accounts",
-    "devnet": "https://faucet.devnet.rippletest.net/accounts",
-}
-# RLUSD issuer from grid-wizard's own .env (terramike/grid-wizard)
-RLUSD_ISSUER = "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import xrpl_common as C
 
 try:
     from xrpl.clients import JsonRpcClient
     from xrpl.models.amounts import IssuedCurrencyAmount
     from xrpl.models.currencies import IssuedCurrency, XRP
     from xrpl.models.requests import (
-        AccountInfo, AccountLines, AccountOffers, BookOffers, ServerInfo,
+        AccountInfo, AccountLines, AccountOffers, BookOffers, ServerInfo, Tx,
     )
     from xrpl.models.transactions import OfferCancel, OfferCreate, Payment, TrustSet
-    from xrpl.transaction import sign_and_submit
+    from xrpl.transaction import autofill
     from xrpl.utils import drops_to_xrp, xrp_to_drops
-    from xrpl.wallet import Wallet
 except ImportError:
     sys.exit("xrpl-py not installed. Run: pip install -r requirements.txt")
 
@@ -65,21 +42,19 @@ except ImportError:
 
 def load_config():
     cfg = {}
-    if CONFIG_PATH.exists():
-        cfg = json.loads(CONFIG_PATH.read_text())
-    cfg["seed"] = os.environ.get("XRPL_SEED") or cfg.get("seed")
+    if C.CONFIG_PATH.exists():
+        cfg = json.loads(C.CONFIG_PATH.read_text())
     cfg["address"] = os.environ.get("XRPL_ADDRESS") or cfg.get("address")
     cfg["network"] = os.environ.get("XRPL_NETWORK") or cfg.get("network", "testnet")
     return cfg
 
 
 def get_client(network):
-    # xrpl-py's default 10s timeout is tight behind an egress proxy; use 30s.
     def _request(self, request):
         return asyncio.run(self._request_impl(request, timeout=30.0))
 
     last_err = None
-    for url in NETWORKS[network]:
+    for url in C.NETWORKS[network]:
         c = JsonRpcClient(url)
         c.request = _request.__get__(c, JsonRpcClient)
         for attempt in range(3):
@@ -93,112 +68,16 @@ def get_client(network):
     sys.exit(f"No healthy {network} node ({last_err}).")
 
 
-def get_wallet(cfg):
-    if not cfg.get("seed"):
-        sys.exit("No wallet seed. Run `xrpl-trade setup` first (or set XRPL_SEED).")
-    try:
-        return Wallet.from_seed(cfg["seed"])
-    except Exception:
-        sys.exit("Seed invalid. Run `xrpl-trade setup` again.")
-
-
-def dec(s, name):
-    try:
-        d = Decimal(str(s))
-    except (InvalidOperation, ValueError):
-        sys.exit(f"Bad {name}: {s!r}")
-    if d <= 0:
-        sys.exit(f"{name} must be positive.")
-    return d
-
-
-def currency_code(code: str) -> str:
-    # 3-char codes pass through; anything else (e.g. RLUSD) is hex160-encoded
-    # the same way grid-wizard does it.
-    code = code.upper()
-    if len(code) == 3 and code.isascii() and code.isalnum():
-        return code
-    raw = code.encode("ascii")
-    if len(raw) > 20:
-        sys.exit(f"currency code too long: {code!r}")
-    return (raw + b"\x00" * (20 - len(raw))).hex().upper()
-
-
-def display_currency(code: str) -> str:
-    if len(code) == 40:
-        try:
-            raw = bytes.fromhex(code).rstrip(b"\x00")
-            if raw.isascii():
-                return raw.decode()
-        except ValueError:
-            pass
-    return code
-
+# ---------- builders (pure: no network, no signing) ----------
 
 def iou_amount(currency, issuer, value: Decimal):
     return IssuedCurrencyAmount(
-        currency=currency_code(currency),
-        issuer=issuer,
-        value=format(value, "f"),
-    )
-
-
-def xrp_amount(value: Decimal):
-    return xrp_to_drops(value)  # drops as str; xrpl-py accepts for XRP
-
-
-def fmt_amt(a):
-    if isinstance(a, dict):  # IOU
-        return f"{a['value']} {display_currency(a['currency'])}.{a['issuer'][:6]}…"
-    return f"{drops_to_xrp(a)} XRP"
-
-
-APPROVED_PATH = Path.home() / ".xrpl" / "approved.json"
-
-
-def load_approved():
-    try:
-        return json.loads(APPROVED_PATH.read_text()).get("pairs", {})
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def resolve_pair(args):
-    """Return (base, base_issuer, quote, quote_issuer).
-
-    --pair NAME resolves through ~/.xrpl/approved.json (vetted issuers only).
-    Otherwise --base/--quote with explicit issuers; RLUSD defaults to its
-    known issuer on whichever side it appears.
-    """
-    if getattr(args, "pair", None):
-        name = args.pair.upper()
-        pairs = load_approved()
-        if name not in pairs:
-            known = ", ".join(sorted(pairs)) or "none"
-            sys.exit(f"unknown pair {name!r}. Approved: {known} (see {APPROVED_PATH})")
-        p = pairs[name]
-        return p["base"].upper(), p.get("base_issuer"), p["quote"].upper(), p.get("quote_issuer")
-    base = args.base.upper()
-    quote = args.quote.upper()
-    base_issuer = getattr(args, "base_issuer", None)
-    quote_issuer = getattr(args, "quote_issuer", None)
-    legacy = getattr(args, "issuer", None)
-    if legacy and not (base_issuer or quote_issuer):
-        # old single --issuer flag: applies to the non-XRP side
-        if base != "XRP" and quote == "XRP":
-            base_issuer = legacy
-        else:
-            quote_issuer = legacy
-    if base == "RLUSD" and not base_issuer:
-        base_issuer = RLUSD_ISSUER
-    if quote == "RLUSD" and not quote_issuer:
-        quote_issuer = RLUSD_ISSUER
-    return base, base_issuer, quote, quote_issuer
+        currency=C.currency_code(currency), issuer=issuer, value=format(value, "f"))
 
 
 def make_amount(ccy, issuer, value: Decimal):
     if ccy == "XRP":
-        return xrp_amount(value)
+        return xrp_to_drops(value)
     if not issuer:
         sys.exit(f"issuer required for {ccy} "
                  f"(pass --base-issuer/--quote-issuer or use --pair)")
@@ -209,56 +88,70 @@ def make_currency(ccy, issuer):
     if ccy == "XRP":
         return XRP()
     if not issuer:
-        sys.exit(f"issuer required for {ccy} "
-                 f"(pass --base-issuer/--quote-issuer or use --pair)")
-    return IssuedCurrency(currency=currency_code(ccy), issuer=issuer)
+        sys.exit(f"issuer required for {ccy}")
+    return IssuedCurrency(currency=C.currency_code(ccy), issuer=issuer)
 
 
-def submit_and_report(tx, client, wallet, dry_run):
-    if dry_run:
-        print(json.dumps(tx.to_dict(), indent=2, default=str))
-        print("\n[dry-run] not submitted.")
-        return
-    resp = sign_and_submit(tx, client, wallet)
-    res = resp.result
-    eng = res.get("engine_result", "?")
-    h = res.get("tx_json", {}).get("hash", "?")
-    print(f"engine_result: {eng}")
-    print(f"hash: {h}")
-    net = "livenet" if "ripple.com" in client.url else "testnet"
-    print(f"explorer: https://{net}.xrpl.org/transactions/{h}")
-    if eng != "tesSUCCESS":
-        sys.exit(f"Not applied: {res.get('engine_result_message', eng)}")
+def build_offer_tx(account, base, base_issuer, quote, quote_issuer,
+                  amount: Decimal, price: Decimal, side: str, expires_in: int):
+    """side=buy: TakerPays=BASE received, TakerGets=QUOTE paid.
+    side=sell: TakerPays=QUOTE received, TakerGets=BASE sold."""
+    if side == "buy":
+        taker_pays = make_amount(base, base_issuer, amount)
+        cost = (amount * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        taker_gets = make_amount(quote, quote_issuer, cost)
+    elif side == "sell":
+        proceeds = (amount * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        taker_pays = make_amount(quote, quote_issuer, proceeds)
+        taker_gets = make_amount(base, base_issuer, amount)
+    else:
+        sys.exit("side must be buy or sell")
+    return OfferCreate(
+        account=account, taker_pays=taker_pays, taker_gets=taker_gets,
+        expiration=C.ripple_time_from_now(expires_in))
 
 
-# ---------- commands ----------
+def fmt_amt(a):
+    if isinstance(a, dict):
+        return f"{a['value']} {C.display_currency(a['currency'])}.{a['issuer'][:8]}…"
+    return f"{drops_to_xrp(a)} XRP"
 
-def cmd_setup(_args):
-    print("XRPL wallet setup. The seed is typed hidden and stored with mode 0600.")
-    print(f"It never leaves this machine. Config: {CONFIG_PATH}\n")
-    net = input("network [mainnet/testnet/devnet] (testnet): ").strip() or "testnet"
-    if net not in NETWORKS:
-        sys.exit("unknown network")
-    if net == "mainnet":
-        print("\n!! mainnet = real money. Use a DEDICATED wallet with limited funds. !!\n")
-    address = input("classic address (r...): ").strip()
-    if not address.startswith("r"):
-        sys.exit("address must start with 'r'")
-    seed = getpass.getpass("seed (family seed s..., hidden): ").strip()
-    if not seed:
-        sys.exit("empty seed")
-    try:
-        w = Wallet.from_seed(seed)
-    except Exception:
-        sys.exit("seed invalid")
-    if w.classic_address != address:
-        sys.exit(f"seed does not match address (derives {w.classic_address})")
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(
-        {"network": net, "address": address, "seed": seed}, indent=2))
-    os.chmod(CONFIG_PATH, 0o600)
-    print(f"\nSaved. Address {address} on {net}.")
 
+# ---------- ceremony ----------
+
+def propose(tx, client, cfg, action, summary_lines, meta=None):
+    """Autofill, summarize, hash, save. Never submits."""
+    filled = autofill(tx, client)
+    txd = filled.to_xrpl()  # PascalCase wire format (to_dict() is snake_case)
+    lines = [
+        f"network:  {cfg['network']}",
+        f"account:  {txd['Account']}",
+        f"action:   {action}",
+        *summary_lines,
+        f"fee:      {drops_to_xrp(txd['Fee'])} XRP",
+        f"sequence: {txd['Sequence']}",
+        f"last_ledger: {txd.get('LastLedgerSequence', 'n/a')}",
+    ]
+    if "Expiration" in txd:
+        exp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(txd["Expiration"] + C.RIPPLE_EPOCH))
+        lines.append(f"expires:  {exp}")
+    h, _ = C.save_proposal(txd, cfg["network"], txd["Account"], action, lines, meta)
+    print("=" * 60)
+    print("PROPOSAL — review carefully. Nothing has been submitted.")
+    print("=" * 60)
+    for ln in lines:
+        print("  " + ln)
+    print("=" * 60)
+    print(f"proposal hash: {h}")
+    print(f"\nTo sign & submit after human approval:\n"
+          f"  xrpl-sign --hash {h[:16]} --approve")
+    print(f"\nFull autofilled transaction saved to:\n"
+          f"  {C.PROPOSALS_DIR / (h + '.json')}")
+    return h
+
+
+# ---------- read commands ----------
 
 def cmd_balance(args, cfg, client):
     addr = args.address or cfg.get("address")
@@ -267,8 +160,7 @@ def cmd_balance(args, cfg, client):
     info = client.request(AccountInfo(account=addr, ledger_index="validated"))
     if not info.is_successful():
         sys.exit(f"AccountInfo failed: {info.result}")
-    bal = info.result["account_data"]["Balance"]
-    print(f"XRP: {drops_to_xrp(bal)}")
+    print(f"XRP: {drops_to_xrp(info.result['account_data']['Balance'])}")
     lines = client.request(AccountLines(account=addr, ledger_index="validated"))
     if lines.is_successful():
         for l in lines.result.get("lines", []):
@@ -278,102 +170,44 @@ def cmd_balance(args, cfg, client):
 
 
 def book_side(client, gets, pays, limit):
-    req = BookOffers(taker_gets=gets, taker_pays=pays, limit=limit,
-                     ledger_index="validated")
-    r = client.request(req)
+    r = client.request(BookOffers(taker_gets=gets, taker_pays=pays,
+                                  limit=limit, ledger_index="validated"))
     if not r.is_successful():
         sys.exit(f"BookOffers failed: {r.result}")
     return r.result.get("offers", [])
 
 
 def amt_value(a):
-    # (Decimal value in native units, currency label)
     if isinstance(a, dict):
-        return Decimal(a["value"]), display_currency(a["currency"])
+        return Decimal(a["value"]), C.display_currency(a["currency"])
     return Decimal(drops_to_xrp(a)), "XRP"
 
 
 def cmd_quote(args, cfg, client):
-    base, base_issuer, quote, quote_issuer = resolve_pair(args)
-    lim = args.limit
+    base, base_issuer, quote, quote_issuer = C.resolve_pair(args)
     base_amt = make_currency(base, base_issuer)
     quote_amt = make_currency(quote, quote_issuer)
-    # asks: offers selling BASE (taker gets BASE, pays QUOTE)
-    asks = book_side(client, base_amt, quote_amt, lim)
-    # bids: offers buying BASE (taker gets QUOTE, pays BASE)
-    bids = book_side(client, quote_amt, base_amt, lim)
+    asks = book_side(client, base_amt, quote_amt, args.limit)
+    bids = book_side(client, quote_amt, base_amt, args.limit)
     print(f"--- {base}/{quote} asks (sell {base}) ---")
     for o in asks:
-        qv, _ = amt_value(o["TakerPays"])
-        bv, _ = amt_value(o["TakerGets"])
+        qv, _ = amt_value(o["TakerPays"]); bv, _ = amt_value(o["TakerGets"])
         print(f"  {fmt_amt(o['TakerGets'])} @ {qv / bv:.6f} {quote}")
     print(f"--- {base}/{quote} bids (buy {base}) ---")
     for o in bids:
-        qv, _ = amt_value(o["TakerGets"])
-        bv, _ = amt_value(o["TakerPays"])
+        qv, _ = amt_value(o["TakerGets"]); bv, _ = amt_value(o["TakerPays"])
         print(f"  {fmt_amt(o['TakerPays'])} @ {qv / bv:.6f} {quote}")
 
 
-def cmd_trustline(args, cfg, client):
-    wallet = get_wallet(cfg)
-    if getattr(args, "pair", None):
-        base, base_issuer, _, _ = resolve_pair(args)
-        if base == "XRP":
-            sys.exit("XRP needs no trustline; use --pair with a token base.")
-        currency, issuer = base, base_issuer
-    else:
-        currency, issuer = args.currency, args.issuer or RLUSD_ISSUER
-    limit = dec(args.limit, "limit")
-    tx = TrustSet(
-        account=wallet.classic_address,
-        limit_amount=iou_amount(currency, issuer, limit),
-    )
-    print(f"TrustSet {currency}.{issuer[:8]}… limit {limit} [{cfg['network']}]")
-    submit_and_report(tx, client, wallet, args.dry_run)
-
-
-def cmd_buy(args, cfg, client):
-    wallet = get_wallet(cfg)
-    base, base_issuer, quote, quote_issuer = resolve_pair(args)
-    amt = dec(args.amount, "amount")      # amount of BASE to buy
-    price = dec(args.price, "price")      # QUOTE per BASE
-    cost = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
-    tx = OfferCreate(
-        account=wallet.classic_address,
-        taker_pays=make_amount(base, base_issuer, amt),
-        taker_gets=make_amount(quote, quote_issuer, cost),
-    )
-    print(f"BUY {amt} {base} @ {price} {quote} = {cost} {quote} [{cfg['network']}]")
-    submit_and_report(tx, client, wallet, args.dry_run)
-
-
-def cmd_sell(args, cfg, client):
-    wallet = get_wallet(cfg)
-    base, base_issuer, quote, quote_issuer = resolve_pair(args)
-    amt = dec(args.amount, "amount")      # amount of BASE to sell
-    price = dec(args.price, "price")      # QUOTE per BASE
-    proceeds = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
-    tx = OfferCreate(
-        account=wallet.classic_address,
-        taker_pays=make_amount(quote, quote_issuer, proceeds),
-        taker_gets=make_amount(base, base_issuer, amt),
-    )
-    print(f"SELL {amt} {base} @ {price} {quote} = {proceeds} {quote} [{cfg['network']}]")
-    submit_and_report(tx, client, wallet, args.dry_run)
-
-
 def cmd_pairs(args, cfg, client):
-    pairs = load_approved()
+    pairs = C.load_approved()
     if not pairs:
-        print(f"No approved pairs. Create {APPROVED_PATH}, e.g.:")
-        print('{"pairs": {"ARMY/XRP": {"base": "ARMY", "base_issuer": "r...", '
-              '"quote": "XRP", "quote_issuer": null}}}')
+        print(f"No approved pairs. Copy approved.example.json to {C.APPROVED_PATH}.")
         return
     for name in sorted(pairs):
         p = pairs[name]
-        bi = (p.get("base_issuer") or "native")[:12]
-        qi = (p.get("quote_issuer") or "native")[:12]
-        print(f"{name}: {p['base']} ({bi}) / {p['quote']} ({qi})")
+        print(f"{name}: {p['base']} ({(p.get('base_issuer') or 'native')[:12]}) / "
+              f"{p['quote']} ({(p.get('quote_issuer') or 'native')[:12]})")
 
 
 def cmd_offers(args, cfg, client):
@@ -391,100 +225,279 @@ def cmd_offers(args, cfg, client):
         print(f"seq={o['seq']} {fmt_amt(o['taker_gets'])} <- {fmt_amt(o['taker_pays'])}")
 
 
+def cmd_inspect_token(args, cfg, client):
+    ccy, issuer = args.currency.upper(), args.issuer
+    r = client.request(AccountInfo(account=issuer, ledger_index="validated"))
+    if not r.is_successful():
+        sys.exit(f"Issuer account not found: {r.result}")
+    ad = r.result["account_data"]
+    flags = int(ad.get("Flags", 0))
+    rate = int(ad.get("TransferRate", 1000000000))
+    fee_pct = (rate - 1000000000) / 10000000
+    domain = ad.get("Domain")
+    if domain:
+        try:
+            domain = bytes.fromhex(domain).decode()
+        except ValueError:
+            pass
+    print(f"token:  {ccy}.{issuer}")
+    print(f"domain: {domain or 'NOT SET (no toml verification possible)'}")
+    print(f"transfer fee: {fee_pct:.3f}%")
+    print(f"global freeze: {'YES — issuer can freeze all holders' if flags & 0x00400000 else 'no'}")
+    print(f"no-freeze enabled: {'yes (issuer gave up freeze power)' if flags & 0x00200000 else 'no'}")
+
+
+def cmd_plan_trade(args, cfg, client):
+    base, base_issuer, quote, quote_issuer = C.resolve_pair(args)
+    amount = C.dec(args.amount, "amount")
+    price = C.dec(args.price, "price")
+    side = args.side
+    base_amt = make_currency(base, base_issuer)
+    quote_amt = make_currency(quote, quote_issuer)
+    # walk the side we'd take from: buys take asks, sells take bids
+    if side == "buy":
+        book = book_side(client, base_amt, quote_amt, 50)  # asks
+        get_f, pay_f = "TakerGets", "TakerPays"
+    else:
+        book = book_side(client, quote_amt, base_amt, 50)  # bids
+        get_f, pay_f = "TakerPays", "TakerGets"
+    if not book:
+        sys.exit("Empty book — no liquidity.")
+    best_q, best_b = amt_value(book[0][pay_f]), amt_value(book[0][get_f])
+    mid = best_q[0] / best_b[0]
+    dev = (price - mid) / mid * 100
+    # walk depth at-or-better than our limit
+    filled_base = Decimal(0); spent_quote = Decimal(0)
+    for o in book:
+        qv, _ = amt_value(o[pay_f]); bv, _ = amt_value(o[get_f])
+        px = qv / bv
+        if (side == "buy" and px > price) or (side == "sell" and px < price):
+            break
+        take = min(bv, amount - filled_base)
+        filled_base += take; spent_quote += take * px
+        if filled_base >= amount:
+            break
+    pct = filled_base / amount * 100
+    avg = spent_quote / filled_base if filled_base else Decimal(0)
+    max_spend = (amount * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+    print(f"plan: {side} {amount} {base} @ limit {price} {quote} [{cfg['network']}]")
+    print(f"book mid: {mid:.6f} {quote}  (limit is {dev:+.2f}% vs mid)")
+    print(f"est. fill at limit: {filled_base} {base} ({pct:.1f}%)")
+    if filled_base:
+        print(f"avg fill price: {avg:.6f} {quote}")
+    print(f"max spend: {max_spend} {quote}")
+    if pct < 100:
+        print("NOTE: book is thin at this limit — expect a partial fill, "
+              "rest becomes a resting offer.")
+
+
+def cmd_reconcile(args, cfg, client):
+    r = client.request(Tx(transaction=args.hash))
+    if not r.is_successful():
+        sys.exit(f"tx lookup failed: {r.result}")
+    res = r.result
+    meta = res.get("meta", {})
+    validated = res.get("validated", False)
+    print(f"hash:      {args.hash}")
+    print(f"validated: {validated}")
+    print(f"result:    {meta.get('TransactionResult', '?')}")
+    print(f"ledger:    {res.get('ledger_index', '?')}")
+
+
+# ---------- write commands (propose only) ----------
+
+def need_account(cfg):
+    if not cfg.get("address"):
+        sys.exit("No address configured. Run `xrpl-trade setup` first.")
+    return cfg["address"]
+
+
+def cmd_buy(args, cfg, client):
+    acct = need_account(cfg)
+    base, bi, quote, qi = C.resolve_pair(args)
+    amt = C.dec(args.amount, "amount"); price = C.dec(args.price, "price")
+    cost = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+    tx = build_offer_tx(acct, base, bi, quote, qi, amt, price, "buy",
+                        args.expires_in)
+    propose(tx, client, cfg, "buy",
+            [f"side:   BUY {amt} {base}",
+             f"price:  {price} {quote} per {base}",
+             f"max spend: {cost} {quote}"],
+            {"side": "buy", "base": base, "base_issuer": bi,
+             "quote": quote, "quote_issuer": qi,
+             "amount": str(amt), "price": str(price)})
+
+
+def cmd_sell(args, cfg, client):
+    acct = need_account(cfg)
+    base, bi, quote, qi = C.resolve_pair(args)
+    amt = C.dec(args.amount, "amount"); price = C.dec(args.price, "price")
+    proceeds = (amt * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+    tx = build_offer_tx(acct, base, bi, quote, qi, amt, price, "sell",
+                        args.expires_in)
+    propose(tx, client, cfg, "sell",
+            [f"side:   SELL {amt} {base}",
+             f"price:  {price} {quote} per {base}",
+             f"min proceeds: {proceeds} {quote}"],
+            {"side": "sell", "base": base, "base_issuer": bi,
+             "quote": quote, "quote_issuer": qi,
+             "amount": str(amt), "price": str(price)})
+
+
+def cmd_trustline(args, cfg, client):
+    acct = need_account(cfg)
+    if getattr(args, "pair", None):
+        base, bi, _, _ = C.resolve_pair(args)
+        if base == "XRP":
+            sys.exit("XRP needs no trustline.")
+        currency, issuer = base, bi
+    else:
+        currency, issuer = args.currency.upper(), args.issuer
+    if not issuer:
+        sys.exit("issuer required (pass --issuer or use --pair)")
+    limit = C.dec(args.limit, "limit")
+    tx = TrustSet(account=acct,
+                  limit_amount=iou_amount(currency, issuer, limit))
+    propose(tx, client, cfg, "trustline",
+            [f"token:  {currency}.{issuer}",
+             f"limit:  {limit}"],
+            {"currency": currency, "issuer": issuer})
+
+
 def cmd_cancel(args, cfg, client):
-    wallet = get_wallet(cfg)
-    tx = OfferCancel(account=wallet.classic_address, offer_sequence=int(args.seq))
-    print(f"Cancel offer seq={args.seq} [{cfg['network']}]")
-    submit_and_report(tx, client, wallet, args.dry_run)
+    acct = need_account(cfg)
+    tx = OfferCancel(account=acct, offer_sequence=int(args.seq))
+    propose(tx, client, cfg, "cancel", [f"offer seq: {args.seq}"])
 
 
 def cmd_send(args, cfg, client):
-    wallet = get_wallet(cfg)
-    amt = dec(args.amount, "amount")
+    from xrpl.core.addresscodec import (
+        is_valid_classic_address, is_valid_xaddress,
+        xaddress_to_classic_address)
+    acct = need_account(cfg)
     dest = args.to
-    if not dest.startswith("r"):
-        sys.exit("destination must start with 'r'")
-    amount = xrp_amount(amt) if args.ccy.upper() == "XRP" else \
-        iou_amount(args.ccy, args.issuer or RLUSD_ISSUER, amt)
-    tx = Payment(account=wallet.classic_address, destination=dest, amount=amount)
-    print(f"SEND {amt} {args.ccy.upper()} -> {dest} [{cfg['network']}]")
-    submit_and_report(tx, client, wallet, args.dry_run)
+    tag = None
+    if is_valid_xaddress(dest):
+        dest, tag, _ = xaddress_to_classic_address(dest)
+        print(f"(X-address decoded: {dest}, tag {tag})")
+    elif not is_valid_classic_address(dest):
+        sys.exit("destination is not a valid classic address or X-address")
+    if args.destination_tag is not None:
+        tag = int(args.destination_tag)
+    amt = C.dec(args.amount, "amount")
+    ccy = args.ccy.upper()
+    amount = make_amount(ccy, args.issuer, amt)
+    tx = Payment(account=acct, destination=dest, amount=amount,
+                 destination_tag=tag)
+    lines = [f"send:   {amt} {ccy}",
+             f"to:     {dest}"]
+    if tag is not None:
+        lines.append(f"dest tag: {tag}")
+    else:
+        lines.append("dest tag: NONE — if the recipient is an exchange, "
+                     "funds may not be credited. Use --destination-tag.")
+    propose(tx, client, cfg, "send", lines,
+            {"currency": ccy, "destination": dest})
+
+
+def cmd_setup(_args):
+    print("XRPL setup (v0.2). This stores ONLY your address and network.")
+    print("The seed is never stored by xrpl-trade — the signer reads it from")
+    print("the XRPL_SEED environment variable (or legacy ~/.xrpl/config.json).\n")
+    net = input("network [mainnet/testnet/devnet] (testnet): ").strip() or "testnet"
+    if net not in C.NETWORKS:
+        sys.exit("unknown network")
+    address = input("classic address (r...): ").strip()
+    if not address.startswith("r"):
+        sys.exit("address must start with 'r'")
+    C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    if C.CONFIG_PATH.exists():
+        cfg = json.loads(C.CONFIG_PATH.read_text())
+    cfg.update({"network": net, "address": address})
+    cfg.pop("seed", None)  # v0.2: the proposer never keeps the seed
+    C.CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    os.chmod(C.CONFIG_PATH, 0o600)
+    print(f"\nSaved address {address} on {net}.")
+    print("Next: xrpl-sign init-policy   (creates the signer policy)")
 
 
 def cmd_faucet(args, cfg, _client):
     net = args.network or cfg.get("network", "testnet")
     if net == "mainnet":
         sys.exit("No faucet on mainnet.")
-    url = FAUCETS[net]
-    print(f"Requesting {net} funds...")
     import httpx
-
-    r = httpx.post(url, json={}, timeout=30.0)
+    r = httpx.post(f"https://faucet.altnet.rippletest.net/accounts"
+                   if net == "testnet" else
+                   "https://faucet.devnet.rippletest.net/accounts",
+                   json={}, timeout=30.0)
     r.raise_for_status()
-    data = r.json()
-    acct = data["account"]
+    acct = r.json()["account"]
     address = acct.get("classicAddress") or acct["address"]
-    print(f"address: {address}")
-    print(f"seed:    {data['seed']}   <- save this, it is shown once")
-    print(f"balance: {data.get('amount', '?')} XRP")
-    print(f"\nThen run: xrpl-trade setup   (choose {net}, paste the address + seed)")
+    print(f"address: {address}\nseed: {r.json()['seed']}  <- save once, then:")
+    print(f"  export XRPL_SEED='<seed>'   # for the signer")
+    print(f"  xrpl-trade setup            # register the address")
 
 
 # ---------- main ----------
 
 def main():
     ap = argparse.ArgumentParser(prog="xrpl-trade",
-                                 description="Trade XRP / XRPL IOUs from the terminal.")
-    ap.add_argument("--network", choices=list(NETWORKS),
+                                 description="XRPL proposer: builds tx, never signs.")
+    ap.add_argument("--network", choices=list(C.NETWORKS),
                     help="override configured network")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="build the transaction and print it without submitting")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("setup", help="store wallet (hidden seed prompt, mode 0600)")
+    sub.add_parser("setup", help="store address+network (no seed in v0.2)")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
-    p = sub.add_parser("quote", help="order book top-of-book for any pair")
-    p.add_argument("--pair", default=None, help="approved pair name, e.g. ARMY/XRP")
+    p = sub.add_parser("quote", help="order book for any pair")
+    p.add_argument("--pair", default=None)
     p.add_argument("--base", default="XRP"); p.add_argument("--quote", default="RLUSD")
     p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
-    p.add_argument("--issuer", default=None, help="legacy: IOU issuer for the non-XRP side")
     p.add_argument("--limit", type=int, default=5)
-    p = sub.add_parser("pairs", help="list approved trading pairs")
-    p = sub.add_parser("trustline", help="create/adjust a trustline")
-    p.add_argument("--pair", default=None, help="approved pair name (trustlines the base token)")
+    sub.add_parser("pairs", help="list approved trading pairs")
+    p = sub.add_parser("inspect-token", help="issuer risk: domain, transfer fee, freeze flags")
+    p.add_argument("--currency", required=True); p.add_argument("--issuer", required=True)
+    p = sub.add_parser("plan-trade", help="estimate fill, impact, max spend (read-only)")
+    p.add_argument("--pair", default=None)
+    p.add_argument("--base", default="XRP"); p.add_argument("--quote", default="RLUSD")
+    p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
+    p.add_argument("--side", required=True, choices=["buy", "sell"])
+    p.add_argument("--amount", required=True); p.add_argument("--price", required=True)
+    p = sub.add_parser("reconcile", help="validated outcome of a submitted tx hash")
+    p.add_argument("--hash", required=True)
+
+    def add_offer(p_):
+        p_.add_argument("--pair", default=None)
+        p_.add_argument("--base", default="XRP"); p_.add_argument("--quote", default="RLUSD")
+        p_.add_argument("--base-issuer", default=None); p_.add_argument("--quote-issuer", default=None)
+        p_.add_argument("--amount", required=True, help="amount of BASE")
+        p_.add_argument("--price", required=True, help="QUOTE per BASE")
+        p_.add_argument("--expires-in", type=int, default=3600,
+                       help="offer expiry seconds (default 3600)")
+
+    p = sub.add_parser("buy", help="PROPOSE buy BASE with QUOTE at limit price")
+    add_offer(p)
+    p = sub.add_parser("sell", help="PROPOSE sell BASE for QUOTE at limit price")
+    add_offer(p)
+    p = sub.add_parser("trustline", help="PROPOSE a trustline")
+    p.add_argument("--pair", default=None)
     p.add_argument("--currency", default="RLUSD"); p.add_argument("--issuer", default=None)
     p.add_argument("--limit", default="1000000")
-    p = sub.add_parser("buy", help="buy BASE with QUOTE at a limit price")
-    p.add_argument("--pair", default=None, help="approved pair name, e.g. ARMY/XRP")
-    p.add_argument("--base", default="XRP", help="asset to buy (default XRP)")
-    p.add_argument("--quote", default="RLUSD", help="asset to pay with (default RLUSD)")
-    p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
-    p.add_argument("--amount", required=True, help="amount of BASE to buy")
-    p.add_argument("--price", required=True, help="QUOTE per BASE")
-    p.add_argument("--issuer", default=None, help="legacy: IOU issuer for the non-XRP side")
-    p = sub.add_parser("sell", help="sell BASE for QUOTE at a limit price")
-    p.add_argument("--pair", default=None, help="approved pair name, e.g. ARMY/XRP")
-    p.add_argument("--base", default="XRP", help="asset to sell (default XRP)")
-    p.add_argument("--quote", default="RLUSD", help="asset to receive (default RLUSD)")
-    p.add_argument("--base-issuer", default=None); p.add_argument("--quote-issuer", default=None)
-    p.add_argument("--amount", required=True, help="amount of BASE to sell")
-    p.add_argument("--price", required=True, help="QUOTE per BASE")
-    p.add_argument("--issuer", default=None, help="legacy: IOU issuer for the non-XRP side")
-    p = sub.add_parser("offers", help="list open offers")
-    p.add_argument("address", nargs="?", help="classic address (default: configured)")
-    p = sub.add_parser("cancel", help="cancel an open offer")
-    p.add_argument("--seq", required=True, type=int, help="offer sequence number")
-    p = sub.add_parser("send", help="send XRP or an IOU")
+    p = sub.add_parser("cancel", help="PROPOSE cancelling an open offer")
+    p.add_argument("--seq", required=True, type=int)
+    p = sub.add_parser("send", help="PROPOSE sending XRP or an IOU")
     p.add_argument("--to", required=True); p.add_argument("--amount", required=True)
     p.add_argument("--ccy", default="XRP"); p.add_argument("--issuer", default=None)
+    p.add_argument("--destination-tag", default=None, type=int)
     p = sub.add_parser("faucet", help="fund a fresh testnet/devnet wallet")
     p.add_argument("--network", choices=["testnet", "devnet"], default=None)
 
     args = ap.parse_args()
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
-    if network not in NETWORKS:
+    if network not in C.NETWORKS:
         sys.exit(f"unknown network {network!r}")
     cfg["network"] = network
     client = get_client(network)
@@ -494,10 +507,12 @@ def main():
         "balance": lambda: cmd_balance(args, cfg, client),
         "quote": lambda: cmd_quote(args, cfg, client),
         "pairs": lambda: cmd_pairs(args, cfg, client),
-        "trustline": lambda: cmd_trustline(args, cfg, client),
+        "inspect-token": lambda: cmd_inspect_token(args, cfg, client),
+        "plan-trade": lambda: cmd_plan_trade(args, cfg, client),
+        "reconcile": lambda: cmd_reconcile(args, cfg, client),
         "buy": lambda: cmd_buy(args, cfg, client),
         "sell": lambda: cmd_sell(args, cfg, client),
-        "offers": lambda: cmd_offers(args, cfg, client),
+        "trustline": lambda: cmd_trustline(args, cfg, client),
         "cancel": lambda: cmd_cancel(args, cfg, client),
         "send": lambda: cmd_send(args, cfg, client),
         "faucet": lambda: cmd_faucet(args, cfg, client),
