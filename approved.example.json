@@ -1,7 +1,1 @@
-{
-  "pairs": {
-    "XRP/RLUSD": {"base": "XRP", "base_issuer": null, "quote": "RLUSD", "quote_issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"},
-    "ARMY/XRP": {"base": "ARMY", "base_issuer": "rGG3wQ4kUzd7Jnmk1n5NWPZjjut62kCBfC", "quote": "XRP", "quote_issuer": null}
-  }
-}
-Copy this to ~/.xrpl/approved.json and add your own vetted pairs.
+{"_note":"Copy this file to ~/.xrpl/approved.json and add your own vetted pairs. Tickers mean nothing on XRPL — the issuer address is the token's identity. Only add issuers you have verified.","pairs":{"ARMY/XRP":{"base":"ARMY","base_issuer":"rGG3wQ4kUzd7Jnmk1n5NWPZjjut62kCBfC","quote":"XRP","quote_issuer":null},"XRP/RLUSD":{"base":"XRP","base_issuer":null,"quote":"RLUSD","quote_issuer":"rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"}}}
