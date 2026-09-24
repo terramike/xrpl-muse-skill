@@ -1,0 +1,20 @@
+{
+  "policy_version": 3,
+  "network_lock": "testnet",
+  "max_fee_drops": 1000,
+  "spend_limits": {
+    "XRP": {
+      "per_tx": "25",
+      "per_day": "100"
+    }
+  },
+  "destination_allowlist": [],
+  "max_deviation_bps": 1000,
+  "proposal_ttl_seconds": 86400,
+  "allowed_tx_types": [
+    "OfferCreate",
+    "OfferCancel",
+    "TrustSet",
+    "Payment"
+  ]
+}

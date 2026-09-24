@@ -1,4 +1,4 @@
-# xrpl-muse-skill v0.2
+# xrpl-muse-skill v0.3
 
 Trade the XRP Ledger from the terminal — any token pair — with a hard safety
 boundary between **proposing** a trade and **signing** it.
@@ -13,21 +13,42 @@ This skill splits the job in two:
 
 - **`xrpl-trade`** builds the transaction, autofills it against the live
   network, shows you *everything* (account, network, assets + issuers,
-  amounts, limit price, max spend, fee, expiry), hashes the exact bytes, and
-  stops. It never sees your seed. It cannot submit.
+  amounts, limit price, max spend, fee, expiry), seals it in a **hash-bound
+  proposal envelope**, and stops. It never sees your seed. It cannot submit.
 - **`xrpl-sign`** is the only program that touches the seed (from the
-  `XRPL_SEED` env var). It re-verifies the proposal hash, enforces a policy
-  file (network lock, approved issuers, spend caps, fee caps, price-deviation
-  checks, destination allowlist), and signs **only** with explicit human
-  `--approve` of that exact hash.
+  `XRPL_SEED` env var — never from a config file). It re-verifies the
+  envelope, derives the summary from the transaction itself (nothing stored
+  is trusted), enforces the policy file, and signs **only** with explicit
+  human `--approve` of that exact hash.
 
 ```bash
 xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
 # → full proposal + hash. Nothing submitted.
 
 xrpl-sign --hash a2c72140d080ca0f --approve
-# → policy checks → sign → validated ledger result → audit log
+# → envelope verify → policy checks → sign → persist → validated result
 ```
+
+## What v0.3 hardens
+
+- **Hash-bound envelope** (`xrpl-proposal/3`): the approval hash covers the
+  network, account, action, creation time, policy version, and the canonical
+  XRPL binary of the complete transaction. Tampering with any of it —
+  including the proposal file — voids the approval.
+- **Strict transaction schemas**: only `OfferCreate`, `OfferCancel`,
+  `TrustSet`, `Payment` are signable, and every field is allowlisted per
+  type. No smuggled `Paths`, `SendMax`, memos, or partial-payment flags.
+- **Derived, never stored**: pair, side, amounts, and price are computed
+  from the transaction inside the signer.
+- **Per-asset spend limits**: per-transaction and rolling-24h caps per asset,
+  reserved atomically. Assets with no configured limit are blocked.
+- **Exact-pair enforcement**: offers must match an approved pair exactly —
+  unlisted token/token combinations are denied.
+- **Destination policy**: payments only to allowlisted `(address,
+  destination_tag)` pairs; conflicting X-address/CLI tags rejected;
+  `RequireDestTag` destinations refuse untagged payments.
+- **Crash-safe submission**: sign → persist the signed hash and
+  `LastLedgerSequence` → submit → wait for the validated ledger result.
 
 ## Why the allowlist matters
 
@@ -43,12 +64,13 @@ FUZZY/XRP`
 
 ```bash
 pip install -r requirements.txt
-xrpl-trade setup            # address + network (no seed stored)
-export XRPL_SEED='s…'       # only the signer reads this
-xrpl-sign init-policy       # policy file, testnet-locked by default
+xrpl-trade setup            # address + network (never the seed)
+xrpl-sign init-policy       # policy file v3, testnet-locked by default
 ```
 
-Testnet funds: `xrpl-trade faucet --network testnet`
+The signer reads the seed **only** from `XRPL_SEED`, provided by your secret
+manager or agent vault after human approval. Testnet funds:
+`xrpl-trade faucet --network testnet`
 
 ## What it does
 
@@ -60,8 +82,17 @@ Testnet funds: `xrpl-trade faucet --network testnet`
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) — including the advisory that versions before
-commit `c3273e59` shipped inverted buy/sell and must not be used for trading.
+See [SECURITY.md](SECURITY.md) — including the platform boundary: `--approve`
+is an assertion, not evidence of human approval, and the advisory that
+versions before commit `c3273e59` shipped inverted buy/sell and must not be
+used for trading.
+
+## Tests
+
+```bash
+python3 tests/test_v03.py          # 40 adversarial logic tests, no network
+python3 tests/test_e2e_testnet.py  # 17 end-to-end checks on testnet
+```
 
 ## License
 
