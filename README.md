@@ -41,7 +41,8 @@ yourself:
 bin/xrpl-trade faucet            # fresh testnet wallet + test XRP (prints seed once — save it)
 bin/xrpl-trade setup             # choose testnet, paste address + seed
 bin/xrpl-trade balance           # check it
-bin/xrpl-trade quote             # live RLUSD/XRP order book
+bin/xrpl-trade quote             # live XRP/RLUSD order book
+bin/xrpl-trade quote --pair ARMY/XRP  # any approved pair
 bin/xrpl-trade --dry-run buy --amount 10 --price 1.50   # preview only, submits nothing
 ```
 
@@ -65,10 +66,10 @@ Global flags go before the subcommand: `--network mainnet`,
 |---|---|
 | `setup` | Interactive wallet setup (hidden seed prompt, verifies seed ↔ address) |
 | `balance [address]` | XRP + trustline balances |
-| `quote [--issuer ADDR] [--limit N]` | Top-of-book RLUSD/XRP bids & asks |
+| `quote [--pair NAME] [--limit N]` | Top-of-book bids & asks for any pair |
 | `trustline --currency RLUSD [--issuer ADDR] [--limit N]` | Create/adjust a trustline (TrustSet) |
-| `buy --amount <XRP> --price <RLUSD/XRP>` | Buy XRP with RLUSD at a limit price |
-| `sell --amount <XRP> --price <RLUSD/XRP>` | Sell XRP for RLUSD at a limit price |
+| `buy --amount <BASE> --price <QUOTE/BASE> [--pair NAME]` | Buy BASE with QUOTE at a limit price |
+| `sell --amount <BASE> --price <QUOTE/BASE> [--pair NAME]` | Sell BASE for QUOTE at a limit price |
 | `offers [address]` | Open offers with sequence numbers |
 | `cancel --seq N` | Cancel an open offer |
 | `send --to <addr> --amount <n> [--ccy XRP]` | Send XRP or an IOU |
