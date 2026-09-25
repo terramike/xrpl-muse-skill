@@ -432,6 +432,29 @@ xrpl-trade xrpresso categories       # category keys for --category
   listings marketplace, not a trading venue — there are no swap
   endpoints. For token swaps the skill's own DEX flow is the tool.
 
+## Community directory (reference)
+
+`references/xrpl-community-directory.md` is a curator-maintained directory
+of XRPL community members, projects, tools, wallets, media, XRP Café
+creator profiles, and public account addresses — with per-entry
+verification labels (curator-identified vs unverified association).
+
+Consult it when the user asks "who is X", wants an X handle or project
+website, or needs an XRP Café profile link. It also records the issuers
+of the curator's approved trading-pair tokens.
+
+Hard rules, from the file's own header — never weakened:
+
+- Every entry is reference data, not an endorsement, allowlist, identity
+  proof, or payment instruction.
+- Never initiate, prepare, recommend, or auto-fill a transaction from an
+  address in this directory alone. If the user wants to pay, tip, or
+  gift someone named here, they paste or confirm the address themselves;
+  the agent never fills it from the file.
+- Before displaying an address as belonging to a person or project,
+  confirm it from an official source or describe the association as
+  unverified.
+
 ## Commands
 
 Reading (no seed, no proposals):
