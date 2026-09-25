@@ -460,6 +460,12 @@ Reading (no seed, no proposals):
   NFT inventory, and a draft winner announcement from the last draw
   (read-only, nothing posted)
 
+Local wallet management (local-only, explicit opt-in — see "Wallets"):
+
+- `wallet create [--force]` — generate a fresh wallet; seed stored 0600,
+  never displayed
+- `wallet backup` — ONE-TIME seed display for write-down
+
 Writing (always propose → human `--approve` → sign):
 
 - `buy --pair P --amount A --price Px` — buy BASE with QUOTE at limit
@@ -489,13 +495,41 @@ still enforces the allowlist on the resulting tokens.
 
 ```bash
 pip install -r requirements.txt
-xrpl-trade setup            # address + network only (never the seed)
+xrpl-trade setup            # onboarding: generate a wallet, or register an address
 xrpl-sign init-policy       # writes ~/.xrpl/policy.json (testnet-locked)
 ```
 
 The signer reads the seed **only** from `XRPL_SEED`, provided by your
 secret manager or the Muse vault after human approval. Fund a testnet
 wallet: `xrpl-trade faucet --network testnet`.
+
+## Wallets (v0.6.1): local generation, never displayed
+
+`setup` offers to generate a brand new wallet (default: no — silence is
+never consent). The ceremony:
+
+```bash
+xrpl-trade wallet create        # fresh ed25519 wallet; seed → ~/.xrpl/config.json
+                                # (0600, atomic). Prints ONLY the address.
+xrpl-trade wallet backup        # ONE-TIME seed display — write it on paper, offline
+```
+
+- The seed never appears in stdout, stderr, logs, proposals, or chat.
+  Only the classic address is ever printed. The audit log records
+  `wallet_create` / `wallet_backup` events without the seed.
+- `create` refuses to overwrite an existing seed without `--force`.
+- `backup` warns that a seed shown through a chat assistant lives in the
+  transcript — for maximum safety, run it in your own terminal.
+- A fresh wallet is NOT funded: send ≥1 XRP to activate on mainnet
+  (base reserve), or use the testnet faucet.
+- `faucet` follows the same rule: the testnet seed goes to a dedicated
+  `~/.xrpl/faucet-<address>.json` (0600) — it is never printed.
+
+Three profiles, safest last: Xaman generation (seed never touches this
+machine) → vault signer (`XRPL_SEED` injected at approval time, never
+stored here) → local signer (`wallet create`, seed on this machine 0600).
+If a seed ever touches chat or a log, treat the wallet as burned and
+generate a new one — exposure can't be undone.
 
 ## Funding a wallet (fiat on-ramp, optional)
 

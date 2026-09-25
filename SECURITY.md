@@ -228,6 +228,16 @@ testnet-only.
   wallet with an agent skill.
 - Old-format (`xrpl-proposal/2`) proposals are rejected by the v0.3 signer;
   rebuild them — never hand-edit a proposal file.
+- **Wallet creation:** `wallet create` generates the seed locally and stores
+  it in `~/.xrpl/config.json` (0600, atomic) without ever displaying it —
+  the seed must not appear in stdout, stderr, logs, proposals, or chat.
+  `wallet backup` is the single deliberate display, for write-down. If a
+  seed ever touches chat or a log, the wallet is burned: generate a new one,
+  don't try to salvage it. Onboarding offers generation with default **no**.
+  Honest boundary: on a machine where the agent runs, "never displayed"
+  means transcript/output hygiene plus 0600 — true operator/agent
+  separation needs the privileged-signer profile from "The platform
+  boundary" above.
 
 ## Release & commit hygiene
 

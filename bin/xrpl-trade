@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""xrpl-trade v0.5: the PROPOSER half of the hardened XRPL skill.
+"""xrpl-trade v0.6: the PROPOSER half of the hardened XRPL skill.
 
-This program NEVER sees the wallet seed and NEVER submits a transaction.
+This program NEVER submits a transaction. Write commands (buy/sell/trustline/cancel/send/nft-pin-and-propose/nft-list/nft-send/nft-buy/nft-bid)
 Write commands (buy/sell/trustline/cancel/send/nft-pin-and-propose/nft-list/nft-send/nft-buy/nft-bid)
 build the
 transaction, autofill it against the live network, print the full ceremony
 summary (account, network, assets+issuers, amounts, limit price, max spend,
 fee, expiry), hash the exact bytes-to-be-approved, and save a proposal.
+
+One deliberate exception: `wallet create` generates a fresh wallet locally
+and stores the seed in ~/.xrpl/config.json (0600, atomic) WITHOUT ever
+displaying it — the "local signer" deployment profile. The seed is shown
+exactly once, and only, by `wallet backup`, for write-down. See "Wallets"
+in SKILL.md and the platform boundary in SECURITY.md.
 
 The separate `xrpl-sign` program enforces policy and signs — only after
 independent human approval of that exact hash.
@@ -1268,25 +1274,129 @@ def cmd_nft_new(args, cfg, client):
         C.save_favorites(favs)
 
 
+# ---------- local wallet creation (v0.6.1) ----------
+#
+# New-user onboarding path: generate a fresh wallet LOCALLY and store the
+# seed straight into ~/.xrpl/config.json (0600, atomic). The seed NEVER
+# appears in stdout, stderr, logs, proposals, or chat — only the classic
+# address is ever printed. This is the "local signer" deployment profile:
+# convenient, but the seed lives on this machine. The vault-signer profile
+# (seed injected as XRPL_SEED at approval time, never stored here) remains
+# the safer option, and Xaman generation (seed never touches this machine
+# at all) the safest. See "Wallets" in SKILL.md.
+
+def generate_wallet_into_config(network, force=False):
+    """Generate a fresh ed25519 wallet; store seed 0600, return address.
+
+    Prints nothing. Refuses to overwrite an already-stored seed unless
+    force is set.
+    """
+    from xrpl.wallet import Wallet
+    cfg = {}
+    if C.CONFIG_PATH.exists():
+        cfg = json.loads(C.CONFIG_PATH.read_text())
+    if cfg.get("seed") and not force:
+        sys.exit("a wallet seed is already stored in ~/.xrpl/config.json — "
+                 "refusing to overwrite. Use `xrpl-trade wallet create --force` "
+                 "to replace it (treat the old wallet as burned if its seed "
+                 "was ever exposed).")
+    wallet = Wallet.create()  # ed25519 in this xrpl-py
+    # Belt and braces: the seed must derive the address we report.
+    if Wallet.from_seed(wallet.seed).classic_address != wallet.classic_address:
+        sys.exit("internal error: generated seed does not derive its address")
+    address = wallet.classic_address
+    seed = wallet.seed
+    del wallet
+    cfg.update({"seed": seed, "address": address, "network": network})
+    del seed
+    C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, C.CONFIG_PATH)
+    C.audit("wallet_create", None, None, network, address, "stored",
+            note="seed stored 0600, never displayed")
+    return address
+
+
+def cmd_wallet(args, cfg):
+    """Local-only wallet management: create + one-time backup display."""
+    if args.wallet_cmd == "create":
+        network = args.network or (cfg or {}).get("network", "testnet")
+        if network not in C.NETWORKS:
+            sys.exit(f"unknown network {network!r}")
+        if args.force:
+            print("WARNING: --force replaces the stored seed. The old wallet is")
+            print("no longer controlled by this machine — if its seed was ever")
+            print("exposed, move any funds first.\n")
+        address = generate_wallet_into_config(network, force=args.force)
+        print("New wallet generated locally (ed25519).")
+        print(f"  address: {address}")
+        print(f"  network: {network}")
+        print("  seed: stored in ~/.xrpl/config.json (0600) — never displayed,")
+        print("        never logged, never leaves this machine via this tool.")
+        print()
+        print("Back it up ONCE, right now (write it on paper, offline):")
+        print("  xrpl-trade wallet backup")
+        print()
+        print("This wallet is NOT funded. To activate on mainnet, send at")
+        print(f"least 1 XRP to {address} (base reserve).")
+        print("On testnet:  xrpl-trade faucet --network testnet")
+    elif args.wallet_cmd == "backup":
+        seed = (cfg or {}).get("seed")
+        address = (cfg or {}).get("address")
+        network = (cfg or {}).get("network", "mainnet")
+        if not seed:
+            sys.exit("no seed stored in ~/.xrpl/config.json — nothing to back "
+                     "up (create one with `xrpl-trade wallet create`)")
+        print("=" * 64)
+        print("ONE-TIME BACKUP — write this down NOW, on paper, offline.")
+        print("Anyone holding this seed controls the wallet. Never paste it")
+        print("into chat, email, screenshots, or any app. If it ever touches")
+        print("chat or a log, treat the wallet as BURNED and generate a new one.")
+        print("=" * 64)
+        print(f"  address: {address}")
+        print(f"  seed:    {seed}")
+        print("=" * 64)
+        print("Note: if you ran this through a chat assistant, this transcript")
+        print("now contains the seed — for maximum safety, run this command in")
+        print("your own terminal instead.")
+        C.audit("wallet_backup", None, None, network, address, "displayed",
+                note="seed shown once for write-down; seed never in the log")
+    else:
+        sys.exit(f"unknown wallet subcommand {args.wallet_cmd!r}")
+
+
 def cmd_setup(_args):
-    print("XRPL setup (v0.5). This stores ONLY your address and network.")
-    print("The seed is never stored by xrpl-trade. In production the Muse")
-    print("vault provides XRPL_SEED to the signer after human approval.\n")
+    print("XRPL setup (v0.6). Two paths:")
+    print("  1. Generate a brand new wallet — seed created locally, stored in")
+    print("     ~/.xrpl/config.json (0600), never displayed.")
+    print("  2. Register an existing address (watch-only) — your seed stays")
+    print("     wherever it already is.\n")
+    ans = input("Generate a brand new wallet? (y/N): ").strip().lower()
     net = input("network [mainnet/testnet/devnet] (testnet): ").strip() or "testnet"
     if net not in C.NETWORKS:
         sys.exit("unknown network")
+    C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
+    if ans in ("y", "yes"):
+        address = generate_wallet_into_config(net)
+        print(f"\nWallet {address} generated and stored (seed never displayed).")
+        print("Back it up once, right now:  xrpl-trade wallet backup")
+        print("Next: xrpl-sign init-policy   (creates the signer policy)")
+        return
     address = input("classic address (r...): ").strip()
     if not C.is_valid_classic_address(address):
         sys.exit("not a valid XRPL classic address (base58 checksum failed)")
-    C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
     cfg = {}
     if C.CONFIG_PATH.exists():
         cfg = json.loads(C.CONFIG_PATH.read_text())
     cfg.update({"network": net, "address": address})
-    cfg.pop("seed", None)  # v0.2: the proposer never keeps the seed
-    C.CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
-    os.chmod(C.CONFIG_PATH, 0o600)
-    print(f"\nSaved address {address} on {net}.")
+    cfg.pop("seed", None)  # watch-only path: no seed is kept here
+    tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, C.CONFIG_PATH)
+    print(f"\nSaved address {address} on {net} (watch-only).")
     print("Next: xrpl-sign init-policy   (creates the signer policy)")
 
 
@@ -1302,10 +1412,21 @@ def cmd_faucet(args, cfg, _client):
     r.raise_for_status()
     acct = r.json()["account"]
     address = acct.get("classicAddress") or acct["address"]
-    print(f"address: {address}\nseed: {r.json()['seed']}")
-    print("Save the seed in your vault/secret manager — never in chat,")
-    print("never in a file the agent reads. Then:")
-    print("  xrpl-trade setup            # register the address")
+    seed = r.json()["seed"]
+    # The seed NEVER goes to stdout: dedicated 0600 file, never displayed.
+    # (A separate file — never the main config — so a throwaway testnet
+    # wallet can't clobber a real one.)
+    fp = C.XRPL_DIR / f"faucet-{address}.json"
+    tmp = fp.with_name(fp.name + ".tmp")
+    tmp.write_text(json.dumps({"seed": seed, "address": address,
+                               "network": net}, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, fp)
+    del seed
+    print(f"address: {address}")
+    print(f"seed: stored in {fp} (0600) — never displayed.")
+    print("Throwaway testnet wallet. To sign with it, load XRPL_SEED from")
+    print("that file in your own terminal — never paste it into chat.")
 
 
 # ---------- main ----------
@@ -1704,7 +1825,15 @@ def main():
                     help="override configured network")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("setup", help="store address+network (no seed in v0.2)")
+    sub.add_parser("setup", help="onboarding: new wallet or address+network")
+    p = sub.add_parser("wallet", help="local wallet: create / one-time backup")
+    w = p.add_subparsers(dest="wallet_cmd", required=True)
+    wc = w.add_parser("create",
+                      help="generate a fresh wallet; seed stored 0600, never displayed")
+    wc.add_argument("--force", action="store_true",
+                    help="replace an already-stored seed")
+    w.add_parser("backup",
+                 help="ONE-TIME display of the stored seed — write it down")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
     p = sub.add_parser("quote", help="order book for any pair")
@@ -1944,6 +2073,10 @@ def main():
     if args.cmd == "xrpresso":
         # Public HTTP API: no wallet, no XRPL client, no config needed.
         cmd_xrpresso(args)
+        return
+    if args.cmd == "wallet":
+        # Local-only: key generation and backup display need no network.
+        cmd_wallet(args, load_config())
         return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
