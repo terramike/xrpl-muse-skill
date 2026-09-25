@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xrpl_common v0.4: shared helpers for xrpl-trade (proposer) and xrpl-sign.
+"""xrpl_common v0.5: shared helpers for xrpl-trade (proposer) and xrpl-sign.
 
 No network, no seeds here — parsing, encoding, hashing, summaries, policy
 loading, and the concurrency-safe spend tracker.
@@ -22,12 +22,40 @@ v0.4 hardening:
     created_at not from the future.
   - NaN/Infinity amounts rejected (they poison limit comparisons).
   - Signer refuses to run unless state files are owner-only.
+  - Hardened price validation (both sides, spread cap, min depth,
+    depth-weighted mid), fail-closed RequireDestTag.
+
+v0.5 hardening (NFTs):
+  - NFTokenMint / NFTokenCreateOffer (sell only) join the strict per-type
+    schemas. Mint policy: URI hex <= max_uri_bytes, TransferFee <=
+    min(policy cap, 50000 protocol max), flags restricted to a
+    policy-gated set (default: transferable + burnable), mints per
+    rolling 24h counted from the audit log.
+  - NFTokenCreateOffer: XRP-only amounts (v1), tfSellNFToken required
+    (buy offers need an Owner field, which the schema rejects outright),
+    Expiration required and bounded like other offers. No book-deviation
+    check — each NFTokenID is unique, there is no fungible book.
+
+v0.5 buy side (NFTs, operator-opt-in via nft.allow_buy_offers):
+  - NFTokenAcceptOffer joins the strict schemas (direct mode only:
+    NFTokenSellOffer required; NFTokenBuyOffer / NFTokenBrokerFee are
+    rejected). The spend lives in the referenced sell offer, not in the
+    tx — the signer fetches the offer entry (fail closed) and reserves
+    the XRP amount through the normal spend lifecycle.
+  - Buy-side NFTokenCreateOffer (Owner set, no sell flag) is a bid: the
+    bid XRP is locked like an OfferCreate's TakerGets and counts toward
+    spend limits; policy caps it at nft.max_bid_xrp.
+  - Anti-counterfeit is a reporting duty, not an authenticity claim: both
+    proposer and signer surface the on-ledger seller, token URI, and
+    taxon so the human verifies the minter. The skill never calls a
+    token "authentic".
 """
 import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from decimal import Decimal, InvalidOperation
@@ -41,6 +69,7 @@ PROPOSALS_DIR = XRPL_DIR / "proposals"
 STATE_PATH = XRPL_DIR / "state.json"
 STATE_LOCK_PATH = XRPL_DIR / "state.lock"
 AUDIT_PATH = XRPL_DIR / "audit.log"
+FAVORITES_PATH = XRPL_DIR / "favorites.json"    # named artist watchlist (read-only)
 
 NETWORKS = {
     "mainnet": ["https://s1.ripple.com:51234", "https://s2.ripple.com:51234"],
@@ -50,8 +79,8 @@ NETWORKS = {
 RIPPLE_EPOCH = 946684800  # unix seconds of 2000-01-01T00:00:00Z
 REQUIRE_DEST_TAG_FLAG = 0x00020000  # lsfRequireDestTag
 
-__version__ = "0.4.0"
-POLICY_VERSION = 3
+__version__ = "0.5.0"
+POLICY_VERSION = 4
 ENVELOPE_FORMAT = "xrpl-proposal/3"
 # Fields covered by the proposal hash. Everything safety-critical lives here.
 # Notably: network, creation time, policy version, and the canonical binary
@@ -281,7 +310,10 @@ def verify_envelope_invariants(prop: dict, tx: dict):
     ttype = tx.get("TransactionType")
     action = prop.get("action")
     expected = {"OfferCreate": ("buy", "sell"), "TrustSet": ("trustline",),
-                "OfferCancel": ("cancel",), "Payment": ("send",)}
+                "OfferCancel": ("cancel",), "Payment": ("send",),
+                "NFTokenMint": ("nft-mint",),
+                "NFTokenCreateOffer": ("nft-list", "nft-bid"),
+                "NFTokenAcceptOffer": ("nft-buy",)}
     if action not in expected.get(ttype, ()):
         raise ProposalError(
             f"envelope action {action!r} does not match transaction type "
@@ -297,8 +329,7 @@ def verify_envelope_invariants(prop: dict, tx: dict):
     if prop.get("created_at", 0) > now + MAX_FUTURE_SKEW:
         raise ProposalError(
             "proposal created_at is unreasonably far in the future — refusing")
-    if ttype == "OfferCreate" and action in ("buy", "sell"):
-        # orientation: buy <=> TakerPays is BASE, sell <=> TakerGets is BASE
+    if ttype == "OfferCreate" and action in ("buy", "sell"):        # orientation: buy <=> TakerPays is BASE, sell <=> TakerGets is BASE
         pays, gets = tx.get("TakerPays"), tx.get("TakerGets")
         pay_tok = norm_token(pays["currency"] if isinstance(pays, dict) else "XRP",
                              pays.get("issuer") if isinstance(pays, dict) else None)
@@ -318,6 +349,20 @@ def verify_envelope_invariants(prop: dict, tx: dict):
                         f"envelope says 'sell' but the offer takes BASE "
                         f"({base[0]}) — orientation mismatch, refusing")
                 break
+    if ttype == "NFTokenCreateOffer" and action in ("nft-list", "nft-bid"):
+        # orientation: nft-list <=> pure sell offer (tfSellNFToken, no
+        # Owner); nft-bid <=> buy offer (Owner set, no sell flag). A
+        # relabeled envelope cannot smuggle the other side past review.
+        is_sell = bool(int(tx.get("Flags", 0) or 0) & NFT_SELL_FLAG)
+        has_owner = "Owner" in tx
+        if action == "nft-list" and (not is_sell or has_owner):
+            raise ProposalError(
+                "envelope says 'nft-list' but the offer is not a pure sell "
+                "offer — refusing")
+        if action == "nft-bid" and (is_sell or not has_owner):
+            raise ProposalError(
+                "envelope says 'nft-bid' but the offer is not a buy offer — "
+                "refusing")
 
 
 def load_proposal(prefix: str):
@@ -379,7 +424,42 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
                   f"to:       {short_addr(tx['Destination'])}"]
         tag = tx.get("DestinationTag")
         lines += [f"dest tag: {tag if tag is not None else 'NONE'}"]
+    elif ttype == "NFTokenMint":
+        uri_raw = tx.get("URI", "")
+        try:
+            uri_txt = bytes.fromhex(uri_raw).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            uri_txt = f"<invalid hex: {uri_raw[:32]}…>"
+        fee = int(tx.get("TransferFee") or 0)
+        flags = int(tx.get("Flags") or 0)
+        flag_names = []
+        for bit, name in ((1, "burnable"), (2, "only-xrp"),
+                          (4, "trustline"), (8, "transferable"),
+                          (16, "mutable")):
+            if flags & bit:
+                flag_names.append(name)
+        lines += [f"uri:      {uri_txt}",
+                  f"royalty:  {fee / 1000:.3f}% (transfer fee {fee}/50000)",
+                  f"flags:    {', '.join(flag_names) or 'none'}",
+                  f"taxon:    {tx.get('NFTokenTaxon')}"]
+    elif ttype == "NFTokenCreateOffer":
+        dest = tx.get("Destination")
+        owner = tx.get("Owner")
+        is_sell = bool(int(tx.get("Flags", 0) or 0) & NFT_SELL_FLAG)
+        side = "SELL" if is_sell else "BUY"
+        lines += [f"token:    {tx.get('NFTokenID')}",
+                  f"price:    {fmt_amount(tx['Amount'])} ({side} offer)"]
+        if is_sell:
+            lines.append(f"buyer:    {'anyone (public listing)' if not dest else short_addr(dest) + ' (private)'}")
+        else:
+            lines.append(f"seller:   {short_addr(owner) if owner else 'NONE'} "
+                         f"(buy offer — only they can accept)")
+    elif ttype == "NFTokenAcceptOffer":
+        lines += [f"offer:    {tx.get('NFTokenSellOffer')} (sell-offer index)",
+                  "note:     price / token / seller are re-verified from the",
+                  "          ledger at signing — the index alone decides"]
     else:
+        lines += [f"(no describer for {ttype} — should have been rejected)"]
         lines += [f"(no describer for {ttype} — should have been rejected)"]
     from xrpl.utils import drops_to_xrp
     lines.append(f"fee:      {drops_to_xrp(tx.get('Fee', '0'))} XRP")
@@ -401,14 +481,40 @@ REQUIRED_FIELDS = {
     "OfferCancel": {"OfferSequence"},
     "TrustSet": {"LimitAmount"},
     "Payment": {"Destination", "Amount"},
+    "NFTokenMint": {"NFTokenTaxon", "URI"},
+    "NFTokenCreateOffer": {"NFTokenID", "Amount"},
+    "NFTokenAcceptOffer": {"NFTokenSellOffer"},
 }
 ALLOWED_FIELDS = {
     "OfferCreate": COMMON_FIELDS | {"TakerPays", "TakerGets", "Expiration"},
     "OfferCancel": COMMON_FIELDS | {"OfferSequence"},
     "TrustSet": COMMON_FIELDS | {"LimitAmount"},
     "Payment": COMMON_FIELDS | {"Destination", "Amount", "DestinationTag"},
+    # NOTE: no "Issuer" on NFTokenMint (minting for another issuer is out
+    # of scope). NFTokenCreateOffer allows "Owner" for buy offers (bids);
+    # sell offers must NOT carry it (enforced in check_nft_offer).
+    "NFTokenMint": COMMON_FIELDS | {"NFTokenTaxon", "URI", "TransferFee",
+                                    "Flags"},
+    "NFTokenCreateOffer": COMMON_FIELDS | {"NFTokenID", "Amount",
+                                           "Expiration", "Destination",
+                                           "Owner", "Flags"},
+    # v1 is direct-mode only: NFTokenSellOffer required; NFTokenBuyOffer
+    # (accepting someone's bid = selling into it) and NFTokenBrokerFee
+    # (brokered mode) are unrepresentable here.
+    "NFTokenAcceptOffer": COMMON_FIELDS | {"NFTokenSellOffer"},
 }
-DEFAULT_ALLOWED_TX_TYPES = ["OfferCreate", "OfferCancel", "TrustSet", "Payment"]
+DEFAULT_ALLOWED_TX_TYPES = ["OfferCreate", "OfferCancel", "TrustSet",
+                            "Payment", "NFTokenMint", "NFTokenCreateOffer",
+                            "NFTokenAcceptOffer"]
+
+# NFTokenMint flag bits (xrpl-py NFTokenMintFlag).
+NFT_MINT_FLAG_NAMES = {1: "burnable", 2: "only-xrp", 4: "trustline",
+                       8: "transferable", 16: "mutable"}
+# Absolute protocol ceiling for TransferFee (50000 = 50%). The policy cap
+# can only tighten below this.
+NFT_MAX_TRANSFER_FEE = 50000
+# tfSellNFToken — the only NFTokenCreateOffer flag bit v1 supports.
+NFT_SELL_FLAG = 1
 
 
 def validate_tx_shape(tx: dict, allowed_types) -> list:
@@ -462,6 +568,10 @@ def validate_amounts(tx: dict) -> list:
         p = num(tx.get("Amount"), "Amount")
         if p:
             problems.append(p)
+    elif ttype == "NFTokenCreateOffer":
+        p = num(tx.get("Amount"), "Amount")
+        if p:
+            problems.append(p)
     elif ttype == "TrustSet":
         la = tx.get("LimitAmount", {})
         try:
@@ -471,6 +581,13 @@ def validate_amounts(tx: dict) -> list:
             v = None
         if v is not None and (not v.is_finite() or v < 0):
             problems.append("LimitAmount must be a finite non-negative number")
+    elif ttype == "NFTokenMint":
+        try:
+            ti = int(str(tx.get("NFTokenTaxon")))
+            if not 0 <= ti <= 0xFFFFFFFF:
+                problems.append("NFTokenTaxon out of uint32 range — refusing")
+        except (ValueError, TypeError):
+            problems.append("NFTokenTaxon must be an integer — refusing")
     for f in ("Fee", "Sequence", "LastLedgerSequence"):
         raw = tx.get(f)
         try:
@@ -480,6 +597,524 @@ def validate_amounts(tx: dict) -> list:
         except (ValueError, TypeError):
             problems.append(f"{f} must be a positive integer")
     return problems
+
+
+# ---------- NFT policy checks (v0.5) ----------
+
+def nft_policy(policy: dict) -> dict:
+    """The policy's nft section with v0.5 defaults. Never trust the
+    operator's file to be complete — load_policy merges defaults, but
+    check_policy can also be called with hand-built dicts in tests."""
+    cfg = {
+        "max_transfer_fee": 10000,    # out of 50000 = 10%
+        "max_mints_per_day": 10,
+        "allowed_mint_flags": [1, 8],  # tfBurnable + tfTransferable
+        "max_uri_bytes": 256,
+        # Buy side (nft-buy / nft-bid) is opt-in: accepting sell offers
+        # spends XRP immediately and bids lock XRP, so the operator
+        # enables it deliberately. max_bid_xrp caps a single bid.
+        "allow_buy_offers": False,
+        "max_bid_xrp": "10",
+    }
+    cfg.update(policy.get("nft") or {})
+    return cfg
+
+
+def check_nft_mint(tx: dict, policy: dict) -> list:
+    """Policy denials for an NFTokenMint, derived from the tx + policy."""
+    denials = []
+    cfg = nft_policy(policy)
+
+    uri = tx.get("URI", "")
+    try:
+        raw = bytes.fromhex(uri) if isinstance(uri, str) else None
+    except (ValueError, TypeError):
+        raw = None
+    if raw is None:
+        denials.append("NFTokenMint URI is not valid hex — refusing")
+    elif len(raw) == 0:
+        denials.append("NFTokenMint URI is empty — refusing")
+    elif len(raw) > int(cfg["max_uri_bytes"]):
+        denials.append(
+            f"NFTokenMint URI is {len(raw)} bytes > max "
+            f"{cfg['max_uri_bytes']} — refusing")
+
+    try:
+        fee = int(str(tx.get("TransferFee", 0)))
+    except (ValueError, TypeError):
+        denials.append("TransferFee must be an integer — refusing")
+        fee = None
+    if fee is not None:
+        cap = min(int(cfg["max_transfer_fee"]), NFT_MAX_TRANSFER_FEE)
+        if not 0 <= fee <= cap:
+            denials.append(
+                f"TransferFee {fee} outside [0, {cap}] "
+                f"(policy cap {cfg['max_transfer_fee']}, protocol max "
+                f"{NFT_MAX_TRANSFER_FEE}) — refusing")
+
+    try:
+        flags = int(str(tx.get("Flags", 0)))
+    except (ValueError, TypeError):
+        denials.append("Flags must be an integer — refusing")
+        flags = None
+    if flags is not None:
+        allowed_bits = 0
+        for b in cfg["allowed_mint_flags"]:
+            allowed_bits |= int(b)
+        if flags & ~allowed_bits:
+            names = ", ".join(
+                NFT_MINT_FLAG_NAMES.get(b, f"bit{b}")
+                for b in NFT_MINT_FLAG_NAMES if flags & b and not allowed_bits & b)
+            denials.append(
+                f"mint flags {flags} include disallowed bits ({names}) — "
+                f"policy allows {sorted(cfg['allowed_mint_flags'])}; refusing")
+
+    return denials
+
+
+def check_nft_offer(tx: dict, policy: dict) -> list:
+    """Policy denials for an NFTokenCreateOffer — sell offers AND buy
+    offers (bids). A buy offer is identified by the Owner field."""
+    denials = []
+    cfg = nft_policy(policy)
+
+    nid = tx.get("NFTokenID", "")
+    if not (isinstance(nid, str) and len(nid) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in nid)):
+        denials.append("NFTokenID must be 64 hex characters — refusing")
+
+    try:
+        flags = int(str(tx.get("Flags", 0)))
+    except (ValueError, TypeError):
+        denials.append("Flags must be an integer — refusing")
+        flags = None
+
+    owner = tx.get("Owner")
+    is_buy = owner is not None
+
+    if is_buy:
+        # ---- buy offer (bid) ----
+        if not cfg.get("allow_buy_offers", False):
+            denials.append(
+                "nft buy side is disabled by policy "
+                "(nft.allow_buy_offers=false) — refusing")
+        if flags is not None:
+            if flags & NFT_SELL_FLAG:
+                denials.append(
+                    "buy offer must not set tfSellNFToken — refusing")
+            if flags & ~NFT_SELL_FLAG:
+                denials.append(
+                    f"unknown NFTokenCreateOffer flag bits in {flags} — "
+                    f"refusing")
+        amt = tx.get("Amount")
+        if not isinstance(amt, str):
+            denials.append("v1 bids are XRP-only (Amount must be drops) — "
+                           "refusing")
+        else:
+            try:
+                from xrpl.utils import drops_to_xrp
+                bid = Decimal(drops_to_xrp(amt))
+            except Exception:  # noqa: BLE001
+                denials.append("bid Amount is not valid drops — refusing")
+                bid = None
+            if bid is not None:
+                cap = Decimal(str(cfg.get("max_bid_xrp", "10")))
+                if bid > cap:
+                    denials.append(
+                        f"bid {bid} XRP > policy max_bid_xrp {cap} — refusing")
+        if not is_valid_classic_address(owner):
+            denials.append("Owner is not a valid classic address — refusing")
+    else:
+        # ---- sell offer ----
+        if flags is not None:
+            if not flags & NFT_SELL_FLAG:
+                denials.append(
+                    "only SELL offers are supported (tfSellNFToken required) "
+                    "— refusing")
+            if flags & ~NFT_SELL_FLAG:
+                denials.append(
+                    f"unknown NFTokenCreateOffer flag bits in {flags} — "
+                    f"refusing")
+        if not isinstance(tx.get("Amount"), str):
+            denials.append("v1 listings are XRP-only (Amount must be drops) — "
+                           "refusing")
+
+    dest = tx.get("Destination")
+    if dest is not None and not is_valid_classic_address(dest):
+        denials.append("Destination is not a valid classic address — refusing")
+
+    return denials
+
+
+# Synthetic asset key for the rolling NFT mint quota. Mint counts are not
+# currency spends, but they reserve through the same atomic SpentTracker
+# lifecycle so parallel signers cannot overshoot the cap.
+NFT_MINT_ASSET = "NFT_MINT"
+
+
+def check_mint_rate(policy: dict, tracker) -> list:
+    """Provisional (non-mutating) rolling-24h mint check.
+
+    Pending reservations count, so a second concurrent signer sees the
+    first signer's in-flight mint. The atomic reservation happens at
+    signing time in xrpl-sign.
+    """
+    cfg = nft_policy(policy)
+    cap = int(cfg["max_mints_per_day"])
+    return tracker.check_count(NFT_MINT_ASSET, 1, cap)
+
+
+def fetch_nft_offer_entry(client, offer_index: str):
+    """Fetch an NFTokenOffer ledger entry by its index. Returns
+    (entry_dict, problem). problem is None on success. Fail closed:
+    any lookup failure is a problem, never an assumption."""
+    from xrpl.models.requests import LedgerEntry
+    if not (isinstance(offer_index, str) and len(offer_index) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in offer_index)):
+        return None, ("offer index must be 64 hex characters — refusing")
+    try:
+        r = client.request(LedgerEntry(index=offer_index.upper()))
+    except Exception as e:  # noqa: BLE001
+        return None, (f"could not read the offer from the ledger: {e} — "
+                       f"refusing")
+    if not r.is_successful():
+        return None, (f"offer not on ledger (entryNotFound or node error) — "
+                       f"refusing")
+    node = (r.result or {}).get("node")
+    if not isinstance(node, dict):
+        return None, "ledger returned a malformed offer entry — refusing"
+    return node, None
+
+
+def fetch_nft_meta(client, owner: str, nftoken_id: str):
+    """On-ledger NFT metadata (URI text, taxon) for one token. Returns
+    (uri_text, taxon, problem). A missing token is a problem — this is
+    the counterfeit check: the seller must actually own the token on
+    the ledger right now."""
+    from xrpl.models.requests import AccountNFTs
+    marker = None
+    while True:
+        try:
+            r = client.request(AccountNFTs(account=owner, limit=400,
+                                           marker=marker))
+        except Exception as e:  # noqa: BLE001
+            return None, None, (f"could not read the seller's NFTs: {e} — "
+                                f"refusing")
+        if not r.is_successful():
+            return None, None, ("could not read the seller's NFTs "
+                                "(node error) — refusing")
+        for n in (r.result or {}).get("account_nfts", []):
+            if n.get("NFTokenID") == nftoken_id:
+                uri_hex = n.get("URI", "")
+                try:
+                    uri_txt = bytes.fromhex(uri_hex).decode("utf-8", "replace")
+                except (ValueError, TypeError):
+                    uri_txt = "<uri is not valid hex>"
+                return uri_txt, n.get("NFTokenTaxon"), None
+        marker = (r.result or {}).get("marker")
+        if not marker:
+            break
+    return None, None, ("token not found in the seller's inventory — the "
+                       "seller may no longer own it — refusing")
+
+
+def nft_sell_offer_report(client, offer_index: str):
+    """Full verification of an NFT sell offer from the ledger.
+
+    Returns (report_lines, denials, xrp_amount_or_None). The report is
+    the anti-counterfeit ceremony: seller, token id, price, on-ledger
+    URI and taxon — facts for the human to judge, never an authenticity
+    claim."""
+    from xrpl.utils import drops_to_xrp
+    lines = []
+    entry, problem = fetch_nft_offer_entry(client, offer_index)
+    if problem:
+        return [], [problem], None
+    if entry.get("LedgerEntryType") != "NFTokenOffer":
+        return [], [f"ledger entry is {entry.get('LedgerEntryType')}, not an "
+                    f"NFT offer — refusing"], None
+    flags = int(entry.get("Flags", 0) or 0)
+    if not flags & NFT_SELL_FLAG:
+        return [], ["the offer is a BUY offer, not a sell offer — "
+                    "nft-buy only accepts sell offers — refusing"], None
+    amount = entry.get("Amount")
+    if not isinstance(amount, str):
+        return [], ["sell offer is denominated in an IOU — v1 nft-buy is "
+                    "XRP-only — refusing"], None
+    try:
+        price = Decimal(drops_to_xrp(amount))
+    except Exception:  # noqa: BLE001
+        return [], ["sell offer amount is not valid drops — refusing"], None
+    seller = entry.get("Owner", "?")
+    nid = entry.get("NFTokenID", "?")
+    uri_txt, taxon, meta_problem = fetch_nft_meta(client, seller, nid)
+    lines.append(f"offer:    {offer_index.upper()}")
+    lines.append(f"seller:   {seller}")
+    lines.append(f"token:    {nid}")
+    lines.append(f"price:    {price} XRP")
+    if meta_problem:
+        return lines, [meta_problem], None
+    if len(uri_txt) > 120:
+        uri_txt = uri_txt[:117] + "..."
+    lines.append(f"uri:      {uri_txt}")
+    lines.append(f"taxon:    {taxon}")
+    expiry = entry.get("Expiration")
+    if expiry is not None:
+        import datetime as _dt
+        unix = expiry + 946684800
+        lines.append(
+            "expires:  " + _dt.datetime.fromtimestamp(
+                unix, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    return lines, [], price
+
+
+# ---------- artist favorites (read-only watchlist) ----------
+
+class FavoritesError(ValueError):
+    """The favorites file is corrupt or an operation is invalid."""
+
+
+FAVORITE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+XRP_CAFE_NFT_URL = "https://xrp.cafe/nft/{}"
+# account_tx pages per favorite per nft-new run (newest-first, so a few
+# pages cover any sane artist wallet; the window stop-condition usually
+# fires long before the cap).
+NFT_NEW_MAX_PAGES = 5
+NFT_NEW_PAGE_LIMIT = 200
+
+
+def load_favorites(path=None):
+    """Load the named watchlist. {} when absent. Raises FavoritesError
+    on corrupt JSON — fail loud, never silently empty."""
+    p = Path(path) if path else FAVORITES_PATH
+    if not p.exists():
+        return {}
+    try:
+        favs = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise FavoritesError(
+            f"favorites file is unreadable ({p}): {e} — fix or delete it")
+    if not isinstance(favs, dict):
+        raise FavoritesError(f"favorites file is not a JSON object ({p})")
+    return favs
+
+
+def save_favorites(favs, path=None):
+    """Persist the watchlist atomically, owner-only 0600."""
+    p = Path(path) if path else FAVORITES_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(favs, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+
+
+def validate_favorite_name(name):
+    """Returns a problem string, or None when the name is usable."""
+    if not isinstance(name, str) or not FAVORITE_NAME_RE.match(name):
+        return (f"favorite name {name!r} is invalid — use 1-32 chars: "
+                "lowercase letters, digits, '-' or '_'")
+    return None
+
+
+def resolve_fav_or_addr(token, favs):
+    """Resolve a favorite name or classic address for READ commands.
+    Returns (address, problem). Favorites take precedence; anything
+    else is a problem, never a guess. Writes never use this — exact
+    addresses only."""
+    if isinstance(token, str) and token in favs \
+            and isinstance(favs[token], dict):
+        return favs[token].get("address"), None
+    if is_valid_classic_address(token):
+        return token, None
+    return None, (f"{token!r} is neither a favorite name nor a valid "
+                  "classic address (base58 checksum failed)")
+
+
+def decode_nft_uri(uri_hex, limit=90):
+    """Hex-decode an NFToken URI for display. Never raises."""
+    try:
+        txt = bytes.fromhex(uri_hex or "").decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return "<uri is not valid hex>"
+    if len(txt) > limit:
+        txt = txt[:limit - 1] + "…"
+    return txt
+
+
+def get_validated_ledger(client):
+    """Current validated ledger index. Returns (index, problem)."""
+    from xrpl.models.requests import Ledger
+    try:
+        r = client.request(Ledger(ledger_index="validated"))
+    except Exception as e:  # noqa: BLE001
+        return None, f"could not read the validated ledger: {e}"
+    if not r.is_successful():
+        return None, f"could not read the validated ledger: {r.result}"
+    idx = (r.result or {}).get("ledger_index")
+    if not isinstance(idx, int):
+        return None, "validated ledger response had no ledger_index"
+    return idx, None
+
+
+def _entry_ripple_date(entry, tx):
+    """Ripple-epoch date for an account_tx entry.
+
+    Prefers the transaction's own ``date``; falls back to the entry's
+    ``close_time_iso`` (ledger close time) when the node omits it.
+    Returns None when neither is available.
+    """
+    ripple_date = tx.get("date")
+    if isinstance(ripple_date, int):
+        return ripple_date
+    iso = entry.get("close_time_iso")
+    if isinstance(iso, str):
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            unix = int(dt.replace(tzinfo=timezone.utc).timestamp())
+            return unix - RIPPLE_EPOCH
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+def extract_mint_token_ids(meta):
+    """NFTokenIDs created by one NFTokenMint, from its tx metadata.
+
+    A first mint creates the NFTokenPage (CreatedNode/NewFields); later
+    mints modify it (ModifiedNode) — those are found by diffing
+    FinalFields against PreviousFields. The metadata's top-level
+    ``nftoken_id`` (present on some nodes) is used as a fallback.
+    Returns a list (usually one). Never raises.
+    """
+    if not isinstance(meta, dict):
+        return []
+    created, final_ids, prev_ids = [], set(), set()
+    for node in meta.get("AffectedNodes", []) or []:
+        if not isinstance(node, dict):
+            continue
+        for kind in ("CreatedNode", "ModifiedNode"):
+            nd = node.get(kind)
+            if not isinstance(nd, dict):
+                continue
+            if nd.get("LedgerEntryType") != "NFTokenPage":
+                continue
+            new_fields = nd.get("NewFields") or {}
+            for t in new_fields.get("NFTokens", []) or []:
+                nid = (t.get("NFToken") or {}).get("NFTokenID")
+                if nid:
+                    created.append(nid)
+            for fkey, dest in (("FinalFields", final_ids),
+                               ("PreviousFields", prev_ids)):
+                for t in (nd.get(fkey) or {}).get("NFTokens", []) or []:
+                    nid = (t.get("NFToken") or {}).get("NFTokenID")
+                    if nid:
+                        dest.add(nid)
+    if created:
+        return created
+    diffed = sorted(final_ids - prev_ids)
+    if diffed:
+        return diffed
+    # Some nodes echo the minted token at the metadata top level.
+    nid = meta.get("nftoken_id")
+    return [nid] if nid else []
+
+
+def scan_artist_mints(client, address, stop_ledger=None, cutoff_unix=None,
+                      max_pages=NFT_NEW_MAX_PAGES,
+                      page_limit=NFT_NEW_PAGE_LIMIT):
+    """Newest-first account_tx walk filtered to NFTokenMint.
+
+    Stops at the first tx at/past stop_ledger (watermark) or older than
+    cutoff_unix, or after max_pages. Returns (mints, pages_used,
+    problem). Each mint: {ledger_index, date_unix, uri_hex, taxon,
+    token_ids}. A lookup failure is a soft problem for the caller to
+    report per-favorite — this is a read-only digest, not a gate."""
+    from xrpl.models.requests import AccountTx
+    mints, marker, pages = [], None, 0
+    while True:
+        try:
+            r = client.request(AccountTx(account=address, limit=page_limit,
+                                         marker=marker))
+        except Exception as e:  # noqa: BLE001
+            return mints, pages, f"account_tx failed: {e}"
+        if not r.is_successful():
+            return mints, pages, \
+                f"account_tx failed: {(r.result or {}).get('error', r.result)}"
+        for entry in (r.result or {}).get("transactions", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            li = entry.get("ledger_index")
+            if stop_ledger is not None and isinstance(li, int) \
+                    and li <= stop_ledger:
+                return mints, pages + 1, None
+            tx = entry.get("tx") or entry.get("tx_json") or {}
+            if tx.get("TransactionType") != "NFTokenMint":
+                continue
+            ripple_d = _entry_ripple_date(entry, tx)
+            unix = ripple_d + RIPPLE_EPOCH \
+                if isinstance(ripple_d, (int, float)) else None
+            if cutoff_unix is not None and unix is not None \
+                    and unix < cutoff_unix:
+                return mints, pages + 1, None
+            mints.append({
+                "ledger_index": li,
+                "date_unix": unix,
+                "uri_hex": tx.get("URI", ""),
+                "taxon": tx.get("NFTokenTaxon"),
+                "token_ids": extract_mint_token_ids(
+                    entry.get("meta") or entry.get("metaData")),
+            })
+        marker = (r.result or {}).get("marker")
+        pages += 1
+        if not marker or pages >= max_pages:
+            break
+    return mints, pages, None
+
+
+def nft_sell_price(client, nft_id):
+    """Cheapest current listing for one token. Returns (price_text,
+    problem): price_text is None when not listed; problem is a soft
+    lookup failure (best-effort read, not a gate)."""
+    from xrpl.models.requests import NFTSellOffers
+    try:
+        r = client.request(NFTSellOffers(nft_id=nft_id))
+    except Exception as e:  # noqa: BLE001
+        return None, f"sell-offer lookup failed: {e}"
+    if not r.is_successful():
+        return None, "sell-offer lookup failed"
+    offers = (r.result or {}).get("offers", []) or []
+    if not offers:
+        return None, None
+    xrp = []
+    for o in offers:
+        a = o.get("Amount")
+        if isinstance(a, str):
+            try:
+                from xrpl.utils import drops_to_xrp
+                xrp.append((Decimal(drops_to_xrp(a)), o))
+            except Exception:  # noqa: BLE001
+                continue
+    if xrp:
+        return fmt_amount(min(xrp, key=lambda p: p[0])[1]["Amount"]), None
+    return fmt_amount(offers[0].get("Amount")), None
+
+
+def check_nft_accept_offer(tx: dict, client, policy: dict):
+    """Policy denials for an NFTokenAcceptOffer + the XRP amount it will
+    spend (fetched from the live offer entry). Returns (denials,
+    xrp_amount_or_None)."""
+    denials = []
+    if not nft_policy(policy).get("allow_buy_offers", False):
+        return (["nft buy side is disabled by policy "
+                 "(nft.allow_buy_offers=false) — refusing"], None)
+    offer_index = tx.get("NFTokenSellOffer", "")
+    _lines, od, amount = nft_sell_offer_report(client, offer_index)
+    denials.extend(od)
+    if denials:
+        return denials, None
+    return [], amount
 
 
 # ---------- tx introspection (from tx JSON only) ----------
@@ -524,7 +1159,15 @@ def tx_spends(tx):
     elif ttype == "Payment":
         amt = tx.get("Amount")
         add(asset_key(amt), amount_value(amt))
-    # TrustSet / OfferCancel spend nothing beyond the fee
+    # TrustSet / OfferCancel / NFTokenMint / NFTokenCreateOffer (sell)
+    # spend nothing beyond the fee. Buy offers (bids) DO spend: the bid
+    # XRP locks in the offer, so it counts like OfferCreate's TakerGets.
+    # (NFTokenAcceptOffer's spend lives in the referenced sell offer —
+    # the signer folds it in via check_nft_accept_offer.)
+    if ttype == "NFTokenCreateOffer":
+        amt = tx.get("Amount")
+        if tx.get("Owner") is not None and isinstance(amt, str):
+            add("XRP", Decimal(drops_to_xrp(amt)))
     add("XRP", Decimal(drops_to_xrp(tx.get("Fee", "0"))))
     return spends
 
@@ -545,6 +1188,14 @@ DEFAULT_POLICY = {
     "max_offer_lifetime_seconds": 86400,
     "proposal_ttl_seconds": 86400,
     "allowed_tx_types": DEFAULT_ALLOWED_TX_TYPES,
+    "nft": {
+        "max_transfer_fee": 10000,    # out of 50000 = 10%
+        "max_mints_per_day": 10,
+        "allowed_mint_flags": [1, 8],  # tfBurnable + tfTransferable
+        "max_uri_bytes": 256,
+        "allow_buy_offers": False,    # opt-in: nft-buy / nft-bid
+        "max_bid_xrp": "10",          # per-bid cap when buys are enabled
+    },
 }
 
 
@@ -567,7 +1218,8 @@ def check_protected_files():
     """Fail closed unless signer state is owner-only.
 
     The protected deployment boundary is: the xrpl-sign program itself,
-    policy.json, approved.json, state.json, state.lock, audit.log. (The
+    policy.json, approved.json, favorites.json, state.json, state.lock,
+    audit.log. (The
     binary is a deployment concern — documented in SECURITY.md.) If the
     agent can rewrite policy or delete state, daily limits are fiction.
     Proposals stay agent-writable: they are treated as hostile input and
@@ -578,8 +1230,8 @@ def check_protected_files():
         euid = os.geteuid()
     except AttributeError:
         return  # non-POSIX: deployment must protect these another way
-    for p in (POLICY_PATH, APPROVED_PATH, STATE_PATH, STATE_LOCK_PATH,
-              AUDIT_PATH):
+    for p in (POLICY_PATH, APPROVED_PATH, FAVORITES_PATH, STATE_PATH,
+              STATE_LOCK_PATH, AUDIT_PATH):
         if not p.exists():
             continue
         st = p.stat()
@@ -715,6 +1367,49 @@ class SpentTracker:
                 entries.append({"rid": rid, "ts": now, "asset": asset,
                                 "amount": str(amt), "status": "pending",
                                 "tx_hash": None, "last_ledger": None})
+            self._save({"entries": entries})
+        return [], rid
+
+    # ---- synthetic count reservations (NFT mint quota) ----
+    #
+    # A mint is not a currency spend, but the rolling cap needs the same
+    # atomicity: check+reserve in one locked section so parallel signers
+    # cannot both slip under the cap. Count entries ride the normal
+    # pending -> bound -> confirmed/released lifecycle, so sweep_pending()
+    # and ambiguous-submission handling work unchanged.
+
+    @staticmethod
+    def _count(entries, asset):
+        return sum(int(e.get("amount", "0")) for e in entries
+                   if e.get("asset") == asset)
+
+    def check_count(self, asset, amount, cap) -> list:
+        """Denial reasons if reserving `amount` more of `asset` would breach
+        `cap`. Does not mutate."""
+        with self._locked():
+            entries = self._prune(self._load()["entries"], int(time.time()))
+            n = self._count(entries, asset)
+            if n + amount > cap:
+                return [f"{asset}: {n} in the last 24h + {amount} would "
+                        f"exceed cap {cap} — refusing"]
+            return []
+
+    def try_reserve_count(self, asset, amount, cap):
+        """Atomically check a count cap AND record a pending count entry.
+
+        Returns (denials, reservation_id). Empty denials = reserved."""
+        import uuid
+        rid = uuid.uuid4().hex[:16]
+        with self._locked():
+            now = int(time.time())
+            entries = self._prune(self._load()["entries"], now)
+            n = self._count(entries, asset)
+            if n + amount > cap:
+                return ([f"{asset}: {n} in the last 24h + {amount} would "
+                         f"exceed cap {cap} — refusing"], None)
+            entries.append({"rid": rid, "ts": now, "asset": asset,
+                            "amount": str(amount), "status": "pending",
+                            "tx_hash": None, "last_ledger": None})
             self._save({"entries": entries})
         return [], rid
 

@@ -361,7 +361,8 @@ with tempfile.TemporaryDirectory() as td:
     # a hand-crafted envelope carrying an un-encodable tx is rejected cleanly
     evil_env = {"format": C.ENVELOPE_FORMAT, "network": "testnet",
                 "account": ACCT, "action": "send",
-                "created_at": int(time.time()), "policy_version": 3,
+                "created_at": int(time.time()),
+                "policy_version": C.POLICY_VERSION,
                 "tx": nan_pay, "tx_binary": "00"}
     core = {k: evil_env[k] for k in C.ENVELOPE_HASH_KEYS}
     evil_env["proposal_hash"] = C.canonical_hash(core)

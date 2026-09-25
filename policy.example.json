@@ -1,23 +1,37 @@
 {
-  "policy_version": 3,
-  "network_lock": "testnet",
+  "allowed_tx_types": [
+    "OfferCreate",
+    "OfferCancel",
+    "TrustSet",
+    "Payment",
+    "NFTokenMint",
+    "NFTokenCreateOffer",
+    "NFTokenAcceptOffer"
+  ],
+  "destination_allowlist": [],
+  "max_deviation_bps": 1000,
   "max_fee_drops": 1000,
+  "max_offer_lifetime_seconds": 86400,
+  "max_spread_bps": 1000,
+  "min_book_depth": "5",
+  "network_lock": "testnet",
+  "nft": {
+    "allow_buy_offers": false,
+    "allowed_mint_flags": [
+      1,
+      8
+    ],
+    "max_bid_xrp": "10",
+    "max_mints_per_day": 10,
+    "max_transfer_fee": 10000,
+    "max_uri_bytes": 256
+  },
+  "policy_version": 4,
+  "proposal_ttl_seconds": 86400,
   "spend_limits": {
     "XRP": {
       "per_day": "100",
       "per_tx": "25"
     }
-  },
-  "destination_allowlist": [],
-  "max_deviation_bps": 1000,
-  "max_spread_bps": 1000,
-  "min_book_depth": "5",
-  "max_offer_lifetime_seconds": 86400,
-  "proposal_ttl_seconds": 86400,
-  "allowed_tx_types": [
-    "OfferCreate",
-    "OfferCancel",
-    "TrustSet",
-    "Payment"
-  ]
+  }
 }

@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""xrpl-trade v0.4: the PROPOSER half of the hardened XRPL skill.
+"""xrpl-trade v0.5: the PROPOSER half of the hardened XRPL skill.
 
 This program NEVER sees the wallet seed and NEVER submits a transaction.
-Write commands (buy/sell/trustline/cancel/send) build the transaction,
-autofill it against the live network, print the full ceremony summary
-(account, network, assets+issuers, amounts, limit price, max spend, fee,
-expiry), hash the exact bytes-to-be-approved, and save a proposal.
+Write commands (buy/sell/trustline/cancel/send/nft-mint/nft-list/nft-buy/nft-bid)
+build the
+transaction, autofill it against the live network, print the full ceremony
+summary (account, network, assets+issuers, amounts, limit price, max spend,
+fee, expiry), hash the exact bytes-to-be-approved, and save a proposal.
 
 The separate `xrpl-sign` program enforces policy and signs — only after
 independent human approval of that exact hash.
 
-Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile.
+Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile,
+nft-inventory, favorites, nft-new.
+NFT: nft-mint pins artwork + metadata to IPFS with the operator's own
+Pinata key (bring-your-own-key — the skill never hosts anyone's media),
+then proposes the mint; nft-list proposes an XRP-denominated sell offer.
 """
 import argparse
 import asyncio
@@ -30,12 +35,22 @@ try:
     from xrpl.models.currencies import IssuedCurrency, XRP
     from xrpl.models.requests import (
         AccountInfo, AccountLines, AccountOffers, BookOffers, ServerInfo, Tx,
+        AccountNFTs,
     )
     from xrpl.models.transactions import OfferCancel, OfferCreate, Payment, TrustSet
+    from xrpl.models.transactions import (NFTokenAcceptOffer,
+                                          NFTokenCreateOffer,
+                                          NFTokenCreateOfferFlag,
+                                          NFTokenMint, NFTokenMintFlag)
     from xrpl.transaction import autofill
     from xrpl.utils import drops_to_xrp, xrp_to_drops
 except ImportError:
     sys.exit("xrpl-py not installed. Run: pip install -r requirements.txt")
+
+try:
+    import xrpl_pin
+except ImportError:
+    xrpl_pin = None  # NFT minting unavailable; other commands unaffected
 
 
 # ---------- config / client ----------
@@ -404,8 +419,349 @@ def cmd_send(args, cfg, client):
     propose(tx, client, cfg, "send", lines)
 
 
+# ---------- NFT commands (v0.5) ----------
+
+def cmd_nft_mint(args, cfg, client):
+    """Pin art + metadata to IPFS (operator's own Pinata key), then PROPOSE
+    an NFTokenMint whose URI points at the metadata CID."""
+    if xrpl_pin is None:
+        sys.exit("xrpl_pin module missing — cannot pin.")
+    acct = need_account(cfg)
+    royalty_bps = int(args.royalty_bps)
+    if not 0 <= royalty_bps <= 5000:
+        sys.exit("royalty must be 0..5000 bps (protocol max is 50%)")
+    taxon = int(args.taxon)
+    if not 0 <= taxon <= 0xFFFFFFFF:
+        sys.exit("taxon must fit in a uint32")
+    print("pinning artwork to IPFS (your Pinata key)…")
+    image_cid, metadata_cid = xrpl_pin.pin_artwork(
+        args.file, args.name, args.description or "")
+    uri = f"ipfs://{metadata_cid}"
+    uri_hex = uri.encode("utf-8").hex().upper()
+    if len(uri.encode("utf-8")) > 256:
+        sys.exit("metadata URI exceeds the 256-byte ledger limit")
+    # XRPL TransferFee is in 1/100000 units: 10000 = 10% = 1000 bps.
+    # So TransferFee = royalty_bps * 10 (e.g. 1000 bps -> 10000).
+    transfer_fee = royalty_bps * 10
+    tx = NFTokenMint(
+        account=acct,
+        nftoken_taxon=taxon,
+        uri=uri_hex,
+        transfer_fee=transfer_fee,
+        flags=int(NFTokenMintFlag.TF_TRANSFERABLE)
+        | int(NFTokenMintFlag.TF_BURNABLE),
+    )
+    propose(tx, client, cfg, "nft-mint",
+            [f"nft:      {args.name}",
+             f"image:    ipfs://{image_cid}",
+             f"metadata: {uri}",
+             f"royalty:  {royalty_bps / 100:.2f}% "
+             f"(immutable after mint — verify it)",
+             f"flags:    transferable + burnable",
+             f"taxon:    {taxon}",
+             "note:     the ledger stores the URI, not the art — "
+             "keep the IPFS pin alive"])
+
+
+def cmd_nft_list(args, cfg, client):
+    """PROPOSE an NFTokenCreateOffer SELL offer for an owned NFT.
+    v1: XRP-denominated only, Expiration always required."""
+    acct = need_account(cfg)
+    nid = args.token_id.strip()
+    if len(nid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in nid):
+        sys.exit("token id must be 64 hex characters")
+    price = C.dec(args.price_xrp, "price")
+    dest = args.destination
+    if dest is not None and not C.is_valid_classic_address(dest):
+        sys.exit("destination is not a valid classic address "
+                 "(base58 checksum failed)")
+    tx = NFTokenCreateOffer(
+        account=acct,
+        nftoken_id=nid.upper(),
+        amount=xrp_to_drops(price),
+        expiration=C.ripple_time_from_now(args.expires_in),
+        destination=dest,
+        flags=int(NFTokenCreateOfferFlag.TF_SELL_NFTOKEN),
+    )
+    lines = [f"token:    {nid.upper()}",
+             f"price:    {price} XRP (SELL offer)"]
+    if dest:
+        lines.append(f"buyer:    {dest} (PRIVATE — only they can accept)")
+    else:
+        lines.append("buyer:    anyone (public listing)")
+    propose(tx, client, cfg, "nft-list", lines)
+
+
+def provisional_spend_check(spends):
+    """Best-effort proposal-time spend-limit check. The signer always
+    re-enforces these — this just refuses doomed proposals early, and
+    makes the reservation math visible before approval."""
+    pol_path = C.POLICY_PATH
+    if not pol_path.exists():
+        print("  note: no policy file — spend limits enforced by xrpl-sign")
+        return
+    try:
+        pol = json.loads(pol_path.read_text())
+    except json.JSONDecodeError:
+        print("  note: unreadable policy file — spend limits enforced by "
+              "xrpl-sign")
+        return
+    if pol.get("policy_version") != C.POLICY_VERSION:
+        print("  note: policy version mismatch — spend limits enforced by "
+              "xrpl-sign")
+        return
+    denials = C.SpentTracker().check(spends, pol)
+    if denials:
+        print("  pre-check: this purchase would breach spend limits:")
+        for d in denials:
+            print(f"    ✗ {d}")
+        sys.exit("nft-buy refused by spend limits (xrpl-sign would deny it)")
+
+
+def cmd_nft_inventory(args, cfg, client):
+    """Read-only: list every NFToken owned by an account (marker-paged,
+    so large collections are fully enumerated). The address argument
+    also accepts a favorite name — writes never do."""
+    arg = args.address
+    if arg:
+        try:
+            favs = C.load_favorites()
+        except C.FavoritesError as e:
+            sys.exit(str(e))
+        addr, problem = C.resolve_fav_or_addr(arg, favs)
+        if problem:
+            sys.exit(problem)
+    else:
+        addr = cfg.get("address")
+    if not addr:
+        sys.exit("No address. Pass one, a favorite name, "
+                 "or run `xrpl-trade setup`.")
+    nfts = []
+    marker = None
+    while True:
+        r = client.request(AccountNFTs(account=addr, limit=400,
+                                       marker=marker))
+        if not r.is_successful():
+            sys.exit(f"account_nfts failed: {r.result}")
+        nfts.extend((r.result or {}).get("account_nfts", []))
+        marker = (r.result or {}).get("marker")
+        if not marker:
+            break
+    if not nfts:
+        print(f"No NFTs owned by {addr} [{cfg['network']}]")
+        return
+    print(f"{len(nfts)} NFT(s) owned by {addr} [{cfg['network']}]")
+    for n in nfts:
+        uri_txt = C.decode_nft_uri(n.get("URI", ""), 90)
+        flags = int(n.get("Flags", 0) or 0)
+        names = [C.NFT_MINT_FLAG_NAMES[b]
+                 for b in sorted(C.NFT_MINT_FLAG_NAMES) if flags & b]
+        print(f"  {n.get('NFTokenID')}")
+        print(f"    uri:   {uri_txt}")
+        print(f"    taxon: {n.get('NFTokenTaxon')}  "
+              f"flags: {', '.join(names) or 'none'}")
+        issuer = n.get("Issuer")
+        if issuer:
+            print(f"    issuer: {issuer}")
+
+
+def cmd_nft_buy(args, cfg, client):
+    """Verify an NFT sell offer from the ledger, then PROPOSE accepting
+    it. The on-ledger verification (seller, token URI, taxon, price) is
+    printed BEFORE the proposal so the human reviews facts — never
+    trust the picture. The signer re-verifies before signing."""
+    acct = need_account(cfg)
+    idx = args.offer_index.strip()
+    lines, denials, amount = C.nft_sell_offer_report(client, idx)
+    print("=" * 60)
+    print("SELL-OFFER VERIFICATION — read from the ledger just now.")
+    print("Verify the SELLER is the minter you expect: anyone can mint")
+    print("the same artwork. This skill reports on-ledger facts; it does")
+    print("NOT authenticate art.")
+    print("=" * 60)
+    for ln in lines:
+        print("  " + ln)
+    print("=" * 60)
+    if denials:
+        for d in denials:
+            print(f"  ✗ {d}")
+        sys.exit("nft-buy refused: " + "; ".join(denials))
+    provisional_spend_check({"XRP": amount})
+    tx = NFTokenAcceptOffer(account=acct, nftoken_sell_offer=idx.upper())
+    propose(tx, client, cfg, "nft-buy",
+            ["buy:      accept the sell offer above",
+             f"max spend: {amount} XRP (+ fee)",
+             "note:     the signer re-verifies the offer from the ledger",
+             "          before signing — a cancelled/changed offer is denied"])
+
+
+def cmd_nft_bid(args, cfg, client):
+    """PROPOSE a buy-side NFTokenCreateOffer (a bid) on someone else's
+    NFT. v1: XRP-denominated only, Expiration always required. The bid
+    XRP is locked in the offer until it is accepted, cancelled, or
+    expires — the signer counts it toward spend limits."""
+    acct = need_account(cfg)
+    nid = args.token_id.strip()
+    if len(nid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in nid):
+        sys.exit("token id must be 64 hex characters")
+    seller = args.seller
+    if not C.is_valid_classic_address(seller):
+        sys.exit("seller is not a valid classic address "
+                 "(base58 checksum failed)")
+    if seller == acct:
+        sys.exit("seller is your own account — use nft-list to sell your own "
+                 "NFT")
+    price = C.dec(args.price_xrp, "price")
+    tx = NFTokenCreateOffer(
+        account=acct,
+        nftoken_id=nid.upper(),
+        amount=xrp_to_drops(price),
+        owner=seller,
+        expiration=C.ripple_time_from_now(args.expires_in),
+    )
+    propose(tx, client, cfg, "nft-bid",
+            [f"token:    {nid.upper()}",
+             f"bid:      {price} XRP (BUY offer — locked until accepted, "
+             "cancelled, or expired)",
+             f"seller:   {seller} (only they can accept)",
+             "note:     policy must enable nft.allow_buy_offers for this to "
+             "sign"])
+
+
+def cmd_favorites(args):
+    """Local named watchlist of artist wallets. Entirely local: no
+    network, no proposals, no signing. Names are lowercase
+    [a-z0-9_-], 1-32 chars; addresses get the real base58-checksum
+    validation."""
+    try:
+        favs = C.load_favorites()
+    except C.FavoritesError as e:
+        sys.exit(str(e))
+    cmd = args.fav_cmd
+    if cmd == "add":
+        problem = C.validate_favorite_name(args.name)
+        if problem:
+            sys.exit(problem)
+        if args.name in favs:
+            sys.exit(f"favorite {args.name!r} already exists "
+                     f"({favs[args.name].get('address')}) — "
+                     "remove it first to re-add")
+        if not C.is_valid_classic_address(args.address):
+            sys.exit("address is not a valid classic address "
+                     "(base58 checksum failed)")
+        favs[args.name] = {"address": args.address,
+                           "added_at": int(time.time()),
+                           "last_checked_ledger": None}
+        if args.note:
+            favs[args.name]["note"] = args.note
+        C.save_favorites(favs)
+        print(f"favorite {args.name!r} → {args.address}")
+    elif cmd == "remove":
+        if args.name not in favs:
+            sys.exit(f"no favorite named {args.name!r}")
+        del favs[args.name]
+        C.save_favorites(favs)
+        print(f"removed favorite {args.name!r}")
+    elif cmd == "rename":
+        if args.old not in favs:
+            sys.exit(f"no favorite named {args.old!r}")
+        problem = C.validate_favorite_name(args.new)
+        if problem:
+            sys.exit(problem)
+        if args.new in favs:
+            sys.exit(f"favorite {args.new!r} already exists")
+        favs[args.new] = favs.pop(args.old)
+        C.save_favorites(favs)
+        print(f"renamed {args.old!r} → {args.new!r}")
+    elif cmd == "list":
+        if not favs:
+            print("no favorites yet — add one with: "
+                  "xrpl-trade favorites add <name> <r-address>")
+            return
+        for name in sorted(favs):
+            f = favs[name]
+            added = time.strftime("%Y-%m-%d",
+                                  time.gmtime(f.get("added_at", 0)))
+            note = f"  ({f['note']})" if f.get("note") else ""
+            print(f"  {name} → {f.get('address')}  added {added}{note}")
+    else:  # pragma: no cover — argparse restricts choices
+        sys.exit(f"unknown favorites command {cmd!r}")
+
+
+def cmd_nft_new(args, cfg, client):
+    """Read-only: what's new from favorite artists.
+
+    For each favorite, finds NFTokenMint transactions since its
+    per-favorite watermark (first run: last 7 days) and reports the
+    token, mint time, current listing price if any, and an xrp.cafe
+    link. The watermark then advances to the validated ledger.
+    --days N is a pure window scan and does NOT move the watermark."""
+    days = args.days
+    if days is not None and not 1 <= days <= 90:
+        sys.exit("--days must be between 1 and 90")
+    try:
+        favs = C.load_favorites()
+    except C.FavoritesError as e:
+        sys.exit(str(e))
+    if not favs:
+        print("no favorites yet — add one with: "
+              "xrpl-trade favorites add <name> <r-address>")
+        return
+    now = int(time.time())
+    validated, problem = C.get_validated_ledger(client)
+    if problem:
+        sys.exit(problem)
+    for name in sorted(favs):
+        fav = favs[name]
+        addr = fav.get("address") or "?"
+        if days is not None:
+            cutoff, stop_ledger = now - days * 86400, None
+            window = f"last {days}d"
+        else:
+            wm = fav.get("last_checked_ledger")
+            if wm is None:
+                cutoff, stop_ledger = now - 7 * 86400, None
+                window = "last 7d (first check)"
+            else:
+                cutoff, stop_ledger = None, wm
+                window = f"since ledger {wm}"
+        mints, _pages, problem = C.scan_artist_mints(
+            client, addr, stop_ledger=stop_ledger, cutoff_unix=cutoff)
+        tag = f"{name} ({C.short_addr(addr)})"
+        if problem:
+            print(f"{tag} — note: {problem}")
+            continue
+        if not mints:
+            print(f"{tag} — nothing new ({window})")
+        else:
+            print(f"{tag} — {len(mints)} new ({window}):")
+            for m in mints:
+                tids = m["token_ids"]
+                nid = tids[0] if tids else None
+                when = (time.strftime("%Y-%m-%d %H:%M UTC",
+                                      time.gmtime(m["date_unix"]))
+                        if m["date_unix"] else "unknown time")
+                print(f"  • {nid or '<token id not found in metadata>'}")
+                print(f"    minted:  {when}   taxon: {m['taxon']}")
+                print(f"    uri:     {C.decode_nft_uri(m['uri_hex'], 80)}")
+                if nid:
+                    price, perr = C.nft_sell_price(client, nid)
+                    link = C.XRP_CAFE_NFT_URL.format(nid)
+                    if perr:
+                        print(f"    listing: unknown ({perr})")
+                    elif price:
+                        print(f"    listing: {price}")
+                    else:
+                        print("    listing: not listed")
+                    print(f"             {link}")
+        if days is None:
+            fav["last_checked_ledger"] = validated
+    if days is None:
+        C.save_favorites(favs)
+
+
 def cmd_setup(_args):
-    print("XRPL setup (v0.4). This stores ONLY your address and network.")
+    print("XRPL setup (v0.5). This stores ONLY your address and network.")
     print("The seed is never stored by xrpl-trade. In production the Muse")
     print("vault provides XRPL_SEED to the signer after human approval.\n")
     net = input("network [mainnet/testnet/devnet] (testnet): ").strip() or "testnet"
@@ -498,8 +854,67 @@ def main():
     p.add_argument("--destination-tag", default=None, type=int)
     p = sub.add_parser("faucet", help="fund a fresh testnet/devnet wallet")
     p.add_argument("--network", choices=["testnet", "devnet"], default=None)
+    p = sub.add_parser("nft-mint", help="PROPOSE minting an NFT (pins art to "
+                                       "IPFS via your Pinata key)")
+    p.add_argument("--file", required=True, help="artwork file to pin")
+    p.add_argument("--name", required=True, help="NFT name")
+    p.add_argument("--description", default="",
+                   help="NFT description (goes in the metadata JSON)")
+    p.add_argument("--royalty-bps", default=1000, type=int,
+                   help="creator royalty in basis points, 0..5000 "
+                        "(default 1000 = 10%%; IMMUTABLE after mint)")
+    p.add_argument("--taxon", default=0, type=int,
+                   help="NFTokenTaxon grouping id (default 0)")
+    p = sub.add_parser("nft-list", help="PROPOSE listing an owned NFT for "
+                                       "sale (XRP only, sell offer)")
+    p.add_argument("--token-id", required=True,
+                   help="NFTokenID (64 hex chars)")
+    p.add_argument("--price-xrp", required=True, help="asking price in XRP")
+    p.add_argument("--destination", default=None,
+                   help="optional buyer address for a private sale")
+    p.add_argument("--expires-in", type=int, default=86400,
+                   help="listing expiry seconds (default 86400)")
+    p = sub.add_parser("nft-inventory", help="list NFTs owned by an account "
+                                            "(read-only)")
+    p.add_argument("address", nargs="?",
+                   help="classic address (default: configured)")
+    p = sub.add_parser("nft-buy", help="verify an NFT sell offer, then PROPOSE "
+                                      "accepting it (XRP only)")
+    p.add_argument("--offer-index", required=True,
+                   help="sell offer index (64 hex chars)")
+    p = sub.add_parser("nft-bid", help="PROPOSE a buy offer (bid) on someone "
+                                      "else's NFT (XRP only)")
+    p.add_argument("--token-id", required=True,
+                   help="NFTokenID (64 hex chars)")
+    p.add_argument("--seller", required=True,
+                   help="owner's classic address (only they can accept)")
+    p.add_argument("--price-xrp", required=True, help="bid in XRP")
+    p.add_argument("--expires-in", type=int, default=86400,
+                   help="bid expiry seconds (default 86400)")
+    p = sub.add_parser("favorites", help="named watchlist of artist wallets "
+                                         "(local, read-only)")
+    fav = p.add_subparsers(dest="fav_cmd", required=True)
+    a = fav.add_parser("add", help="watch an artist wallet")
+    a.add_argument("name", help="short name, e.g. lara")
+    a.add_argument("address", help="artist's classic r-address")
+    a.add_argument("--note", default=None, help="optional note")
+    r = fav.add_parser("remove", help="stop watching a wallet")
+    r.add_argument("name")
+    fav.add_parser("list", help="show the watchlist")
+    rn = fav.add_parser("rename", help="rename a favorite")
+    rn.add_argument("old")
+    rn.add_argument("new")
+    p = sub.add_parser("nft-new", help="new mints from favorite artists "
+                                       "(read-only)")
+    p.add_argument("--days", type=int, default=None,
+                   help="window in days, 1-90 (default: since last check; "
+                        "--days never moves the watermark)")
 
     args = ap.parse_args()
+    if args.cmd == "favorites":
+        # Local-only: no config, no network client needed.
+        cmd_favorites(args)
+        return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
     if network not in C.NETWORKS:
@@ -521,6 +936,12 @@ def main():
         "cancel": lambda: cmd_cancel(args, cfg, client),
         "send": lambda: cmd_send(args, cfg, client),
         "faucet": lambda: cmd_faucet(args, cfg, client),
+        "nft-mint": lambda: cmd_nft_mint(args, cfg, client),
+        "nft-list": lambda: cmd_nft_list(args, cfg, client),
+        "nft-inventory": lambda: cmd_nft_inventory(args, cfg, client),
+        "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
+        "nft-bid": lambda: cmd_nft_bid(args, cfg, client),
+        "nft-new": lambda: cmd_nft_new(args, cfg, client),
     }[args.cmd]()
 
 

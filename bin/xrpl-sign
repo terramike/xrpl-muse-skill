@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""xrpl-sign v0.4: the POLICY-GATED SIGNER half of the hardened XRPL skill.
+"""xrpl-sign v0.5: the POLICY-GATED SIGNER half of the hardened XRPL skill.
 
 This is the only program that ever sees the wallet seed. It signs NOTHING
 unless ALL of these hold:
@@ -16,12 +16,19 @@ unless ALL of these hold:
   3. The proposal's network matches the policy's network_lock
      (default: testnet — mainnet proposals hard-fail until you opt in).
   4. The transaction type is allowlisted (OfferCreate, OfferCancel,
-     TrustSet, Payment), every field matches the strict per-type schema,
-     and every amount/fee/sequence is finite and sane. Unknown types,
-     smuggled fields (Paths, SendMax, memos, partial-payment flags…),
-     NaN/Infinity amounts are rejected.
+     TrustSet, Payment, NFTokenMint, NFTokenCreateOffer), every field
+     matches the strict per-type schema, and every amount/fee/sequence is
+     finite and sane. Unknown types, smuggled fields (Paths, SendMax,
+     memos, partial-payment flags, NFToken Owner/Issuer…), NaN/Infinity
+     amounts are rejected.
   5. Every non-XRP token is in the approved allowlist, extracted from the
-     TX JSON itself; offers must match an approved PAIR exactly.
+     TX JSON itself; offers must match an approved PAIR exactly. NFT
+     mints/listings touch no IOUs: mints enforce the nft policy (URI
+     <= max_uri_bytes, TransferFee <= min(policy cap, 50000), flags
+     restricted to the policy-gated set, mints per rolling 24h capped);
+     listings must be XRP-denominated sell offers (tfSellNFToken) with a
+     bounded Expiration — buy offers are unrepresentable (no Owner field
+     in the schema).
   6. Fee <= max_fee_drops. Offers carry an Expiration inside the allowed
      lifetime window and price within max_deviation_bps of the live
      depth-weighted book mid (both sides present, spread and depth
@@ -84,30 +91,45 @@ def cmd_init_policy(_args):
 
 
 def cmd_migrate_policy(_args):
-    """Upgrade a v2 policy file to v3 (keeps a .bak), or backfill a v3
-    policy with the v0.4 defaults (max_spread_bps, min_book_depth,
-    max_offer_lifetime_seconds)."""
+    """Upgrade a policy file to v4 (keeps a .bak), or backfill a v4
+    policy with the v0.5 nft defaults.
+
+    Conservative like the v0.4 migration: operator settings are
+    preserved, and allowed_tx_types is NEVER widened silently — an
+    operator opts into NFTokenMint / NFTokenCreateOffer by editing the
+    list themselves."""
     if not C.POLICY_PATH.exists():
         sys.exit(f"No policy file at {C.POLICY_PATH}")
     old = json.loads(C.POLICY_PATH.read_text())
     ver = old.get("policy_version", 2)
     if ver == C.POLICY_VERSION:
-        missing = [k for k in ("max_spread_bps", "min_book_depth",
-                               "max_offer_lifetime_seconds")
-                   if k not in old]
+        missing = [k for k in ("nft",) if k not in old]
         if not missing:
             sys.exit("Policy is already up to date.")
+        bak = C.POLICY_PATH.with_suffix(".json.v4.bak")
+        bak.write_text(json.dumps(old, indent=2))
+        new = dict(old)
+        new["nft"] = json.loads(json.dumps(C.DEFAULT_POLICY["nft"]))
+        C.POLICY_PATH.write_text(json.dumps(new, indent=2))
+        os.chmod(C.POLICY_PATH, 0o600)
+        print(f"Backed up v4 policy to {bak}")
+        print(f"Backfilled v0.5 defaults: {', '.join(missing)}")
+        print("NOTE: allowed_tx_types was NOT widened — add NFTokenMint / "
+              "NFTokenCreateOffer yourself to enable NFTs.")
+        return
+    if ver == 3:
         bak = C.POLICY_PATH.with_suffix(".json.v3.bak")
         bak.write_text(json.dumps(old, indent=2))
         new = dict(old)
-        new["max_spread_bps"] = old.get("max_spread_bps", 1000)
-        new["min_book_depth"] = old.get("min_book_depth", "5")
-        new["max_offer_lifetime_seconds"] = old.get(
-            "max_offer_lifetime_seconds", 86400)
+        new["policy_version"] = C.POLICY_VERSION
+        new["nft"] = json.loads(json.dumps(C.DEFAULT_POLICY["nft"]))
         C.POLICY_PATH.write_text(json.dumps(new, indent=2))
         os.chmod(C.POLICY_PATH, 0o600)
         print(f"Backed up v3 policy to {bak}")
-        print(f"Backfilled v0.4 defaults: {', '.join(missing)}")
+        print(f"Migrated policy to v{C.POLICY_VERSION}; added the nft "
+              f"section with v0.5 defaults.")
+        print("NOTE: allowed_tx_types was NOT widened — add NFTokenMint / "
+              "NFTokenCreateOffer yourself to enable NFTs.")
         return
     new = dict(C.DEFAULT_POLICY)
     new["network_lock"] = old.get("network_lock", "testnet")
@@ -125,17 +147,23 @@ def cmd_migrate_policy(_args):
     new["max_deviation_bps"] = old.get("max_deviation_bps", 1000)
     new["max_spread_bps"] = old.get("max_spread_bps", 1000)
     new["min_book_depth"] = old.get("min_book_depth", "5")
-    new["max_offer_lifetime_seconds"] = old.get("max_offer_lifetime_seconds",
-                                                86400)
+    new["max_offer_lifetime_seconds"] = old.get(
+        "max_offer_lifetime_seconds", 86400)
     new["proposal_ttl_seconds"] = old.get("proposal_ttl_seconds", 86400)
+    new["allowed_tx_types"] = old.get(
+        "allowed_tx_types", ["OfferCreate", "OfferCancel", "TrustSet",
+                             "Payment"])
     bak = C.POLICY_PATH.with_suffix(".json.v2.bak")
     bak.write_text(json.dumps(old, indent=2))
     C.POLICY_PATH.write_text(json.dumps(new, indent=2))
     os.chmod(C.POLICY_PATH, 0o600)
     print(f"Backed up v2 policy to {bak}")
-    print(f"Wrote v3 policy to {C.POLICY_PATH}. NOTE: per-asset spend_limits "
-          f"currently cover XRP only — add limits for every IOU you trade, "
-          f"or those assets stay blocked (fail closed).")
+    print(f"Wrote v{C.POLICY_VERSION} policy to {C.POLICY_PATH}. NOTE: "
+          f"per-asset spend_limits currently cover XRP only — add limits "
+          f"for every IOU you trade, or those assets stay blocked (fail "
+          f"closed). Add NFTokenMint / NFTokenCreateOffer / "
+          f"NFTokenAcceptOffer to allowed_tx_types to enable NFTs, and set "
+          f"nft.allow_buy_offers=true to enable the buy side.")
 
 
 def _cur_from_amount(a):
@@ -313,6 +341,31 @@ def check_policy(prop, tx, policy, client, tracker):
                     f"offer Expiration {exp} outside the allowed window "
                     f"(now, now+{max_life}s) — refusing")
 
+    # 4b. NFT sell offers: bounded expiry like other offers, but NO
+    # book-deviation check — each NFTokenID is unique, there is no
+    # fungible book to check a price against.
+    if ttype == "NFTokenCreateOffer":
+        if "Expiration" not in tx:
+            denials.append("NFTokenCreateOffer without Expiration")
+        else:
+            now_r = int(time.time()) - C.RIPPLE_EPOCH
+            exp = tx["Expiration"]
+            max_life = int(policy.get("max_offer_lifetime_seconds", 86400))
+            if not (isinstance(exp, int) and now_r < exp <= now_r + max_life):
+                denials.append(
+                    f"listing Expiration {exp} outside the allowed window "
+                    f"(now, now+{max_life}s) — refusing")
+
+    # 4c. NFT policy: mint URI/royalty/flags + rolling mint rate limit;
+    # offer shape (XRP-only, valid token id / destination); buy-side
+    # (bids) additionally need the policy toggle + per-bid cap.
+    if ttype == "NFTokenMint":
+        denials.extend(C.check_nft_mint(tx, policy))
+        # provisional; the atomic reservation happens at signing time below
+        denials.extend(C.check_mint_rate(policy, tracker))
+    if ttype == "NFTokenCreateOffer":
+        denials.extend(C.check_nft_offer(tx, policy))
+
     # 5. payment destination allowlist: exact (address, tag) match
     if ttype == "Payment":
         dest, tag = tx.get("Destination", ""), tx.get("DestinationTag")
@@ -331,6 +384,15 @@ def check_policy(prop, tx, policy, client, tracker):
     spends = {}
     if not amount_problems:
         spends = C.tx_spends(tx)
+        if ttype == "NFTokenAcceptOffer":
+            # the spend lives in the referenced sell offer, not in the
+            # tx: fetch it from the ledger (fail closed), verify it is
+            # really an XRP sell offer the seller still owns, and fold
+            # the price into the reservation.
+            ad, amount = C.check_nft_accept_offer(tx, client, policy)
+            denials.extend(ad)
+            if amount is not None:
+                spends["XRP"] = spends.get("XRP", Decimal(0)) + amount
         denials.extend(tracker.check(spends, policy))
 
     return denials, spends
@@ -388,6 +450,27 @@ def cmd_sign(args):
     print("=" * 60)
     for ln in C.describe_tx(tx, prop.get("action", "?")):
         print("  " + ln)
+    if tx.get("TransactionType") == "NFTokenAcceptOffer":
+        # The buy ceremony: re-verify the sell offer from the ledger AT
+        # SIGNING time and show the authoritative facts. If the offer
+        # changed or vanished since the proposal, refuse to sign — a
+        # TOCTOU on the offer index must never become a blind purchase.
+        rlines, rdenials, _ = C.nft_sell_offer_report(
+            client, tx.get("NFTokenSellOffer", ""))
+        print("  --- sell offer re-verified from the ledger at signing ---")
+        print("  VERIFY the seller below is the minter you expect; anyone "
+              "can mint the same artwork.")
+        for ln in rlines:
+            print("  " + ln)
+        if rdenials:
+            print("  ✗ the offer changed since the proposal:")
+            for d in rdenials:
+                print(f"    ✗ {d}")
+            C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
+                    prop["network"], tx["Account"], "policy_denied",
+                    "offer changed at signing: " + "; ".join(rdenials),
+                    spends)
+            sys.exit(1)
     print("  spends: " + ", ".join(f"{v} {k}" for k, v in spends.items()))
     print("=" * 60)
 
@@ -418,14 +501,33 @@ def cmd_sign(args):
                 "atomic reserve: " + msg, spends)
         sys.exit(f"Daily-limit reservation failed: {msg}")
 
+    # NFT mints also consume one unit of the rolling mint quota, reserved
+    # atomically here (same lock) so parallel signers can't overshoot the
+    # cap between the provisional check and signing. The count entry rides
+    # the normal bind/confirm/release lifecycle with the spend entries.
+    mrid = None
+    if tx.get("TransactionType") == "NFTokenMint":
+        cap = int(C.nft_policy(policy)["max_mints_per_day"])
+        m_denials, mrid = tracker.try_reserve_count(
+            C.NFT_MINT_ASSET, 1, cap)
+        if m_denials:
+            msg = "; ".join(m_denials)
+            tracker.release_reservation(rid)
+            C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
+                    prop["network"], tx["Account"], "policy_denied",
+                    "atomic mint reserve: " + msg, spends)
+            sys.exit(f"Mint-quota reservation failed: {msg}")
+
     seed = load_seed()
     try:
         wallet = Wallet.from_seed(seed)
     except Exception:
         tracker.release_reservation(rid)
+        tracker.release_reservation(mrid)
         sys.exit("Seed invalid.")
     if wallet.classic_address != tx["Account"]:
         tracker.release_reservation(rid)
+        tracker.release_reservation(mrid)
         sys.exit(f"Seed derives {wallet.classic_address}, but proposal is for "
                  f"{tx['Account']} — refusing (wallet mismatch).")
     del seed
@@ -436,11 +538,12 @@ def cmd_sign(args):
     thash = signed.get_hash()
     last_ledger = tx.get("LastLedgerSequence")
 
-    # Bind the reservation to the signed tx, then persist BEFORE submitting:
+    # Bind the reservation(s) to the signed tx, then persist BEFORE submitting:
     # a crash between sign and submit still leaves a reconciliation trail
     # (hash + last ledger), and the budget stays reserved until the ledger
     # outcome is known.
     tracker.bind_reservation(rid, thash, last_ledger)
+    tracker.bind_reservation(mrid, thash, last_ledger)
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"], "signed",
             f"last_ledger={last_ledger}", spends)
@@ -504,7 +607,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="pending proposals")
     ap.add_argument("cmd", nargs="?", choices=["init-policy", "migrate-policy"],
                     help="init-policy: write the default policy file | "
-                         "migrate-policy: upgrade a v2 policy to v3")
+                         "migrate-policy: upgrade a policy to v4")
     args = ap.parse_args()
     if args.cmd == "init-policy":
         cmd_init_policy(args)
