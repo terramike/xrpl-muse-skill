@@ -312,7 +312,7 @@ def verify_envelope_invariants(prop: dict, tx: dict):
     expected = {"OfferCreate": ("buy", "sell"), "TrustSet": ("trustline",),
                 "OfferCancel": ("cancel",), "Payment": ("send",),
                 "NFTokenMint": ("nft-mint",),
-                "NFTokenCreateOffer": ("nft-list", "nft-bid"),
+                "NFTokenCreateOffer": ("nft-list", "nft-send", "nft-bid"),
                 "NFTokenAcceptOffer": ("nft-buy",)}
     if action not in expected.get(ttype, ()):
         raise ProposalError(
@@ -349,16 +349,29 @@ def verify_envelope_invariants(prop: dict, tx: dict):
                         f"envelope says 'sell' but the offer takes BASE "
                         f"({base[0]}) — orientation mismatch, refusing")
                 break
-    if ttype == "NFTokenCreateOffer" and action in ("nft-list", "nft-bid"):
-        # orientation: nft-list <=> pure sell offer (tfSellNFToken, no
-        # Owner); nft-bid <=> buy offer (Owner set, no sell flag). A
-        # relabeled envelope cannot smuggle the other side past review.
+    if ttype == "NFTokenCreateOffer" and action in ("nft-list", "nft-send",
+                                                    "nft-bid"):
+        # orientation: nft-list <=> pure SELL offer (tfSellNFToken, no
+        # Owner, positive XRP price); nft-send <=> TRANSFER (tfSellNFToken,
+        # no Owner, Destination set, 0-drops Amount — a gift, not a sale);
+        # nft-bid <=> buy offer (Owner set, no sell flag). A relabeled
+        # envelope cannot smuggle one side past review, and a sale can
+        # never be relabeled as a gift (or vice versa).
         is_sell = bool(int(tx.get("Flags", 0) or 0) & NFT_SELL_FLAG)
         has_owner = "Owner" in tx
-        if action == "nft-list" and (not is_sell or has_owner):
+        has_dest = bool(tx.get("Destination"))
+        amt = tx.get("Amount")
+        is_zero = isinstance(amt, str) and amt == "0"
+        if action == "nft-list" and (not is_sell or has_owner or is_zero):
             raise ProposalError(
-                "envelope says 'nft-list' but the offer is not a pure sell "
-                "offer — refusing")
+                "envelope says 'nft-list' but the offer is not a priced "
+                "sell offer — refusing")
+        if action == "nft-send" and (not is_sell or has_owner or not has_dest
+                                    or not is_zero):
+            raise ProposalError(
+                "envelope says 'nft-send' but the offer is not a 0-XRP "
+                "transfer (sell flag + Destination + 0 drops required) — "
+                "refusing")
         if action == "nft-bid" and (is_sell or not has_owner):
             raise ProposalError(
                 "envelope says 'nft-bid' but the offer is not a buy offer — "
@@ -446,14 +459,26 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
         dest = tx.get("Destination")
         owner = tx.get("Owner")
         is_sell = bool(int(tx.get("Flags", 0) or 0) & NFT_SELL_FLAG)
-        side = "SELL" if is_sell else "BUY"
-        lines += [f"token:    {tx.get('NFTokenID')}",
-                  f"price:    {fmt_amount(tx['Amount'])} ({side} offer)"]
-        if is_sell:
-            lines.append(f"buyer:    {'anyone (public listing)' if not dest else short_addr(dest) + ' (private)'}")
+        amt = tx.get("Amount")
+        is_transfer = (is_sell and not owner and dest
+                       and isinstance(amt, str) and amt == "0")
+        if is_transfer:
+            # A 0-drops sell offer aimed at a Destination is a GIFT
+            # transfer — the ceremony must never describe it as a sale.
+            lines += [f"token:    {tx.get('NFTokenID')}",
+                      "action:   TRANSFER (gift — 0 XRP, NOT a sale)",
+                      f"to:       {dest}",
+                      "note:     recipient must accept before expiry — "
+                      "nothing moves until they do"]
         else:
-            lines.append(f"seller:   {short_addr(owner) if owner else 'NONE'} "
-                         f"(buy offer — only they can accept)")
+            side = "SELL" if is_sell else "BUY"
+            lines += [f"token:    {tx.get('NFTokenID')}",
+                      f"price:    {fmt_amount(tx['Amount'])} ({side} offer)"]
+            if is_sell:
+                lines.append(f"buyer:    {'anyone (public listing)' if not dest else short_addr(dest) + ' (private)'}")
+            else:
+                lines.append(f"seller:   {short_addr(owner) if owner else 'NONE'} "
+                             f"(buy offer — only they can accept)")
     elif ttype == "NFTokenAcceptOffer":
         lines += [f"offer:    {tx.get('NFTokenSellOffer')} (sell-offer index)",
                   "note:     price / token / seller are re-verified from the",
@@ -569,9 +594,20 @@ def validate_amounts(tx: dict) -> list:
         if p:
             problems.append(p)
     elif ttype == "NFTokenCreateOffer":
-        p = num(tx.get("Amount"), "Amount")
-        if p:
-            problems.append(p)
+        amt = tx.get("Amount")
+        try:
+            is_sell = bool(int(str(tx.get("Flags", 0))) & NFT_SELL_FLAG)
+        except (ValueError, TypeError):
+            is_sell = False
+        if (is_sell and tx.get("Destination")
+                and isinstance(amt, str) and amt == "0"):
+            pass  # gift transfer (nft-send): 0 drops is the legitimate
+            # amount. Shape enforcement (no Owner, valid destination)
+            # lives in check_nft_offer + the envelope invariants.
+        else:
+            p = num(amt, "Amount")
+            if p:
+                problems.append(p)
     elif ttype == "TrustSet":
         la = tx.get("LimitAmount", {})
         try:
@@ -718,6 +754,8 @@ def check_nft_offer(tx: dict, policy: dict) -> list:
                 denials.append("bid Amount is not valid drops — refusing")
                 bid = None
             if bid is not None:
+                if bid <= 0:
+                    denials.append("bid Amount must be positive — refusing")
                 cap = Decimal(str(cfg.get("max_bid_xrp", "10")))
                 if bid > cap:
                     denials.append(
@@ -738,6 +776,13 @@ def check_nft_offer(tx: dict, policy: dict) -> list:
         if not isinstance(tx.get("Amount"), str):
             denials.append("v1 listings are XRP-only (Amount must be drops) — "
                            "refusing")
+        elif tx.get("Amount") == "0" and tx.get("Destination") is None:
+            # 0-drops carve-out: a gift TRANSFER is allowed only as a sell
+            # offer aimed at a Destination (nft-send). A 0-XRP offer with
+            # no destination is a meaningless public listing — refused.
+            denials.append(
+                "0-XRP NFTokenCreateOffer without a Destination — "
+                "refusing (use nft-send for transfers)")
 
     dest = tx.get("Destination")
     if dest is not None and not is_valid_classic_address(dest):

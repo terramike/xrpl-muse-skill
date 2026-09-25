@@ -2,7 +2,7 @@
 """xrpl-trade v0.5: the PROPOSER half of the hardened XRPL skill.
 
 This program NEVER sees the wallet seed and NEVER submits a transaction.
-Write commands (buy/sell/trustline/cancel/send/nft-mint/nft-list/nft-buy/nft-bid)
+Write commands (buy/sell/trustline/cancel/send/nft-mint/nft-list/nft-send/nft-buy/nft-bid)
 build the
 transaction, autofill it against the live network, print the full ceremony
 summary (account, network, assets+issuers, amounts, limit price, max spend,
@@ -629,6 +629,57 @@ def cmd_nft_bid(args, cfg, client):
              "sign"])
 
 
+def cmd_nft_send(args, cfg, client):
+    """PROPOSE a 0-XRP NFTokenCreateOffer transfer (a gift) of an owned
+    NFT to a favorite name or classic address. --to resolves against the
+    local favorites file first (case-insensitive), then as a classic
+    address — anything else is refused. The offer carries a 0-drops
+    Amount and a Destination: it is a TRANSFER, never a sale. The
+    recipient must accept it before it expires; nothing moves until
+    they do. Expiration always required."""
+    acct = need_account(cfg)
+    nid = args.token_id.strip()
+    if len(nid) != 64 or any(c not in "0123456789abcdefABCDEF" for c in nid):
+        sys.exit("token id must be 64 hex characters")
+    try:
+        favs = C.load_favorites()
+    except C.FavoritesError as e:
+        sys.exit(str(e))
+    token = args.to
+    key = token.lower() if isinstance(token, str) else token
+    fav_name = None
+    if isinstance(key, str) and key in favs and isinstance(favs[key], dict):
+        dest = favs[key].get("address")
+        if not C.is_valid_classic_address(dest):
+            sys.exit(f"favorite {key!r} has an invalid address — fix it "
+                     "with `favorites remove` / `favorites add`")
+        fav_name = key
+    elif C.is_valid_classic_address(token):
+        dest = token
+    else:
+        sys.exit(f"{token!r} is neither a favorite name nor a valid classic "
+                 "address (base58 checksum failed)")
+    if dest == acct:
+        sys.exit("destination is your own account — a transfer offer to "
+                 "yourself is pointless")
+    tx = NFTokenCreateOffer(
+        account=acct,
+        nftoken_id=nid.upper(),
+        amount="0",  # 0 drops: gift transfer, NOT a sale
+        destination=dest,
+        expiration=C.ripple_time_from_now(args.expires_in),
+        flags=int(NFTokenCreateOfferFlag.TF_SELL_NFTOKEN),
+    )
+    lines = [f"token:    {nid.upper()}",
+             "action:   TRANSFER (gift — 0 XRP, NOT a sale)",
+             f"to:       {dest}"]
+    if fav_name:
+        lines.append(f"favorite: {fav_name}")
+    lines.append("note:     the recipient must accept the offer before it "
+                 "expires — nothing moves until they do")
+    propose(tx, client, cfg, "nft-send", lines)
+
+
 def cmd_favorites(args):
     """Local named watchlist of artist wallets. Entirely local: no
     network, no proposals, no signing. Names are lowercase
@@ -943,6 +994,16 @@ def main():
     p.add_argument("--price-xrp", required=True, help="bid in XRP")
     p.add_argument("--expires-in", type=int, default=86400,
                    help="bid expiry seconds (default 86400)")
+    p = sub.add_parser("nft-send", help="PROPOSE gifting an owned NFT "
+                                       "(0-XRP transfer offer to a favorite "
+                                       "name or r-address)")
+    p.add_argument("--token-id", required=True,
+                   help="NFTokenID (64 hex chars)")
+    p.add_argument("--to", required=True,
+                   help="recipient: favorite name (case-insensitive) or "
+                        "classic r-address")
+    p.add_argument("--expires-in", type=int, default=86400,
+                   help="transfer-offer expiry seconds (default 86400)")
     p = sub.add_parser("favorites", help="named watchlist of artist wallets "
                                          "(local, read-only)")
     fav = p.add_subparsers(dest="fav_cmd", required=True)
@@ -1022,6 +1083,7 @@ def main():
         "faucet": lambda: cmd_faucet(args, cfg, client),
         "nft-mint": lambda: cmd_nft_mint(args, cfg, client),
         "nft-list": lambda: cmd_nft_list(args, cfg, client),
+        "nft-send": lambda: cmd_nft_send(args, cfg, client),
         "nft-inventory": lambda: cmd_nft_inventory(args, cfg, client),
         "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
         "nft-bid": lambda: cmd_nft_bid(args, cfg, client),

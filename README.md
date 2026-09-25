@@ -57,6 +57,11 @@ xrpl-sign --hash a2c72140d080ca0f --approve
   accepted, cancelled, or expires. The buy side is opt-in
   (`nft.allow_buy_offers`, default off) with a per-bid cap
   (`nft.max_bid_xrp`).
+- **NFT transfers** (`xrpl-trade nft-send --token-id … --to <favorite|r…>`):
+  proposes a 0-XRP *transfer offer* (a gift, not a sale) to a favorite
+  name or r-address. The recipient must accept before it expires; it
+  spends 0 XRP beyond the fee, and the signer ceremony describes it as a
+  transfer, never a sale.
 - **NFT policy gates**: royalty (`TransferFee`) capped per policy and
   immutable after mint, burnable/transferable flag allowlist, URI
   byte-length cap, rolling-24h mint count, and a conservative v4 policy

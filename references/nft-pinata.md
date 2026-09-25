@@ -81,3 +81,26 @@ xrpl-trade nft-list --token-id <64-hex-id> --price-xrp 25 \
   `max_offer_lifetime_seconds`).
 - `--destination` makes it a private sale to one buyer address; without it
   anyone can accept.
+
+## Transfers (`nft-send`)
+
+```bash
+xrpl-trade nft-send --token-id <64-hex-id> --to <favorite-name|r-address> \
+    [--expires-in 86400]
+```
+
+- A **gift**, not a sale: the offer carries a 0-drops `Amount` and a
+  `Destination`. The ledger has no direct NFT-transfer transaction —
+  sending is a transfer offer the recipient must accept before it
+  expires. Nothing moves until they do.
+- `--to` resolves against the local favorites file first
+  (case-insensitive), then as a classic r-address; anything else is
+  refused. The resolved address is printed in the proposal, and the
+  favorite name when one matched.
+- Policy carve-out: a 0-XRP `NFTokenCreateOffer` is allowed **only** as a
+  sell-flag offer with a `Destination` (a transfer). 0-XRP offers with no
+  destination, and 0-amount buy offers, are still refused. The signer
+  ceremony describes it as `TRANSFER (gift — 0 XRP, NOT a sale)`; it
+  spends 0 XRP beyond the fee.
+- The recipient accepts with `nft-buy --offer-index <idx>` (the
+  `nft.allow_buy_offers` toggle gates all `NFTokenAcceptOffer`s).

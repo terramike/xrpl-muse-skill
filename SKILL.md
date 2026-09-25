@@ -166,6 +166,11 @@ xrpl-trade nft-buy --offer-index <64-hex>
 xrpl-trade nft-bid --token-id <64-hex> --seller r... --price-xrp 5 \
     [--expires-in 86400]
 # → proposes a BUY offer (bid); the bid XRP locks until accepted/cancelled/expired
+
+xrpl-trade nft-send --token-id <64-hex> --to <favorite-name|r...> \
+    [--expires-in 86400]
+# → proposes a 0-XRP TRANSFER offer (gift, NOT a sale); the recipient
+#   must accept before it expires
 ```
 
 - **Bring your own Pinata.** Every operator uses their own account and
@@ -187,8 +192,15 @@ xrpl-trade nft-bid --token-id <64-hex> --seller r... --price-xrp 5 \
   fee runs through the per-transaction and rolling-24h spend caps.
 - Bids need `nft.allow_buy_offers: true` and are capped by
   `nft.max_bid_xrp`; the bid XRP is reserved until the offer resolves.
-- Minting, listing, buying, and bidding are separate writes — each needs
-  its own proposal hash and its own human approval.
+- **Transfers are gifts, not sales.** `nft-send` proposes a 0-XRP transfer
+  offer to a favorite name or r-address (`--to` resolves the name locally
+  and prints the resolved address in the proposal). The recipient must
+  accept before expiry; it spends 0 XRP beyond the fee, and the signer
+  ceremony describes it as a transfer, never a sale. Policy allows a
+  0-XRP offer only with the sell flag and a destination — 0-XRP offers
+  without a destination, and 0-amount bids, are refused.
+- Minting, listing, sending, buying, and bidding are separate writes —
+  each needs its own proposal hash and its own human approval.
 
 ## Following artists (v0.5): favorites + what's new
 
@@ -214,8 +226,10 @@ xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the waterm
   cheapest current listing price if any ("not listed" otherwise), and an
   `https://xrp.cafe/nft/<NFTokenID>` link.
 - Favorite names also work wherever a read command takes an address
-  (`nft-inventory lara`). Writes never accept names — exact addresses
-  only.
+  (`nft-inventory lara`). Among writes, only `nft-send --to` accepts a
+  name — it resolves against the local favorites file (case-insensitive)
+  and prints the resolved address in the proposal; the destination is
+  hash-bound in the envelope like everything else.
 
 ## XRPresso discovery: marketplace search (read-only)
 
@@ -278,6 +292,8 @@ Writing (always propose → human `--approve` → sign):
 - `trustline --pair P --limit N` — trustline the pair's base token
 - `cancel --seq N` — cancel an open offer
 - `send --to r… --amount A --ccy XRP [--destination-tag N]`
+- `nft-send --token-id <64-hex> --to <favorite|r…>` — gift an owned NFT
+  (0-XRP transfer offer; recipient must accept before expiry)
 
 `--amount` is always BASE units, `--price` is always QUOTE per BASE.
 `--pair NAME` resolves through `~/.xrpl/approved.json` (copy
