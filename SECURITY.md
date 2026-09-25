@@ -79,6 +79,56 @@ and enforces:
   state, lock, or audit files are not owner-only (this catches accidental
   exposure; it is not a substitute for the privileged boundary below).
 
+### Safety model additions (v0.6.0, unreleased)
+
+- **Fail-closed spend state.** A corrupt `state.json` aborts signing with
+  printed recovery steps — it is never treated as an empty ledger (which
+  would silently reset rolling limits). Unbound spend/mint reservations
+  are always released; only bound ones survive for reconciliation.
+- **Validated-ledger NFT reads.** Offer entries and ownership checks pin
+  to one validated ledger index and refuse unvalidated data.
+- **Terminal sanitization.** All human-supplied or ledger-supplied text
+  shown in ceremonies (mint descriptions, decoded URIs, favorites notes)
+  is neutralized for ANSI/OSC escape sequences, control characters, and
+  bidi overrides.
+- **Full-hash approval.** `--approve` requires the exact 64-character
+  proposal hash; prefixes are read-only conveniences, never approval.
+- **Pinata stage vs pin-and-propose.** `nft-stage` validates artwork with
+  zero network calls; `nft-pin-and-propose` re-validates the staged hash,
+  pins, and proposes as one approved action. The pinner only ever sees
+  the validated file and the exact reviewed metadata. `PINATA_JWT` is
+  read from the environment at pin time only — never stored, logged, or
+  written into proposals.
+- **Issuer vs seller.** The buy ceremony shows the on-ledger **issuer**
+  (minter) on its own line, distinct from the seller (current owner).
+  The human verifies the issuer is the artist they expect.
+- **Strict policy schema.** `load_policy()` rejects unknown keys, wrong
+  types, out-of-range values, bad addresses, unsupported networks/tx
+  types, and zero/negative TTLs with one fail-closed error. The buy side
+  is double opt-in: `NFTokenAcceptOffer` is absent from the default
+  `allowed_tx_types` *and* `nft.allow_buy_offers` defaults to false.
+
+### Giveaway paths (v0.6.0 item 9)
+
+The giveaway code (new after the v0.5.1 audit) gets the same treatment:
+
+- The donation wallet's spend state (`giveaway_state.json`) uses the
+  same `SpentTracker` — corrupt state fails closed with recovery steps,
+  never as an empty ledger.
+- NFT gift ownership checks pin to the validated ledger and refuse
+  unvalidated data, like the buy-side reads.
+- The `announce` draft sanitizes the human-supplied prize text for the
+  terminal.
+- Giveaway proposals sign through the same full-hash `--approve` gate,
+  under the narrow giveaway policy (which passes the strict schema —
+  `giveaway` and `allow_any_payment_destination` are known, typed keys).
+- Seed handling: vault injection of `XRPL_GIVEAWAY_SEED` at signing time
+  is the preferred path. Local storage in `giveaway.json` is a deliberate
+  fallback — getpass entry (never echoed), verified to derive the
+  donation wallet before anything is stored, atomic `0600` write — and
+  `check_protected_files` covers it plus the giveaway policy in giveaway
+  mode. The seed never appears in output, logs, proposals, or chat.
+
 ## The platform boundary — read before mainnet
 
 `--approve` is an **assertion**, not evidence of human approval. v0.5 is
@@ -95,8 +145,58 @@ mainnet-ready **only** when all of these hold:
    the agent must not be able to alter signing policy or activate signing
    merely by passing `--approve`.
 
+A same-user local agent does **not** satisfy condition 3, even with `0600`
+files: a same-UID process can read the signer's environment variables and
+rewrite its policy, state, and even the signer program itself. `0600`
+protects against *other users*, not against the agent running as you.
+Same-user installs are therefore testnet-only by policy — `install.sh`
+says so on every run.
+
 Without those platform guarantees, v0.5 is a hardened testnet tool. Do not
 describe it as generically mainnet-safe.
+
+### What actually protects the signer (v0.6.0 item 10 — verified)
+
+`check_protected_files()` runs at the start of every `xrpl-sign`
+invocation, before proposal verification and signing. Verified behavior
+(covered by regression tests):
+
+- Every *existing* protected file — `policy.json`, `approved.json`,
+  `favorites.json`, `state.json`, `state.lock`, `audit.log` (plus
+  `giveaway_policy.json` and `giveaway.json` in giveaway mode) — must be
+  owned by the current UID and have no group/world permission bits, or
+  the signer refuses to run.
+- Absent files are skipped: only an absent state file means empty state.
+- On non-POSIX systems the check silently does nothing — the deployment
+  must protect those files another way.
+
+Honest limits, verified the same way:
+
+- **Nothing in the code protects `bin/xrpl-sign` itself.** The check
+  covers data files, not the program. A process running as you can
+  rewrite the signer, and no check will notice. Protecting the binary
+  is a deployment job (read-only install owned by another UID, signed
+  releases — see below).
+- **`0600` does not stop a same-UID process.** Demonstrated
+  empirically: a file chmod'd `0600` can still be rewritten by the same
+  user with no privilege escalation. The permission check is a
+  multi-user-OS boundary (it keeps *other* users out); it is not a
+  boundary between you and software running as you.
+- **The audit log is append-only, not tamper-evident.** It is `0600`
+  JSONL, but it is not hash-chained — a same-UID process can rewrite or
+  truncate it undetectably. Treat it as an operational record, not as
+  proof against a compromised account.
+- **The proposals directory is deliberately unprotected.** Proposals are
+  treated as hostile input and fully verified (hash-bound envelope,
+  TTL, policy checks) on every signing run.
+
+Net: on a shared POSIX machine the check is real protection against
+other users. Against anything running as your UID — including the
+agent itself — the protection is the vault-held seed, the
+propose→approve→sign ceremony with genuine per-transaction human
+approval, and a deployment where the agent cannot rewrite the signer
+or its policy. Without that deployment, same-user installs stay
+testnet-only.
 
 ## Operator rules (all versions)
 
@@ -105,14 +205,18 @@ describe it as generically mainnet-safe.
   exact action, amount, price, destination, network, and proposal hash.
   Minting, listing, buying, and bidding are separate writes — approve
   each one.
-- NFTs are pinned under the operator's **own** Pinata account. `PINATA_JWT`
-  comes from the vault/environment only: it never goes into the repo,
-  proposals, logs, or chat. The publisher hosts no one's media.
+- NFTs are pinned under the operator's **own** Pinata account, in two
+  steps: `nft-stage` (offline review) then `nft-pin-and-propose` (the
+  approved action that pins). `PINATA_JWT` is injected for the single
+  pin operation only — never exported into a shell, never written to a
+  file, never in the repo, proposals, logs, or chat. The publisher hosts
+  no one's media. Pinning is an external write; it happens *inside* the
+  approved action, not before it.
 - **Counterfeit risk:** anyone can mint an NFT with the same artwork or a
-  similar name. Before buying, verify the **seller address** against the
-  minter you expect — the `nft-buy` ceremony shows the on-ledger seller,
-  token URI, and taxon for exactly this reason. The skill reports
-  on-ledger facts; it does not authenticate art.
+  similar name. Before buying, verify the **issuer address** (the minter)
+  is the artist you expect — the `nft-buy` ceremony shows the on-ledger
+  seller, issuer, token URI, and taxon for exactly this reason. The skill
+  reports on-ledger facts; it does not authenticate art.
 - **Favorites track wallets, not identities.** A favorite is a name you
   chose for an r-address. If an artist changes wallets, the favorite
   goes stale — nothing re-verifies that the wallet still belongs to
@@ -124,3 +228,15 @@ describe it as generically mainnet-safe.
   wallet with an agent skill.
 - Old-format (`xrpl-proposal/2`) proposals are rejected by the v0.3 signer;
   rebuild them — never hand-edit a proposal file.
+
+## Release & commit hygiene
+
+- Security-relevant changes ship with honest commit messages that say
+  what the change does and why — no cutesy titles on substantive diffs.
+- Release tags are signed (`git tag -s`). A release is cut only when the
+  full deterministic suite is green, every planned security item has
+  landed with its regression tests, and the operator has approved the
+  release explicitly. No partial security releases.
+- Public history is never rewritten. If a published commit message
+  misdescribed its diff, the correction goes in the next honest commit
+  and the release notes — not in a force-push.

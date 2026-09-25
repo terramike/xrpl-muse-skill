@@ -108,8 +108,10 @@ with tempfile.TemporaryDirectory() as td:
                                            "max_bid_xrp"})
     check("NFT types in default allowlist",
           "NFTokenMint" in C.DEFAULT_ALLOWED_TX_TYPES
-          and "NFTokenCreateOffer" in C.DEFAULT_ALLOWED_TX_TYPES
-          and "NFTokenAcceptOffer" in C.DEFAULT_ALLOWED_TX_TYPES)
+          and "NFTokenCreateOffer" in C.DEFAULT_ALLOWED_TX_TYPES)
+    check("buy side is opt-in: NFTokenAcceptOffer NOT in defaults",
+          "NFTokenAcceptOffer" not in C.DEFAULT_ALLOWED_TX_TYPES
+          and "NFTokenAcceptOffer" in C.REQUIRED_FIELDS)  # still supported
 
     # --- 2. strict schemas ---
     no_uri = mint_tx()
@@ -373,10 +375,12 @@ with tempfile.TemporaryDirectory() as td:
     check("metadata has XLS-24d shape",
           meta == {"name": "Cool Art", "description": "A test piece",
                    "image": "ipfs://bafyimg"})
-    with tempfile.NamedTemporaryFile(suffix=".png") as tf:
-        tf.write(b"\x89PNG fakepng")
-        tf.flush()
-        img_cid, meta_cid = P.pin_artwork(tf.name, "Cool Art", "A test piece")
+    with tempfile.TemporaryDirectory() as td:
+        art = os.path.join(td, "art.png")
+        with open(art, "wb") as tf:
+            tf.write(b"\x89PNG\r\n\x1a\nfakepng")
+        img_cid, meta_cid = P.pin_artwork(art, "Cool Art", "A test piece",
+                                          media_dir=td)
     check("pin_artwork returns both CIDs",
           img_cid == "bafytestcid123" and meta_cid == "bafytestcid123")
     check("art pinned as file, metadata as JSON",
@@ -384,11 +388,12 @@ with tempfile.TemporaryDirectory() as td:
           and calls[1][0].endswith("pinJSONToIPFS"))
     del os.environ["PINATA_JWT"]
     P._post = real_post  # real transport: must fail on the missing key
-    with tempfile.NamedTemporaryFile(suffix=".png") as tf2:
-        tf2.write(b"data")
-        tf2.flush()
+    with tempfile.TemporaryDirectory() as td2:
+        art2 = os.path.join(td2, "art.png")
+        with open(art2, "wb") as tf2:
+            tf2.write(b"\x89PNG\r\n\x1a\nfakepng")
         try:
-            P.pin_file(tf2.name)
+            P.pin_file(art2, media_dir=td2)
             check("missing PINATA_JWT fails cleanly", False)
         except SystemExit as e:
             check("missing PINATA_JWT fails cleanly",
@@ -426,7 +431,7 @@ with tempfile.TemporaryDirectory() as td:
           od["Flags"] == 1 and od["Amount"] == "2500000")
 
     # --- 15. nft-buy / nft-bid (stub ledger, no network) ---
-    from xrpl.models.requests import AccountNFTs, LedgerEntry
+    from xrpl.models.requests import AccountNFTs, Ledger, LedgerEntry
 
     OFFER_IDX = "AB" * 32
     TOKEN = "CD" * 32
@@ -446,18 +451,35 @@ with tempfile.TemporaryDirectory() as td:
             return self._ok
 
     class StubClient:
-        """Ledger double: one offer entry + the seller's NFT page."""
-        def __init__(self, offer, nfts):
+        """Ledger double: one offer entry + the seller's NFT page.
+
+        Models the v0.6.0 pinned-ledger flow: the report first reads the
+        validated ledger index, then pins the offer and inventory reads to
+        that same index. Every data response carries validated=True."""
+        VALIDATED_INDEX = 90041
+
+        def __init__(self, offer, nfts, validated=True):
             self.offer = offer
             self.nfts = nfts
+            self.validated = validated
+            self.seen_ledger_indexes = []
 
         def request(self, req):
+            if isinstance(req, Ledger):
+                return StubResp(True, {"ledger_index": self.VALIDATED_INDEX,
+                                       "validated": True})
             if isinstance(req, LedgerEntry):
+                self.seen_ledger_indexes.append(req.ledger_index)
                 if self.offer is None:
                     return StubResp(False, {"error": "entryNotFound"})
-                return StubResp(True, {"node": self.offer})
+                return StubResp(True, {"node": self.offer,
+                                       "ledger_index": self.VALIDATED_INDEX,
+                                       "validated": self.validated})
             if isinstance(req, AccountNFTs):
-                return StubResp(True, {"account_nfts": self.nfts})
+                self.seen_ledger_indexes.append(req.ledger_index)
+                return StubResp(True, {"account_nfts": self.nfts,
+                                       "ledger_index": self.VALIDATED_INDEX,
+                                       "validated": self.validated})
             raise AssertionError("unexpected request type")
 
     seller_nfts = [{"NFTokenID": TOKEN, "URI": GOOD_URI,
@@ -471,24 +493,31 @@ with tempfile.TemporaryDirectory() as td:
                 "NFTokenSellOffer": idx, "Fee": "12", "Sequence": 1,
                 "LastLedgerSequence": 999}
 
+    # buy side is opt-in: shape tests use an explicit allowlist that
+    # includes the type, mirroring an operator who opted in.
+    ACCEPT_TYPES = C.DEFAULT_ALLOWED_TX_TYPES + ["NFTokenAcceptOffer"]
+
     # schema: direct mode only
     no_idx = accept_tx()
     del no_idx["NFTokenSellOffer"]
     check("NFTokenAcceptOffer without sell offer flagged",
           any("NFTokenSellOffer" in p for p in C.validate_tx_shape(
-              no_idx, C.DEFAULT_ALLOWED_TX_TYPES)))
+              no_idx, ACCEPT_TYPES)))
     smuggle_buy = accept_tx()
     smuggle_buy["NFTokenBuyOffer"] = "EF" * 32
     check("NFTokenAcceptOffer+NFTokenBuyOffer rejected",
           any("NFTokenBuyOffer" in p for p in C.validate_tx_shape(
-              smuggle_buy, C.DEFAULT_ALLOWED_TX_TYPES)))
+              smuggle_buy, ACCEPT_TYPES)))
     smuggle_broker = accept_tx()
     smuggle_broker["NFTokenBrokerFee"] = "100"
     check("NFTokenAcceptOffer+NFTokenBrokerFee rejected",
           any("NFTokenBrokerFee" in p for p in C.validate_tx_shape(
-              smuggle_broker, C.DEFAULT_ALLOWED_TX_TYPES)))
+              smuggle_broker, ACCEPT_TYPES)))
     check("NFTokenAcceptOffer direct-mode shape clean",
-          not C.validate_tx_shape(accept_tx(), C.DEFAULT_ALLOWED_TX_TYPES))
+          not C.validate_tx_shape(accept_tx(), ACCEPT_TYPES))
+    check("NFTokenAcceptOffer refused when not opted in",
+          any("NFTokenAcceptOffer" in p for p in C.validate_tx_shape(
+              accept_tx(), C.DEFAULT_ALLOWED_TX_TYPES)))
 
     # offer verification
     d, amt = C.check_nft_accept_offer(accept_tx("xyz"), good_client, pol_on)

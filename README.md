@@ -6,7 +6,10 @@ minting and XRP-denominated listings under the same propose → approve →
 sign boundary.
 
 Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
-terminal), but safe for humans too.
+terminal). **Testnet-safe by default; mainnet requires the Muse vault
+signer or an external protected signer with real per-transaction human
+approval.** A same-user local install is testnet-only — see
+`SECURITY.md` "Deployment profiles" before mainnet.
 
 ## The idea
 
@@ -33,10 +36,17 @@ xrpl-sign --hash a2c72140d080ca0f --approve
 
 ## What v0.5 adds
 
-- **NFT minting** (`xrpl-trade nft-mint`): pins artwork + XLS-24d metadata
-  to IPFS through the operator's **own** Pinata account (`PINATA_JWT` from
-  the environment — the publisher hosts no one's media), then proposes an
-  `NFTokenMint` whose `URI` points at the metadata CID.
+- **NFT minting** (`xrpl-trade nft-stage`, then `nft-pin-and-propose`):
+  a deliberate two-step flow. `nft-stage` validates the artwork locally
+  (approved media directory, size and image-type checks, SHA-256) and
+  writes a reviewable stage record with **zero network calls**.
+  `nft-pin-and-propose` is the approved action: it re-validates the file
+  against the staged hash, pins artwork + XLS-24d metadata to IPFS
+  through the operator's **own** Pinata account, then proposes an
+  `NFTokenMint` whose `URI` points at the metadata CID. Pinning is an
+  external write and happens *inside* the approved action — never before
+  it. `PINATA_JWT` is injected for the single operation (never exported
+  into a shell, never stored); the publisher hosts no one's media.
 - **XRP listings** (`xrpl-trade nft-list`): proposes XRP-denominated
   *sell* offers only. IOU prices are denied, every listing carries a
   ledger expiration.
@@ -49,8 +59,8 @@ xrpl-sign --hash a2c72140d080ca0f --approve
   proposing `NFTokenAcceptOffer`. The signer re-verifies the offer at
   signing time; a changed or vanished offer is refused. The skill reports
   on-ledger facts and never calls a token "authentic" — anyone can mint
-  the same artwork, so the human verifies the seller is the minter they
-  expect. Buying spends XRP immediately and runs through the
+  the same artwork, so the human verifies the ISSUER is the minter
+  they expect (the seller is only the current owner). Buying spends XRP immediately and runs through the
   per-transaction and rolling-24h spend caps.
 - **NFT bids** (`xrpl-trade nft-bid --token-id … --seller r… --price-xrp …`):
   proposes a buy-side offer; the bid XRP locks until the offer is
@@ -122,9 +132,9 @@ on XRPL; the issuer address is the identity.
 ## Install
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-locked.txt   # hash-pinned dependencies
 xrpl-trade setup            # address + network (never the seed)
-xrpl-sign init-policy       # policy file v3, testnet-locked by default
+xrpl-sign init-policy       # policy file v4, testnet-locked by default
 ```
 
 The signer reads the seed **only** from `XRPL_SEED`, provided by your secret
@@ -147,6 +157,35 @@ See [SECURITY.md](SECURITY.md) — including the platform boundary: `--approve`
 is an assertion, not evidence of human approval, and the advisory that
 versions before commit `c3273e59` shipped inverted buy/sell and must not be
 used for trading.
+
+## Deployment profiles
+
+**1. Muse vault signer (supported for mainnet).** The signer runs under
+Muse with the seed injected per-operation from the vault, only after
+genuine per-transaction human approval. This is the only mainnet posture
+the publisher supports.
+
+**2. Xaman-human (community path).** A human reviews and signs in Xaman
+(or another external wallet); the skill prepares proposals but never
+touches a seed. A dedicated signer adapter is parked for later — today
+this means the human signs outside the skill.
+
+**3. Autonomous-experimental (testnet only).** A same-user local agent
+running the signer itself. Convenient, but the security boundary does
+**not** hold here: a same-UID process can read the signer's environment
+and rewrite its policy and state files, and `0600` permissions do not
+stop it. Use testnet, or accept explicitly that you are your own
+adversary.
+
+### What the NFT checks do and don't cover
+
+The buy ceremony verifies on-ledger facts: the offer is a sell offer,
+the seller owns the token, the issuer (minter) is the artist you expect,
+the URI/taxon match. It does **not** protect market value (no
+floor-price or rarity check — price sanity is the human's call) and it
+does **not** prove ownership of the underlying art (anyone can mint the
+same bytes). Token/issuer allowlists and floor-price guardrails are
+parked as opt-in policy features, not built.
 
 ## Tests
 

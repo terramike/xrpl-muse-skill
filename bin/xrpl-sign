@@ -48,6 +48,12 @@ Muse vault injects it after genuine human confirmation; it must never be a
 raw exported variable in a shared shell. The derived address must match the
 proposal's account, or signing is refused.
 
+Giveaway mode: `xrpl-sign --hash <h> --approve --seed-env XRPL_GIVEAWAY_SEED
+--policy ~/.xrpl/giveaway_policy.json` signs donation-wallet gifts under a
+separate narrow policy (Payment + NFTokenCreateOffer only, per-gift XRP
+cap, separate spend accounting). The vault injects XRPL_GIVEAWAY_SEED the
+same way; `xrpl-trade giveaway setup` is the deliberate local fallback.
+
 Submission is crash-safe: the transaction is signed, the reservation is
 bound to the signed hash + LastLedgerSequence, and both are persisted to
 the audit log BEFORE submit_and_wait, so a crash between signing and
@@ -366,16 +372,16 @@ def check_policy(prop, tx, policy, client, tracker):
     if ttype == "NFTokenCreateOffer":
         denials.extend(C.check_nft_offer(tx, policy))
 
-    # 5. payment destination allowlist: exact (address, tag) match
+    # 5. payment destinations. Default: exact (address, tag) allowlist
+    # match. Giveaway mode (`allow_any_payment_destination`): winners are
+    # arbitrary addresses — the human approved this exact destination in
+    # the proposal ceremony, so the signer only re-validates the shape
+    # (valid classic address, never seed-like). The require-dest-tag
+    # check below still applies in both modes.
     if ttype == "Payment":
-        dest, tag = tx.get("Destination", ""), tx.get("DestinationTag")
-        ok = any(e.get("address") == dest and e.get("destination_tag") == tag
-                 for e in policy["destination_allowlist"])
-        if not ok:
-            denials.append(
-                f"destination ({dest[:12]}…, tag {tag}) not in "
-                f"destination_allowlist ({len(policy['destination_allowlist'])} entries)")
-        req = check_require_dest_tag(client, dest, tag)
+        denials.extend(C.check_payment_destination(tx, policy))
+        req = check_require_dest_tag(client, tx.get("Destination", ""),
+                                     tx.get("DestinationTag"))
         if req:
             denials.append(req)
 
@@ -400,21 +406,120 @@ def check_policy(prop, tx, policy, client, tracker):
 
 # ---------- signing ----------
 
-def load_seed():
-    """Seed ONLY from XRPL_SEED. In production the Muse vault injects this
-    after genuine human confirmation. No config-file fallback (removed v0.3)."""
-    seed = os.environ.get("XRPL_SEED")
+def load_seed(seed_env="XRPL_SEED"):
+    """Seed ONLY from the named environment variable. In production the
+    Muse vault injects it after genuine human confirmation; it must never
+    be a raw exported variable in a shared shell. No config-file fallback
+    for the main seed (removed v0.3).
+
+    For the giveaway seed env (XRPL_GIVEAWAY_SEED) there is one deliberate
+    fallback: the owner-only giveaway.json written by `giveaway setup`.
+    The vault's env injection is preferred; the seed never touches chat,
+    logs, or proposals either way."""
+    seed = os.environ.get(seed_env)
+    if not seed and seed_env == C.GIVEAWAY_SEED_ENV:
+        seed = C.read_giveaway_seed()
     if not seed:
-        sys.exit("No seed. In production the vault provides XRPL_SEED after "
-                 "human approval — it is never exported by hand or read "
-                 "from a config file (see SECURITY.md).")
+        hint = (f"the vault did not inject {seed_env} for this signing"
+                if seed_env != C.GIVEAWAY_SEED_ENV else
+                f"{seed_env} is not set and no seed is stored — run "
+                f"`xrpl-trade giveaway setup` or have the vault inject "
+                f"{seed_env} after human approval")
+        sys.exit(f"No seed. {hint} — it is never exported by hand or read "
+                 "from a chat log (see SECURITY.md).")
     return seed
+
+
+def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env):
+    """Post-approval core: reserve budget, sign, bind reservation.
+
+    Returns (signed_tx, thash, last_ledger). The try/finally releases the
+    unbound reservation(s) on EVERY exception path from here through bind —
+    including SystemExit from a missing seed and KeyboardInterrupt.
+
+    load_seed() deliberately stays AFTER the --approve check in cmd_sign():
+    the vault injects the seed only at genuine human approval time, so
+    reading it earlier would be both useless and a boundary violation.
+    (Do not "fix" this by moving the seed load up.)
+    """
+    rid = None
+    mrid = None
+    bound = False
+    try:
+        try:
+            # Atomic daily-limit reservation: concurrent signers can't
+            # double-spend the daily budget between the check above and
+            # the signing below.
+            reserve_denials, rid = tracker.try_reserve(spends, policy)
+            if reserve_denials:
+                msg = "; ".join(reserve_denials)
+                C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
+                        prop["network"], tx["Account"], "policy_denied",
+                        "atomic reserve: " + msg, spends)
+                sys.exit(f"Daily-limit reservation failed: {msg}")
+
+            # NFT mints also consume one unit of the rolling mint quota,
+            # reserved atomically here (same lock) so parallel signers can't
+            # overshoot the cap between the provisional check and signing.
+            # The count entry rides the normal bind/confirm/release lifecycle
+            # with the spend entries.
+            if tx.get("TransactionType") == "NFTokenMint":
+                cap = int(C.nft_policy(policy)["max_mints_per_day"])
+                m_denials, mrid = tracker.try_reserve_count(
+                    C.NFT_MINT_ASSET, 1, cap)
+                if m_denials:
+                    msg = "; ".join(m_denials)
+                    C.audit(prop.get("action", "?"), prop["proposal_hash"],
+                            None, prop["network"], tx["Account"],
+                            "policy_denied",
+                            "atomic mint reserve: " + msg, spends)
+                    sys.exit(f"Mint-quota reservation failed: {msg}")
+
+            seed = load_seed(seed_env)
+            try:
+                wallet = Wallet.from_seed(seed)
+            except Exception:
+                sys.exit("Seed invalid.")
+            if wallet.classic_address != tx["Account"]:
+                sys.exit(f"Seed derives {wallet.classic_address}, but proposal "
+                         f"is for {tx['Account']} — refusing (wallet mismatch).")
+            del seed
+
+            from xrpl.models.transactions import Transaction
+            tx_obj = Transaction.from_xrpl(tx)  # tx stored in PascalCase wire format
+            signed = sign_tx(tx_obj, wallet)
+            thash = signed.get_hash()
+            last_ledger = tx.get("LastLedgerSequence")
+
+            # Bind the reservation(s) to the signed tx, then persist BEFORE
+            # submitting: a crash between sign and submit still leaves a
+            # reconciliation trail (hash + last ledger), and the budget stays
+            # reserved until the ledger outcome is known.
+            tracker.bind_reservation(rid, thash, last_ledger)
+            tracker.bind_reservation(mrid, thash, last_ledger)
+            bound = True
+            return signed, thash, last_ledger
+        finally:
+            if not bound:
+                # release_reservation only drops UNBOUND pending entries and
+                # is a no-op for None, so this is safe on every path —
+                # including a partially completed bind.
+                tracker.release_reservation(rid)
+                tracker.release_reservation(mrid)
+    except C.StateCorruptError as e:
+        sys.exit(str(e))
 
 
 def cmd_sign(args):
     # The protected deployment boundary: policy, allowlist, spend state,
-    # and audit log must be owner-only, or limits are fiction.
-    C.check_protected_files()
+    # and audit log must be owner-only, or limits are fiction. Giveaway
+    # mode additionally protects the giveaway policy and giveaway.json
+    # (which may hold the donation-wallet seed).
+    policy = C.load_policy(args.policy)
+    giveaway_mode = bool(policy.get("giveaway"))
+    C.check_protected_files(
+        extra=(C.GIVEAWAY_POLICY_PATH, C.GIVEAWAY_PATH)
+        if giveaway_mode else ())
 
     prop, path = C.load_proposal(args.hash)
 
@@ -428,8 +533,17 @@ def cmd_sign(args):
                 "proposal_rejected", str(e))
         sys.exit(f"Proposal rejected: {e}")
 
-    policy = C.load_policy()
-    tracker = C.SpentTracker()
+    # Full-hash approval (v0.6.0 item 4): a prefix is fine for the
+    # read-only review, but --approve must name the EXACT 64-char hash
+    # the human reviewed. Refused before any policy check or signing.
+    if args.approve:
+        C.require_full_hash_for_approve(args.hash, prop)
+
+    policy = C.load_policy(args.policy)
+    giveaway_mode = bool(policy.get("giveaway"))
+    tracker = (C.SpentTracker(state_path=C.GIVEAWAY_STATE_PATH,
+                              lock_path=C.GIVEAWAY_STATE_LOCK_PATH)
+               if giveaway_mode else C.SpentTracker())
 
     # proposal TTL (created_at is hash-bound)
     age = int(time.time()) - prop["created_at"]
@@ -438,9 +552,12 @@ def cmd_sign(args):
                  f"{policy['proposal_ttl_seconds'] // 3600}h) — rebuild it.")
 
     client = C.make_client(prop["network"])
-    # Resolve any ambiguous past reservations before checking limits.
-    tracker.sweep_pending(client)
-    denials, spends = check_policy(prop, tx, policy, client, tracker)
+    try:
+        # Resolve any ambiguous past reservations before checking limits.
+        tracker.sweep_pending(client)
+        denials, spends = check_policy(prop, tx, policy, client, tracker)
+    except C.StateCorruptError as e:
+        sys.exit(str(e))
 
     # ---- the ceremony: everything below is DERIVED from the tx ----
     print("=" * 60)
@@ -458,8 +575,9 @@ def cmd_sign(args):
         rlines, rdenials, _ = C.nft_sell_offer_report(
             client, tx.get("NFTokenSellOffer", ""))
         print("  --- sell offer re-verified from the ledger at signing ---")
-        print("  VERIFY the seller below is the minter you expect; anyone "
+        print("  VERIFY the issuer below is the artist you expect; anyone "
               "can mint the same artwork.")
+        print("  The seller is the current owner, not necessarily the minter.")
         for ln in rlines:
             print("  " + ln)
         if rdenials:
@@ -486,64 +604,20 @@ def cmd_sign(args):
 
     if not args.approve:
         print("\nNot approved. A HUMAN must review the exact hash above, then run:")
-        print(f"  xrpl-sign --hash {prop['proposal_hash'][:16]} --approve")
-        print("The vault releases the seed only on that genuine human approval.")
+        if prop.get("action") == C.GIFT_ACTION:
+            print(f"  {C.giveaway_sign_command(prop['proposal_hash'])}")
+            print(f"The vault releases {C.GIVEAWAY_SEED_ENV} only on that "
+                  "genuine human approval.")
+        else:
+            print(f"  xrpl-sign --hash {prop['proposal_hash']} --approve")
+            print("The vault releases the seed only on that genuine human approval.")
         return
 
     # --- the point of no return: independent human approval was given ---
-    # Atomic daily-limit reservation: concurrent signers can't double-spend
-    # the daily budget between the check above and the signing below.
-    reserve_denials, rid = tracker.try_reserve(spends, policy)
-    if reserve_denials:
-        msg = "; ".join(reserve_denials)
-        C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
-                prop["network"], tx["Account"], "policy_denied",
-                "atomic reserve: " + msg, spends)
-        sys.exit(f"Daily-limit reservation failed: {msg}")
-
-    # NFT mints also consume one unit of the rolling mint quota, reserved
-    # atomically here (same lock) so parallel signers can't overshoot the
-    # cap between the provisional check and signing. The count entry rides
-    # the normal bind/confirm/release lifecycle with the spend entries.
-    mrid = None
-    if tx.get("TransactionType") == "NFTokenMint":
-        cap = int(C.nft_policy(policy)["max_mints_per_day"])
-        m_denials, mrid = tracker.try_reserve_count(
-            C.NFT_MINT_ASSET, 1, cap)
-        if m_denials:
-            msg = "; ".join(m_denials)
-            tracker.release_reservation(rid)
-            C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
-                    prop["network"], tx["Account"], "policy_denied",
-                    "atomic mint reserve: " + msg, spends)
-            sys.exit(f"Mint-quota reservation failed: {msg}")
-
-    seed = load_seed()
-    try:
-        wallet = Wallet.from_seed(seed)
-    except Exception:
-        tracker.release_reservation(rid)
-        tracker.release_reservation(mrid)
-        sys.exit("Seed invalid.")
-    if wallet.classic_address != tx["Account"]:
-        tracker.release_reservation(rid)
-        tracker.release_reservation(mrid)
-        sys.exit(f"Seed derives {wallet.classic_address}, but proposal is for "
-                 f"{tx['Account']} — refusing (wallet mismatch).")
-    del seed
-
-    from xrpl.models.transactions import Transaction
-    tx_obj = Transaction.from_xrpl(tx)  # tx stored in PascalCase wire format
-    signed = sign_tx(tx_obj, wallet)
-    thash = signed.get_hash()
-    last_ledger = tx.get("LastLedgerSequence")
-
-    # Bind the reservation(s) to the signed tx, then persist BEFORE submitting:
-    # a crash between sign and submit still leaves a reconciliation trail
-    # (hash + last ledger), and the budget stays reserved until the ledger
-    # outcome is known.
-    tracker.bind_reservation(rid, thash, last_ledger)
-    tracker.bind_reservation(mrid, thash, last_ledger)
+    # Reserve budget, sign, and bind — with guaranteed reservation cleanup
+    # on every failure path (see _reserve_sign_bind).
+    signed, thash, last_ledger = _reserve_sign_bind(
+        prop, tx, policy, tracker, spends, args.seed_env)
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"], "signed",
             f"last_ledger={last_ledger}", spends)
@@ -576,12 +650,15 @@ def cmd_sign(args):
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"],
             "applied" if ok else f"failed:{tres}", "", spends)
-    if ok:
-        tracker.confirm(thash)
-        path.unlink()  # proposal consumed
-    else:
-        tracker.release_tx(thash)
-        sys.exit(f"Not applied: {tres}")
+    try:
+        if ok:
+            tracker.confirm(thash)
+            path.unlink()  # proposal consumed
+        else:
+            tracker.release_tx(thash)
+            sys.exit(f"Not applied: {tres}")
+    except C.StateCorruptError as e:
+        sys.exit(str(e))
 
 
 def cmd_list(_args):
@@ -601,9 +678,17 @@ def cmd_list(_args):
 def main():
     ap = argparse.ArgumentParser(prog="xrpl-sign",
                                  description="Policy-gated XRPL signer.")
-    ap.add_argument("--hash", default=None, help="proposal hash (prefix ok)")
+    ap.add_argument("--hash", default=None,
+                    help="proposal hash (prefix ok for read-only review; "
+                         "full 64-char hash required with --approve)")
     ap.add_argument("--approve", action="store_true",
                     help="HUMAN approval of this exact hash: sign & submit")
+    ap.add_argument("--seed-env", default="XRPL_SEED",
+                    help="env var holding the seed (default XRPL_SEED; "
+                         "giveaway gifts use XRPL_GIVEAWAY_SEED)")
+    ap.add_argument("--policy", default=None,
+                    help="policy file (default ~/.xrpl/policy.json; giveaway "
+                         "gifts use ~/.xrpl/giveaway_policy.json)")
     ap.add_argument("--list", action="store_true", help="pending proposals")
     ap.add_argument("cmd", nargs="?", choices=["init-policy", "migrate-policy"],
                     help="init-policy: write the default policy file | "

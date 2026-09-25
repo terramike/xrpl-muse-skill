@@ -9,13 +9,119 @@ See references/nft-pinata.md for setup.
 
 No xrpl-py dependency here (stdlib only) so the pinner stays tiny.
 """
+import hashlib
 import json
 import os
+import stat
 import sys
 import urllib.request
 
 PINATA_PIN_FILE = "https://api.pinata.cloud/pinning/pinFileToIPFS"
 PINATA_PIN_JSON = "https://api.pinata.cloud/pinning/pinJSONToIPFS"
+
+
+# ---------- pin sources: validated local files only ----------
+
+# Artwork size cap: 10 MiB. NFT art bigger than this is a mistake, and the
+# cap bounds what a misclick can exfiltrate in one pin.
+NFT_MAX_BYTES = 10 * 1024 * 1024
+
+# Conservative allowlist: raster images only. No SVG (scriptable XML), no
+# HTML, no executables — the pinner is not a general file host.
+ALLOWED_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+MEDIA_DIR_ENV = "XRPL_NFT_MEDIA_DIR"
+
+
+def default_media_dir():
+    return os.path.join(os.path.expanduser("~"), ".xrpl", "media")
+
+
+def media_dir():
+    """Approved artwork directory: env override or ~/.xrpl/media."""
+    return os.environ.get(MEDIA_DIR_ENV) or default_media_dir()
+
+
+def _sniff_mime(head: bytes):
+    """MIME from magic bytes (not the file extension). None if unknown."""
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def read_validated_source(path, media_dir=None):
+    """Read a pin source after strict validation. Zero network calls.
+
+    Returns (data, info) where info = {path, bytes, mime, sha256}.
+    Refuses (SystemExit): missing/non-regular files, paths resolving
+    outside the NFT media directory (symlink escape), symlinks at open
+    time (O_NOFOLLOW), empty or oversized files, and MIME types outside
+    ALLOWED_MIME (sniffed from magic bytes, never the extension).
+    """
+    mdir = os.path.realpath(media_dir or default_media_dir())
+    if not os.path.isdir(mdir):
+        sys.exit(
+            f"NFT media directory not found: {mdir}\n"
+            f"Create it, put the artwork inside, and re-run — or set "
+            f"{MEDIA_DIR_ENV} to choose another directory.")
+    try:
+        real = os.path.realpath(path)
+    except (TypeError, ValueError):
+        real = ""
+    try:
+        inside = os.path.commonpath([real, mdir]) == mdir and real != mdir
+    except ValueError:
+        inside = False
+    if not inside:
+        sys.exit(f"refusing: source is outside the NFT media directory\n"
+                 f"  source:    {path}\n"
+                 f"  media dir: {mdir}")
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        sys.exit(f"refusing: source not found: {path}")
+    except IsADirectoryError:
+        sys.exit(f"refusing: source is a directory: {path}")
+    except OSError as e:
+        # ELOOP here means a symlink appeared at open time (TOCTOU swap).
+        sys.exit(f"refusing to open source: {path} ({e.strerror or e})")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            sys.exit(f"refusing: not a regular file: {path}")
+        size = st.st_size
+        if size == 0:
+            sys.exit(f"refusing to pin empty file: {path}")
+        if size > NFT_MAX_BYTES:
+            sys.exit(f"refusing: {size} bytes exceeds the "
+                     f"{NFT_MAX_BYTES}-byte artwork limit")
+        mime = _sniff_mime(os.read(fd, 16))
+        if mime not in ALLOWED_MIME:
+            sys.exit(
+                f"refusing: {mime or 'unrecognized'} content is not allowed "
+                f"artwork (allowed: {', '.join(sorted(ALLOWED_MIME))})")
+        h = hashlib.sha256()
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if len(data) != size:
+            sys.exit("refusing: file changed while reading — re-run")
+        return data, {"path": real, "bytes": size, "mime": mime,
+                      "sha256": h.hexdigest(), "media_dir": mdir}
+    finally:
+        os.close(fd)
 
 
 def _jwt():
@@ -54,14 +160,14 @@ def _post(url, body: bytes, content_type: str, filename: str = None) -> dict:
         sys.exit(f"Pinata unreachable: {e.reason}")
 
 
-def pin_file(path: str) -> str:
-    """Pin a local file to IPFS. Returns the CID (no ipfs:// prefix)."""
-    with open(path, "rb") as f:
-        data = f.read()
-    if not data:
-        sys.exit(f"refusing to pin empty file: {path}")
+def pin_file(path: str, media_dir=None) -> str:
+    """Pin a local file to IPFS. Returns the CID (no ipfs:// prefix).
+
+    The source is strictly validated (media directory, O_NOFOLLOW, size,
+    MIME) before any byte leaves the machine."""
+    data, info = read_validated_source(path, media_dir=media_dir)
     resp = _post(PINATA_PIN_FILE, data, "application/octet-stream",
-                 filename=os.path.basename(path))
+                 filename=os.path.basename(info["path"]))
     cid = resp.get("IpfsHash")
     if not cid:
         sys.exit(f"Pinata returned no IpfsHash: {resp!r}"[:200])
@@ -89,13 +195,13 @@ def build_metadata(name: str, description: str, image_cid: str) -> dict:
     }
 
 
-def pin_artwork(path: str, name: str, description: str):
+def pin_artwork(path: str, name: str, description: str, media_dir=None):
     """Pin art + metadata. Returns (image_cid, metadata_cid).
 
     Two pins, one for the art and one for the metadata JSON — the ledger
     URI points at the metadata CID, marketplaces resolve image from it.
     """
-    image_cid = pin_file(path)
+    image_cid = pin_file(path, media_dir=media_dir)
     meta = build_metadata(name, description, image_cid)
     metadata_cid = pin_json(meta, name=f"{name}-metadata.json")
     return image_cid, metadata_cid

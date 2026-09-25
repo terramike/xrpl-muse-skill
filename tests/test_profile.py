@@ -232,6 +232,7 @@ script = iter([
     "trading, nfts",   # interests
     "y",               # price alerts yes
     "5",               # threshold
+    "",                # giveaway opt-in: skip
 ])
 
 
@@ -251,6 +252,16 @@ check("init: membership saved", prof["memberships"] == ["xaodao"])
 check("init: interests saved", prof["interests"] == ["trading", "nfts"])
 check("init: alerts saved",
       prof["alerts"] == {"price_moves": True, "threshold_pct": 5.0})
+check("init: giveaway defaults (not opted in)",
+      prof["giveaway"] == {"opt_in": False, "opt_in_tx": None})
+
+# schema-v1 profiles written before the giveaway feature gain the defaults
+old_path = TMP / "old_profile.json"
+old_path.write_text(json.dumps({"display_name": "Old"}))
+prof = C.load_profile(old_path)
+check("old v1 profile gains giveaway defaults",
+      prof["giveaway"] == {"opt_in": False, "opt_in_tx": None}
+      and prof["display_name"] == "Old")
 
 # init when a profile already exists: no prompts, no overwrite
 calls = []

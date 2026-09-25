@@ -398,7 +398,7 @@ check("int price formats",
                                   "currency": "XRP",
                                   "url": "https://xrpresso.io/l/1"}))
 check("long text truncated",
-      len(XP._text("y" * 400)) == 300 and XP._text("y" * 400).endswith("..."))
+      len(XP._text("y" * 400)) == 300 and XP._text("y" * 400).endswith("…"))
 check("bool stats become ?",
       "?" in XP.fmt_stats({"activeListings": True, "listedNfts": 1,
                            "liveAuctions": 0, "liveDrops": 0,

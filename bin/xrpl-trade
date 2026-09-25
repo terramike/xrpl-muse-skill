@@ -2,7 +2,7 @@
 """xrpl-trade v0.5: the PROPOSER half of the hardened XRPL skill.
 
 This program NEVER sees the wallet seed and NEVER submits a transaction.
-Write commands (buy/sell/trustline/cancel/send/nft-mint/nft-list/nft-send/nft-buy/nft-bid)
+Write commands (buy/sell/trustline/cancel/send/nft-pin-and-propose/nft-list/nft-send/nft-buy/nft-bid)
 build the
 transaction, autofill it against the live network, print the full ceremony
 summary (account, network, assets+issuers, amounts, limit price, max spend,
@@ -12,15 +12,29 @@ The separate `xrpl-sign` program enforces policy and signs — only after
 independent human approval of that exact hash.
 
 Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile,
-nft-inventory, favorites, nft-new, xrpresso (XRPresso marketplace discovery).
+nft-inventory, favorites, nft-new, xrpresso (XRPresso marketplace discovery),
+giveaway entrants/draw/status/announce (Friday community giveaway).
 Local-only: profile (onboarding questionnaire — name, watch-only addresses,
-memberships, interests; never leaves this machine).
-NFT: nft-mint pins artwork + metadata to IPFS with the operator's own
-Pinata key (bring-your-own-key — the skill never hosts anyone's media),
-then proposes the mint; nft-list proposes an XRP-denominated sell offer.
+memberships, interests; never leaves this machine), giveaway setup,
+nft-stage (artwork validation + hashing before any pin).
+Writing always proposes: buy/sell/trustline/cancel/send/nft-pin-and-propose/nft-list/
+nft-send/nft-buy/nft-bid, plus giveaway opt-in (proposes the 1-drop entry
+payment — approval is still required, and opt-in is only recorded after
+the payment is validated on-ledger), plus giveaway gift (proposes a prize
+payment from the donation wallet — signed only after the human approves
+that exact hash, under the giveaway policy with the donation wallet's key).
+The draw only SELECTS a winner — it never builds or sends a gift.
+NFT: nft-stage validates + hashes artwork LOCALLY (zero network) and
+writes a reviewable stage record; nft-pin-and-propose pins the staged
+artwork + metadata to IPFS with the operator's own Pinata key
+(bring-your-own-key — the skill never hosts anyone's media), then
+proposes the mint. Pinning is an external write, so it lives in the
+second, explicitly-run step — never hidden inside a single command.
+nft-list proposes an XRP-denominated sell offer.
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -110,6 +124,52 @@ def make_currency(ccy, issuer):
     return IssuedCurrency(currency=C.currency_code(ccy), issuer=issuer)
 
 
+def build_gift_payment(donation_wallet, dest, amount: Decimal, ccy, issuer):
+    """Pure builder: a gift Payment FROM the donation wallet. Never signs."""
+    return Payment(account=donation_wallet, destination=dest,
+                   amount=make_amount(ccy, issuer, amount))
+
+
+def build_gift_nft_offer(donation_wallet, dest, token_id, expires_in=86400):
+    """Pure builder: a 0-XRP destination-restricted NFTokenCreateOffer gift
+    (transfer, never a sale) FROM the donation wallet. Never signs."""
+    return NFTokenCreateOffer(
+        account=donation_wallet,
+        nftoken_id=token_id.strip().upper(),
+        amount="0",  # 0 drops: gift transfer, NOT a sale
+        destination=dest,
+        expiration=C.ripple_time_from_now(expires_in),
+        flags=int(NFTokenCreateOfferFlag.TF_SELL_NFTOKEN),
+    )
+
+
+def donation_wallet_owns_nft(client, wallet, token_id):
+    """Fail-closed check that the donation wallet owns the NFT (marker-paged)."""
+    marker = None
+    while True:
+        kw = {"account": wallet, "limit": 400, "ledger_index": "validated"}
+        if marker:
+            kw["marker"] = marker
+        try:
+            resp = client.request(AccountNFTs(**kw))
+        except Exception as e:  # noqa: BLE001
+            sys.exit(f"gift: NFT ownership lookup failed: {e}")
+        if not resp.is_successful():
+            sys.exit("gift: NFT ownership lookup failed — refusing")
+        res = resp.result or {}
+        # Item 2 standard: ledger_index="validated" is a request, not a
+        # guarantee — refuse the data unless the node confirms it.
+        if res.get("validated") is not True:
+            sys.exit("gift: NFT ownership lookup returned unvalidated "
+                     "ledger data — refusing")
+        for n in res.get("account_nfts", []):
+            if n.get("NFTokenID") == token_id:
+                return True
+        marker = res.get("marker")
+        if not marker:
+            return False
+
+
 def build_offer_tx(account, base, base_issuer, quote, quote_issuer,
                   amount: Decimal, price: Decimal, side: str, expires_in: int):
     """side=buy: TakerPays=BASE received, TakerGets=QUOTE paid.
@@ -167,7 +227,18 @@ def propose(tx, client, cfg, action, summary_lines):
     print("=" * 60)
     print(f"proposal hash: {h}")
     print(f"\nA HUMAN must review the hash above, then run:")
-    print(f"  xrpl-sign --hash {h[:16]} --approve")
+    if action == C.GIFT_ACTION:
+        # Donation-wallet gifts sign under the giveaway policy with the
+        # giveaway seed — never the main wallet's key or policy.
+        print(f"  {C.giveaway_sign_command(h)}")
+        if C.GIVEAWAY_POLICY_PATH.exists():
+            print(f"\nGiveaway policy: {C.GIVEAWAY_POLICY_PATH}")
+        else:
+            print(f"\nGiveaway policy: {C.GIVEAWAY_POLICY_PATH} "
+                  "(missing — run `giveaway setup` first)")
+        print(f"Seed: {C.GIVEAWAY_SEED_ENV} (vault-injected) or `giveaway setup`")
+    else:
+        print(f"  xrpl-sign --hash {h} --approve")
     print(f"\nFull autofilled transaction saved to:\n"
           f"  {C.PROPOSALS_DIR / (h + '.json')}")
     return h
@@ -422,48 +493,175 @@ def cmd_send(args, cfg, client):
     propose(tx, client, cfg, "send", lines)
 
 
-# ---------- NFT commands (v0.5) ----------
+# ---------- NFT mint: two-step pin flow (v0.6.0 item 5) ----------
+#
+# Pinning is an external write (and an exfiltration vector), so it must
+# never happen pre-consent inside a single command. Step 1 (nft-stage)
+# is fully local: validate + hash the artwork, build the metadata, write
+# a reviewable stage record - ZERO network calls. Step 2
+# (nft-pin-and-propose) is the explicitly-run, approval-gated step: the
+# human reviewed the stage record, then runs it to pin + propose.
+# PINATA_JWT is read from the environment only at pin time - never
+# stored, logged, or written into proposal files.
 
-def cmd_nft_mint(args, cfg, client):
-    """Pin art + metadata to IPFS (operator's own Pinata key), then PROPOSE
-    an NFTokenMint whose URI points at the metadata CID."""
+STAGE_FORMAT = "nft-stage/1"
+
+
+def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
+                  media_dir=None):
+    """Validate artwork and write a stage record. Zero network calls.
+
+    Returns the stage record dict. The record binds the file's sha256 so
+    nft-pin-and-propose can prove the file is byte-identical before any
+    byte leaves the machine. Raises SystemExit on any refusal.
+    """
     if xrpl_pin is None:
-        sys.exit("xrpl_pin module missing — cannot pin.")
-    acct = need_account(cfg)
-    royalty_bps = int(args.royalty_bps)
+        sys.exit("xrpl_pin module missing - cannot stage.")
+    royalty_bps = int(royalty_bps)
     if not 0 <= royalty_bps <= 5000:
         sys.exit("royalty must be 0..5000 bps (protocol max is 50%)")
-    taxon = int(args.taxon)
+    taxon = int(taxon)
     if not 0 <= taxon <= 0xFFFFFFFF:
         sys.exit("taxon must fit in a uint32")
-    print("pinning artwork to IPFS (your Pinata key)…")
-    image_cid, metadata_cid = xrpl_pin.pin_artwork(
-        args.file, args.name, args.description or "")
+    if not name or not str(name).strip():
+        sys.exit("NFT name is required")
+    _data, info = xrpl_pin.read_validated_source(file, media_dir=media_dir)
+    created = int(time.time())
+    sid = hashlib.sha256(
+        f"{info['sha256']}:{created}:{name}".encode()).hexdigest()[:16]
+    record = {
+        "format": STAGE_FORMAT,
+        "stage_id": sid,
+        "created_at": created,
+        "source_path": info["path"],
+        "sha256": info["sha256"],
+        "bytes": info["bytes"],
+        "mime": info["mime"],
+        "name": name,
+        "description": description,
+        # The exact metadata that will be pinned; the image CID is filled
+        # in at pin time. The human reviews this record before approving.
+        "metadata": {"name": name, "description": description,
+                     "image": None},
+        "royalty_bps": royalty_bps,
+        "taxon": taxon,
+        # Which media dir validated this file; the pin step re-validates
+        # against the same directory (plus the sha256 re-check).
+        "media_dir": info["media_dir"],
+    }
+    C.STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    (C.STAGE_DIR / f"{sid}.json").write_text(json.dumps(record, indent=2))
+    return record
+
+
+def load_stage_record(stage_id):
+    """Load and sanity-check a stage record. Refuses missing/ambiguous/
+    corrupt records - a bad stage never reaches the pin step."""
+    matches = (list(C.STAGE_DIR.glob(f"{stage_id}*.json"))
+               if C.STAGE_DIR.exists() else [])
+    if not matches:
+        sys.exit(f"No staged artwork matching {stage_id!r} - run "
+                 f"`xrpl-trade nft-stage` first.")
+    if len(matches) > 1:
+        sys.exit(f"Ambiguous stage id {stage_id!r}: "
+                 f"{[m.stem[:12] for m in matches]}")
+    try:
+        rec = json.loads(matches[0].read_text())
+    except (ValueError, OSError) as e:
+        sys.exit(f"Stage record unreadable: {e}")
+    if not isinstance(rec, dict) or rec.get("format") != STAGE_FORMAT:
+        sys.exit("Stage record has an unsupported format - re-run nft-stage.")
+    for key in ("stage_id", "source_path", "sha256", "bytes", "mime",
+                "name", "description", "metadata", "royalty_bps", "taxon"):
+        if key not in rec:
+            sys.exit(f"Stage record is missing {key!r} - re-run nft-stage.")
+    meta = rec["metadata"]
+    if (not isinstance(meta, dict)
+            or set(meta) != {"name", "description", "image"}
+            or meta["image"] is not None
+            or meta["name"] != rec["name"]
+            or meta["description"] != rec["description"]):
+        sys.exit("Stage record metadata is inconsistent - re-run nft-stage.")
+    return rec
+
+
+def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
+    """Pin the staged artwork + metadata, then propose the NFTokenMint.
+
+    The approval-gated step: the human reviewed the stage record and ran
+    this command deliberately. Prints exactly what is about to leave the
+    machine before pinning. Returns the proposal hash.
+    """
+    if xrpl_pin is None:
+        sys.exit("xrpl_pin module missing - cannot pin.")
+    pinner = pinner or xrpl_pin
+    rec = load_stage_record(stage_id)
+    # Re-validate against the same media dir: the file must be
+    # byte-identical to what was staged.
+    _data, info = pinner.read_validated_source(
+        rec["source_path"], media_dir=rec.get("media_dir"))
+    if info["sha256"] != rec["sha256"]:
+        sys.exit("refusing: the artwork file changed since staging "
+                 "(hash mismatch) - re-run `xrpl-trade nft-stage`.")
+    name = rec["name"]
+    acct = need_account(cfg)
+    print("pinning to IPFS via Pinata (external write):")
+    print(f"  file:      {C.safe_terminal_text(info['path'])}")
+    print(f"  sha256:    {info['sha256'][:16]}...")
+    print(f"  size/mime: {info['bytes']} bytes, {info['mime']}")
+    print(f"  name:      {C.safe_terminal_text(name, 120)}")
+    image_cid = pinner.pin_file(info["path"],
+                                media_dir=rec.get("media_dir"))
+    meta = dict(rec["metadata"])
+    meta["image"] = f"ipfs://{image_cid}"
+    metadata_cid = pinner.pin_json(meta, name=f"{name}-metadata.json")
     uri = f"ipfs://{metadata_cid}"
     uri_hex = uri.encode("utf-8").hex().upper()
     if len(uri.encode("utf-8")) > 256:
         sys.exit("metadata URI exceeds the 256-byte ledger limit")
     # XRPL TransferFee is in 1/100000 units: 10000 = 10% = 1000 bps.
-    # So TransferFee = royalty_bps * 10 (e.g. 1000 bps -> 10000).
-    transfer_fee = royalty_bps * 10
+    transfer_fee = int(rec["royalty_bps"]) * 10
     tx = NFTokenMint(
         account=acct,
-        nftoken_taxon=taxon,
+        nftoken_taxon=int(rec["taxon"]),
         uri=uri_hex,
         transfer_fee=transfer_fee,
         flags=int(NFTokenMintFlag.TF_TRANSFERABLE)
         | int(NFTokenMintFlag.TF_BURNABLE),
     )
-    propose(tx, client, cfg, "nft-mint",
-            [f"nft:      {args.name}",
-             f"image:    ipfs://{image_cid}",
-             f"metadata: {uri}",
-             f"royalty:  {royalty_bps / 100:.2f}% "
-             f"(immutable after mint — verify it)",
-             f"flags:    transferable + burnable",
-             f"taxon:    {taxon}",
-             "note:     the ledger stores the URI, not the art — "
-             "keep the IPFS pin alive"])
+    return propose(tx, client, cfg, "nft-mint",
+                   [f"nft:      {C.safe_terminal_text(name, 120)}",
+                    f"image:    ipfs://{image_cid}",
+                    f"metadata: {uri}",
+                    f"royalty:  {int(rec['royalty_bps']) / 100:.2f}% "
+                    f"(immutable after mint - verify it)",
+                    f"flags:    transferable + burnable",
+                    f"taxon:    {rec['taxon']}",
+                    "note:     the ledger stores the URI, not the art - "
+                    "keep the IPFS pin alive"])
+
+
+def cmd_nft_stage(args, cfg, client):
+    """Step 1: validate + hash artwork locally, write a stage record."""
+    rec = stage_artwork(args.file, args.name, args.description or "",
+                        args.royalty_bps, args.taxon)
+    print("STAGED - nothing has left this machine (zero network calls).")
+    print(f"  stage id: {rec['stage_id']}")
+    print(f"  file:     {C.safe_terminal_text(rec['source_path'])}")
+    print(f"  sha256:   {rec['sha256']}")
+    print(f"  size:     {rec['bytes']} bytes ({rec['mime']})")
+    print(f"  name:     {C.safe_terminal_text(rec['name'], 120)}")
+    print(f"  royalty:  {rec['royalty_bps'] / 100:.2f}% "
+          f"(immutable after mint - verify it)")
+    print(f"  taxon:    {rec['taxon']}")
+    print(f"\nReview the above, then run:")
+    print(f"  xrpl-trade nft-pin-and-propose --stage {rec['stage_id']}")
+    print("That step pins to IPFS (external write) and proposes the mint.")
+
+
+def cmd_nft_pin_and_propose(args, cfg, client):
+    """Step 2: pin the staged artwork + metadata, propose the mint."""
+    pin_and_propose_stage(args.stage, cfg, client)
 
 
 def cmd_nft_list(args, cfg, client):
@@ -513,7 +711,21 @@ def provisional_spend_check(spends):
         print("  note: policy version mismatch — spend limits enforced by "
               "xrpl-sign")
         return
-    denials = C.SpentTracker().check(spends, pol)
+    try:
+        pol = C.validate_policy({**C.DEFAULT_POLICY, **pol})
+    except C.PolicyError:
+        # Best-effort stays best-effort: never do limit math on a
+        # schema-violating policy. The signer validates strictly and
+        # will refuse — say so now, cleanly.
+        print("  note: policy file fails schema validation — spend limits "
+              "enforced by xrpl-sign (it will refuse)")
+        return
+    try:
+        denials = C.SpentTracker().check(spends, pol)
+    except C.StateCorruptError as e:
+        # Fail closed at proposal time too: never propose against unknown
+        # limits. The signer would refuse anyway; say so now, cleanly.
+        sys.exit(str(e))
     if denials:
         print("  pre-check: this purchase would breach spend limits:")
         for d in denials:
@@ -570,17 +782,18 @@ def cmd_nft_inventory(args, cfg, client):
 
 def cmd_nft_buy(args, cfg, client):
     """Verify an NFT sell offer from the ledger, then PROPOSE accepting
-    it. The on-ledger verification (seller, token URI, taxon, price) is
-    printed BEFORE the proposal so the human reviews facts — never
-    trust the picture. The signer re-verifies before signing."""
+    it. The on-ledger verification (seller, issuer, token URI, taxon,
+    price) is printed BEFORE the proposal so the human reviews facts —
+    never trust the picture. The signer re-verifies before signing."""
     acct = need_account(cfg)
     idx = args.offer_index.strip()
     lines, denials, amount = C.nft_sell_offer_report(client, idx)
     print("=" * 60)
     print("SELL-OFFER VERIFICATION — read from the ledger just now.")
-    print("Verify the SELLER is the minter you expect: anyone can mint")
-    print("the same artwork. This skill reports on-ledger facts; it does")
-    print("NOT authenticate art.")
+    print("Verify the ISSUER is the artist you expect: anyone can mint")
+    print("the same artwork. The seller is only the current owner; the")
+    print("issuer is the minter. This skill reports on-ledger facts; it")
+    print("does NOT authenticate art.")
     print("=" * 60)
     for ln in lines:
         print("  " + ln)
@@ -736,7 +949,8 @@ def cmd_favorites(args):
             f = favs[name]
             added = time.strftime("%Y-%m-%d",
                                   time.gmtime(f.get("added_at", 0)))
-            note = f"  ({f['note']})" if f.get("note") else ""
+            note = f"  ({C.safe_terminal_text(f['note'], 120)})" \
+                if f.get("note") else ""
             print(f"  {name} → {f.get('address')}  added {added}{note}")
     else:  # pragma: no cover — argparse restricts choices
         sys.exit(f"unknown favorites command {cmd!r}")
@@ -752,10 +966,14 @@ def _profile_input(prompt, default="", _input=input):
     return ans if ans else default
 
 
-def run_profile_init(prof, _input=input):
+def run_profile_init(prof, _input=input, cfg=None, client=None):
     """Interactive onboarding questionnaire. Everything stays local.
     Seed-like input at the address prompt is refused with the loud
-    warning and re-prompted — never stored."""
+    warning and re-prompted — never stored.
+    The last question offers the Friday community giveaway opt-in: answering
+    yes creates a normal 1-drop Payment proposal to the donation wallet
+    (still needs human approval); the profile is marked opted-in only after
+    that payment is validated on-ledger."""
     print("XRPL skill onboarding — everything stays on this machine "
           "(~/.xrpl/profile.json, owner-only).")
     print("Skip any question with Enter. Type 'quit' to stop.\n")
@@ -832,14 +1050,29 @@ def run_profile_init(prof, _input=input):
         if problem:
             print(f"  ({problem} — keeping 3)")
 
+    # Friday community giveaway opt-in. Default is skip (Enter) — opting in
+    # sends real value off your wallet, so silence must never mean yes.
+    ans = _profile_input(
+        "\nJoin the Friday community giveaway? (sends a 1-drop opt-in from "
+        "your wallet — proves the address is yours, costs ~nothing) (y/N): ",
+        default="", _input=_input)
+    if ans is None:
+        print("onboarding stopped — nothing was saved")
+        return
+    if ans.strip().lower() in C.PROFILE_BOOL_TRUE:
+        print()
+        print(giveaway_opt_in_flow(cfg, client, prof, C.load_giveaway_config()))
+
     C.save_profile(prof)
     print("\nProfile saved to ~/.xrpl/profile.json — "
           "review it anytime with: xrpl-trade profile show")
 
 
-def cmd_profile(args):
+def cmd_profile(args, cfg=None, client=None):
     """Local assistant profile (onboarding). Entirely local: no network,
-    no proposals, no signing. Watch-only addresses only — seed-like
+    no proposals, no signing — except `init`, which MAY propose the
+    giveaway opt-in payment when the user answers yes (cfg/client are
+    passed through only for that). Watch-only addresses only — seed-like
     input is refused, never stored."""
     try:
         raw = C.load_profile()
@@ -853,7 +1086,7 @@ def cmd_profile(args):
             print("you already have a profile — `profile show` to review, "
                   "`profile clear` to start over")
             return
-        run_profile_init(prof)
+        run_profile_init(prof, cfg=cfg, client=client)
     elif cmd == "show":
         if not exists:
             print("no profile yet — run: xrpl-trade profile init")
@@ -868,6 +1101,9 @@ def cmd_profile(args):
         al = prof.get("alerts") or {}
         print(f"  alerts:      price_moves={al.get('price_moves')} "
               f"threshold={al.get('threshold_pct')}%")
+        gw = prof.get("giveaway") or {}
+        print(f"  giveaway:    opt_in={gw.get('opt_in')} "
+              f"tx={gw.get('opt_in_tx') or '—'}")
     elif cmd == "set":
         problem = C.set_profile_field(prof, args.field, args.value)
         if problem:
@@ -1074,6 +1310,393 @@ def cmd_faucet(args, cfg, _client):
 
 # ---------- main ----------
 
+def giveaway_opt_in_flow(cfg, client, prof, gw):
+    """The shared giveaway opt-in logic (profile init + `giveaway opt-in`).
+
+    Returns a message for the caller to print. The profile is marked
+    opted-in (and saved) ONLY after a matching 1-drop opt-in Payment is
+    found validated on-ledger — creating a proposal is NOT opt-in.
+    Every branch is non-fatal: problems come back as text, never exits,
+    so the onboarding questionnaire can't be derailed by a network hiccup.
+    """
+    gw_prof = prof.get("giveaway") or {}
+    if gw_prof.get("opt_in"):
+        return (f"already opted in — entry tx {gw_prof.get('opt_in_tx') or '—'}; "
+                f"you're in the Friday draw")
+    if client is None:
+        return ("opt-in needs a network client — run "
+                "`xrpl-trade giveaway opt-in` from a terminal with network")
+    acct = (cfg or {}).get("address")
+    if not acct:
+        return ("no address configured — run `xrpl-trade setup` first, then "
+                "`xrpl-trade giveaway opt-in`")
+    wallet, tag = gw["donation_wallet"], gw["opt_in_tag"]
+
+    # 1. Already on-ledger? (covers: they sent it by hand, or they approved
+    #    a proposal earlier and re-ran this.) Nothing proposed, no duplicates.
+    found, problem = C.find_opt_in_tx(client, acct, wallet, tag)
+    if problem:
+        return f"couldn't check the ledger for an existing opt-in: {problem}"
+    if found:
+        prof["giveaway"] = {"opt_in": True, "opt_in_tx": found}
+        C.save_profile(prof)
+        return (f"opt-in already on-ledger: {found}\n"
+                "recorded — you're in the Friday draw")
+
+    # 2. Add the exact (donation wallet, tag) pair to the payment
+    #    destination allowlist — the signer refuses anything not listed.
+    problem = C.add_destination_allowlist_entry(wallet, tag)
+    if problem:
+        return f"couldn't update your payment destination allowlist: {problem}"
+    print(f"  added ({wallet}, tag {tag}) to your payment destination allowlist")
+
+    # 3. Propose the 1-drop opt-in through the normal ceremony: human
+    #    approval still required, and the profile stays unmarked until the
+    #    payment validates. Re-run this command afterwards to record it.
+    tx = Payment(account=acct, destination=wallet,
+                 amount=xrp_to_drops(Decimal("0.000001")),
+                 destination_tag=tag)
+    propose(tx, client, cfg, "giveaway-opt-in",
+            ["opt-in:   Friday community giveaway",
+             f"to:       {wallet} (donation wallet)",
+             "amount:   1 drop (0.000001 XRP)",
+             f"dest tag: {tag}"])
+    return ("proposal created — after you approve it, re-run "
+            "`xrpl-trade giveaway opt-in` to record your entry")
+
+
+def cmd_giveaway(args, cfg, client):
+    """Friday community giveaway. entrants/draw/status are read-only;
+    opt-in goes through the normal propose → human-approve → sign flow.
+    The draw only SELECTS a winner — it never builds or submits a gift
+    transaction (that stays human-approved, gift by gift)."""
+    gw = C.load_giveaway_config(getattr(args, "donation_wallet", None))
+    wallet, tag = gw["donation_wallet"], gw["opt_in_tag"]
+    network = cfg.get("network", "?")
+    cmd = args.gw_cmd
+
+    if cmd == "opt-in":
+        try:
+            raw = C.load_profile()
+        except C.ProfileError as e:
+            sys.exit(str(e))
+        prof = C.normalize_profile(raw) if raw else C.default_profile()
+        print(giveaway_opt_in_flow(cfg, client, prof, gw))
+        return
+
+    if cmd == "entrants":
+        entrants, problem = C.eligible_entrants(client, wallet, tag)
+        if problem:
+            sys.exit(problem)
+        print(f"Giveaway entrants — donation wallet {wallet} [{network}]")
+        print(f"  opt-in: 1 drop (0.000001 XRP) with destination tag {tag}")
+        n_elig = sum(1 for e in entrants if e["eligible"])
+        for e in entrants:
+            yn = "yes" if e["eligible"] else "no"
+            print(f"  {e['address']:<36} tx {e['opt_in_tx'][:12]}… "
+                  f"actions {e['action_count']:>3}  eligible {yn}")
+        print(f"\n{n_elig}/{len(entrants)} eligible "
+              f"(eligibility: opt-in + ≥1 wallet action)")
+        return
+
+    if cmd == "draw":
+        if args.ledger_offset < 0:
+            sys.exit("--ledger-offset must be >= 0")
+        entrants, problem = C.eligible_entrants(client, wallet, tag)
+        if problem:
+            sys.exit(problem)
+        eligible = [e for e in entrants if e["eligible"]]
+        if not eligible:
+            print("no eligible entrants — nothing to draw")
+            return
+        current, problem = C.get_validated_ledger(client)
+        if problem:
+            sys.exit(problem)
+        target = current + args.ledger_offset
+        if args.ledger_offset:
+            print(f"waiting for ledger {target} "
+                  f"(validated {current} + offset {args.ledger_offset})…")
+        lhash, problem = C.wait_for_ledger_hash(client, target)
+        if problem:
+            sys.exit(problem)
+        idx, digest, _seed = C.pick_giveaway_winner(eligible, lhash)
+        winner = eligible[idx]
+        print("=" * 64)
+        print("GIVEAWAY DRAW — selection only. No transaction was built, "
+              "proposed, or submitted.")
+        print("=" * 64)
+        print(f"  entrants:    {len(eligible)} eligible")
+        print(f"  ledger:      {target}")
+        print(f"  ledger hash: {lhash}")
+        print("  method:      sha256(ledger_hash + ':' + opt-in tx hashes "
+              "in address order) mod entrants")
+        print(f"  digest:      {digest}")
+        print(f"  winner idx:  {idx} (= digest mod {len(eligible)})")
+        print(f"  WINNER:      {winner['address']}")
+        print("Verify independently: take the ledger hash above and the "
+              "opt-in tx hashes below (sorted by address), sha256 the "
+              f"colon/comma-joined string, take mod {len(eligible)}.")
+        for e in eligible:
+            print(f"    {e['address']}  {e['opt_in_tx']}")
+        # Persist the public draw result for `giveaway announce`. This is a
+        # local record of public data — the draw still never transacts.
+        C.save_last_draw({
+            "drawn_at": int(time.time()),
+            "network": network,
+            "donation_wallet": wallet,
+            "ledger_index": target,
+            "ledger_hash": lhash,
+            "method": ("sha256(ledger_hash + ':' + opt-in tx hashes in "
+                       "address order) mod entrants"),
+            "digest": digest,
+            "winner_index": idx,
+            "winner": winner["address"],
+            "entrant_count": len(eligible),
+            "opt_in_txs": {e["address"]: e["opt_in_tx"] for e in eligible},
+        })
+        return
+
+    if cmd == "gift":
+        cmd_giveaway_gift(args, gw, wallet)
+        return
+
+    if cmd == "setup":
+        cmd_giveaway_setup(args, gw)
+        return
+
+    if cmd == "announce":
+        cmd_giveaway_announce(args, gw)
+        return
+
+    if cmd == "status":
+        try:
+            info = client.request(AccountInfo(account=wallet,
+                                              ledger_index="validated"))
+        except Exception as e:
+            sys.exit(f"status: account info failed: {e}")
+        if not info.is_successful():
+            sys.exit(f"status: account info failed: "
+                     f"{(info.result or {}).get('error', info.result)}")
+        bal = drops_to_xrp((info.result or {}).get("account_data", {})
+                           .get("Balance", "0"))
+        print(f"Giveaway pot — {wallet} [{network}]")
+        print(f"  XRP: {bal}")
+        try:
+            lines = client.request(AccountLines(account=wallet,
+                                                ledger_index="validated",
+                                                limit=400))
+        except Exception as e:
+            sys.exit(f"status: trustlines failed: {e}")
+        if lines.is_successful():
+            nonzero = [ln for ln in (lines.result or {}).get("lines", [])
+                       if float(ln.get("balance", 0)) != 0]
+            print(f"  trustlines with balance: {len(nonzero)}")
+            for ln in sorted(nonzero, key=lambda x: x.get("currency", "")):
+                print(f"    {ln.get('balance')} {ln.get('currency')} "
+                      f"({ln.get('account')})")
+        else:
+            print("  trustlines: (lookup failed)")
+        # marker-paged NFT inventory (same shape as nft-inventory)
+        nfts, marker = [], None
+        while True:
+            kw = {"account": wallet, "limit": 400, "ledger_index": "validated"}
+            if marker:
+                kw["marker"] = marker
+            try:
+                resp = client.request(AccountNFTs(**kw))
+            except Exception as e:
+                sys.exit(f"status: NFT inventory failed: {e}")
+            if not resp.is_successful():
+                sys.exit(f"status: NFT inventory failed: "
+                         f"{(resp.result or {}).get('error', resp.result)}")
+            res = resp.result or {}
+            # Same item-2 standard as nft-inventory: refuse unvalidated data.
+            if res.get("validated") is not True:
+                sys.exit("status: NFT inventory returned unvalidated "
+                         "ledger data — refusing")
+            nfts.extend(res.get("account_nfts") or [])
+            marker = res.get("marker")
+            if not marker:
+                break
+        print(f"  NFTs owned: {len(nfts)}")
+        for n in nfts:
+            print(f"    {n.get('NFTokenID')} (taxon {n.get('NFTokenTaxon')})")
+        return
+
+    sys.exit(f"unknown giveaway command {cmd!r}")
+
+
+def cmd_giveaway_gift(args, gw, wallet):
+    """PROPOSE a gift from the donation wallet to a winner.
+
+    Nothing is submitted — the normal ceremony applies: the human reviews
+    the exact proposal hash, then signs with the donation wallet's key
+    under the giveaway policy. There is no auto-send path.
+    """
+    network = gw["network"]
+    max_gift = gw["max_gift_xrp"]
+
+    problem = C.validate_gift_destination(args.to, wallet)
+    if problem:
+        sys.exit(problem)
+    dest = args.to.strip()
+
+    has_amount = args.amount is not None
+    has_nft = args.token_id is not None
+    if has_amount == has_nft:
+        sys.exit("give exactly one of --amount (XRP/IOU gift) "
+                 "or --token-id (NFT gift)")
+
+    # All pure validation happens BEFORE any network call, so bad input
+    # exits without touching the ledger.
+    if has_nft:
+        nid = args.token_id.strip().upper()
+        if len(nid) != 64 or any(c not in "0123456789abcdefABCDEF"
+                                 for c in nid):
+            sys.exit("token id must be 64 hex characters")
+    else:
+        amt = C.dec(args.amount, "amount")
+        if amt <= 0:
+            sys.exit("amount must be positive")
+        ccy = (args.ccy or "XRP").upper()
+        issuer = args.issuer
+        if ccy == "XRP":
+            if issuer:
+                sys.exit("XRP gifts take no --issuer")
+        elif not issuer:
+            sys.exit(f"IOU gift needs --issuer for {ccy}")
+        elif not C.is_valid_classic_address(issuer):
+            sys.exit("issuer is not a valid classic address")
+        cap_problem = C.check_gift_cap(amt, ccy, max_gift)
+        if cap_problem:
+            sys.exit(cap_problem)
+
+    gclient = get_client(network)
+
+    # Winner sanity check: warn (never block) when the destination is not
+    # a currently-eligible entrant. Best effort — a scan failure must not
+    # block a legitimate gift.
+    try:
+        entrants, eproblem = C.eligible_entrants(gclient, wallet,
+                                                gw["opt_in_tag"])
+        if eproblem:
+            print(f"  note: entrant list unavailable ({eproblem}) — "
+                  "skipping winner check")
+        elif not any(e["address"] == dest and e["eligible"]
+                     for e in entrants):
+            print(f"  WARNING: {dest} is not in the current eligible "
+                  "entrant list.")
+            print("  The gift will still be proposed — verify the winner "
+                  "out of band.")
+    except Exception as e:  # noqa: BLE001
+        print(f"  note: entrant check failed ({e}) — continuing")
+
+    if has_nft:
+        if not donation_wallet_owns_nft(gclient, wallet, nid):
+            sys.exit(f"donation wallet {wallet} does not own NFT {nid} — "
+                     "refusing")
+        tx = build_gift_nft_offer(wallet, dest, nid, args.expires_in)
+        lines = ["gift:     NFT transfer (0 XRP, NOT a sale)",
+                 f"token:    {nid}",
+                 f"from:     {wallet} (donation wallet)",
+                 f"to:       {dest}",
+                 "note:     the recipient must accept the offer before it "
+                 "expires — nothing moves until they do"]
+    else:
+        tx = build_gift_payment(wallet, dest, amt, ccy, issuer)
+        lines = [f"gift:     {amt} {ccy}"
+                 + (f" ({issuer[:12]}…)" if issuer else ""),
+                 f"from:     {wallet} (donation wallet)",
+                 f"to:       {dest}"]
+        if ccy != "XRP":
+            lines.append("note:     IOU gifts must be in the approved token "
+                         "allowlist AND have a")
+            lines.append("          spend_limits entry in the giveaway policy, "
+                         "or xrpl-sign")
+            lines.append("          denies them (fail-closed)")
+
+    propose(tx, gclient, {"network": network}, C.GIFT_ACTION, lines)
+
+
+def cmd_giveaway_setup(args, gw):
+    """Interactive donation-wallet setup: writes the narrow giveaway signer
+    policy, then optionally stores the donation-wallet seed locally.
+
+    The seed is read via getpass — never echoed, never printed, never
+    logged. It is validated (must derive the donation wallet) before
+    anything is stored. Skipping the seed means the vault injects
+    XRPL_GIVEAWAY_SEED at signing time (preferred)."""
+    import getpass
+
+    wallet, network, max_gift = (gw["donation_wallet"], gw["network"],
+                                 gw["max_gift_xrp"])
+    print(f"Giveaway setup — donation wallet {wallet} [{network}]")
+
+    if C.write_giveaway_policy(max_gift, network):
+        print(f"  wrote giveaway policy: {C.GIVEAWAY_POLICY_PATH}")
+        print(f"    network_lock={network}, Payment+NFTokenCreateOffer only, "
+              f"XRP per-tx cap={max_gift}")
+    else:
+        print(f"  policy exists: {C.GIVEAWAY_POLICY_PATH} (edit it directly)")
+
+    print(f"\nSeed storage. Preferred: the vault injects {C.GIVEAWAY_SEED_ENV}")
+    print("at signing time after human approval (nothing stored on disk).")
+    print("Fallback: store it here — owner-only 0600, read only by xrpl-sign.")
+    try:
+        seed = getpass.getpass(
+            "Donation wallet seed (Enter to skip, use the vault): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nskipped.")
+        return
+    if not seed:
+        print(f"skipped — the signer will read {C.GIVEAWAY_SEED_ENV} "
+              "from the environment.")
+        return
+    try:
+        from xrpl.wallet import Wallet
+        derived = Wallet.from_seed(seed).classic_address
+    except Exception:  # noqa: BLE001
+        sys.exit("that is not a valid XRPL seed — nothing was stored")
+    if derived != wallet:
+        sys.exit(f"that seed derives {derived}, not the donation wallet "
+                 f"{wallet} — nothing was stored")
+    C.write_giveaway_seed(seed)
+    print(f"seed stored in {C.GIVEAWAY_PATH} (0600). It will never be printed.")
+
+
+def cmd_giveaway_announce(args, gw):
+    """Print a draft winner announcement. Read-only — nothing is posted."""
+    rec = C.load_last_draw()
+    if rec is None:
+        sys.exit("no draw on record — run `giveaway draw` first")
+    winner = (args.winner or rec.get("winner") or "").strip()
+    problem = C.validate_gift_destination(winner, gw["donation_wallet"])
+    if problem:
+        sys.exit(f"winner: {problem}")
+    prize = (args.prize or "").strip() or "(prize not specified)"
+    print("Draft announcement — copy, edit, post wherever the community lives:")
+    print()
+    print("Friday Giveaway winner!")
+    print()
+    print(f"Winner: {winner}")
+    # The prize text is human-supplied free text: sanitize for the
+    # terminal like any other untrusted string (item 3).
+    print(f"Prize: {C.safe_terminal_text(prize, 200)} — from the community "
+          "donation pot")
+    print()
+    print("Draw proof (verify it yourself):")
+    print(f"  ledger:      {rec.get('ledger_index')}")
+    print(f"  ledger hash: {rec.get('ledger_hash')}")
+    print(f"  method:      {rec.get('method')}")
+    print(f"  digest:      {rec.get('digest')}")
+    print(f"  entrants:    {rec.get('entrant_count')} eligible")
+    print()
+    print("Thanks to everyone who entered — and to our donors! Chip in:")
+    print(gw["donation_wallet"])
+    print()
+    print("Next draw: Friday 7:37 AM PT.")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="xrpl-trade",
                                  description="XRPL proposer: builds tx, never signs.")
@@ -1126,9 +1749,12 @@ def main():
     p.add_argument("--destination-tag", default=None, type=int)
     p = sub.add_parser("faucet", help="fund a fresh testnet/devnet wallet")
     p.add_argument("--network", choices=["testnet", "devnet"], default=None)
-    p = sub.add_parser("nft-mint", help="PROPOSE minting an NFT (pins art to "
-                                       "IPFS via your Pinata key)")
-    p.add_argument("--file", required=True, help="artwork file to pin")
+    p = sub.add_parser("nft-stage", help="STAGE artwork for an NFT mint: "
+                                        "validate + hash locally, zero "
+                                        "network calls")
+    p.add_argument("--file", required=True,
+                   help="artwork file (must be inside the NFT media "
+                        "directory, ~/.xrpl/media by default)")
     p.add_argument("--name", required=True, help="NFT name")
     p.add_argument("--description", default="",
                    help="NFT description (goes in the metadata JSON)")
@@ -1137,6 +1763,12 @@ def main():
                         "(default 1000 = 10%%; IMMUTABLE after mint)")
     p.add_argument("--taxon", default=0, type=int,
                    help="NFTokenTaxon grouping id (default 0)")
+    p = sub.add_parser("nft-pin-and-propose",
+                       help="PIN staged artwork + metadata to IPFS "
+                            "(external write via your Pinata key) and "
+                            "PROPOSE the mint")
+    p.add_argument("--stage", required=True,
+                   help="stage id printed by nft-stage")
     p = sub.add_parser("nft-list", help="PROPOSE listing an owned NFT for "
                                        "sale (XRP only, sell offer)")
     p.add_argument("--token-id", required=True,
@@ -1246,13 +1878,66 @@ def main():
     d.add_argument("id", help="listing id")
     xp.add_parser("stats", help="marketplace aggregate stats")
     xp.add_parser("categories", help="listing category keys")
+    p = sub.add_parser("giveaway", help="Friday community giveaway: opt in, "
+                                        "list entrants, draw a winner, show "
+                                        "the pot (draw only selects — it "
+                                        "never sends)")
+    gp = p.add_subparsers(dest="gw_cmd", required=True)
+    gp.add_parser("opt-in", help="opt in: checks for an on-ledger 1-drop "
+                                 "entry, otherwise PROPOSES one (human "
+                                 "approval still required; recorded only "
+                                 "after validation)")
+    e = gp.add_parser("entrants", help="list opt-ins + eligibility "
+                                       "(read-only)")
+    e.add_argument("--donation-wallet", default=None,
+                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+    d = gp.add_parser("draw", help="deterministic draw from a future ledger "
+                                   "hash (read-only; selects only)")
+    d.add_argument("--donation-wallet", default=None,
+                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+    d.add_argument("--ledger-offset", type=int, default=20,
+                   help="ledgers ahead of the current validated index to "
+                        "draw from (default 20)")
+    s = gp.add_parser("status", help="the pot: XRP balance, nonzero "
+                                     "trustlines, NFT inventory (read-only)")
+    s.add_argument("--donation-wallet", default=None,
+                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+    g = gp.add_parser("gift", help="PROPOSE a gift from the donation wallet "
+                                  "(human approval still required; never "
+                                  "auto-sends)")
+    g.add_argument("--to", required=True, help="winner's classic address")
+    g.add_argument("--amount", default=None,
+                   help="gift amount (XRP or IOU; exactly one of --amount / "
+                        "--token-id)")
+    g.add_argument("--ccy", default="XRP", help="currency code (default XRP)")
+    g.add_argument("--issuer", default=None,
+                   help="issuer (required for IOU gifts)")
+    g.add_argument("--token-id", default=None,
+                   help="NFT id to gift (0-XRP transfer offer)")
+    g.add_argument("--donation-wallet", default=None,
+                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+    g.add_argument("--expires-in", type=int, default=86400,
+                   help="NFT transfer offer expiry in seconds (default 86400)")
+    gp.add_parser("setup", help="interactive donation-wallet setup: signer "
+                               "policy + optional local seed (getpass, never "
+                               "echoed)").add_argument(
+        "--donation-wallet", default=None,
+        help="donation wallet to set up (default: ~/.xrpl/giveaway.json)")
+    a = gp.add_parser("announce", help="print a draft winner announcement "
+                                      "(read-only, nothing posted)")
+    a.add_argument("--winner", default=None,
+                   help="winner address (default: last draw's winner)")
+    a.add_argument("--prize", default=None,
+                   help="prize description, e.g. '5 XRP'")
+    a.add_argument("--donation-wallet", default=None,
+                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
 
     args = ap.parse_args()
     if args.cmd == "favorites":
         # Local-only: no config, no network client needed.
         cmd_favorites(args)
         return
-    if args.cmd == "profile":
+    if args.cmd == "profile" and args.prof_cmd != "init":
         # Local-only: no config, no network client needed.
         cmd_profile(args)
         return
@@ -1266,6 +1951,12 @@ def main():
         sys.exit(f"unknown network {network!r}")
     cfg["network"] = network
     client = get_client(network)
+
+    if args.cmd == "profile":
+        # Only `init` reaches here (others returned above); it may PROPOSE
+        # the giveaway opt-in when the user answers yes.
+        cmd_profile(args, cfg, client)
+        return
 
     {
         "setup": lambda: cmd_setup(args),
@@ -1281,13 +1972,16 @@ def main():
         "cancel": lambda: cmd_cancel(args, cfg, client),
         "send": lambda: cmd_send(args, cfg, client),
         "faucet": lambda: cmd_faucet(args, cfg, client),
-        "nft-mint": lambda: cmd_nft_mint(args, cfg, client),
+        "nft-stage": lambda: cmd_nft_stage(args, cfg, client),
+        "nft-pin-and-propose": lambda: cmd_nft_pin_and_propose(args, cfg,
+                                                              client),
         "nft-list": lambda: cmd_nft_list(args, cfg, client),
         "nft-send": lambda: cmd_nft_send(args, cfg, client),
         "nft-inventory": lambda: cmd_nft_inventory(args, cfg, client),
         "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
         "nft-bid": lambda: cmd_nft_bid(args, cfg, client),
         "nft-new": lambda: cmd_nft_new(args, cfg, client),
+        "giveaway": lambda: cmd_giveaway(args, cfg, client),
     }[args.cmd]()
 
 

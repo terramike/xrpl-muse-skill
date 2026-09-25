@@ -93,8 +93,14 @@ mainnet-ready **only** when all of these hold:
 - The signer and the policy file sit behind a vault, separate OS identity,
   or privileged signing service the agent cannot rewrite.
 
+A same-user local agent does **not** satisfy this boundary, even with
+`0600` files: a same-UID process can read the signer's environment and
+rewrite its policy and state. Same-user installs are testnet-only.
+
 Without those platform guarantees, v0.5 is a hardened testnet tool — not
-generically mainnet-safe. The design states this honestly; see `SECURITY.md`.
+generically mainnet-safe. Three deployment profiles are documented in
+`README.md` (Muse vault / Xaman-human / autonomous-experimental); the
+design states all of this honestly in `SECURITY.md`.
 
 ## The ceremony (every write)
 
@@ -148,12 +154,25 @@ transaction-derived summary — it never signs.
 
 ## NFTs (v0.5): mint, list, inventory, buy, bid
 
-```bash
-export PINATA_JWT="…"   # your own Pinata account — never goes in git
-xrpl-trade nft-mint --file art.png --name "Neon Drift" \
-    --description "Series 1, piece 3" --royalty-bps 1000
-# → pins art + metadata under YOUR Pinata account, proposes NFTokenMint
+Minting is a deliberate **two-step** flow — pinning is an external write
+and happens inside the approved action, never before it:
 
+```bash
+xrpl-trade nft-stage --file art.png --name "Neon Drift" \
+    --description "Series 1, piece 3" --royalty-bps 1000
+# → validates the artwork locally (approved media dir, size/type/sha256)
+#   and writes a reviewable stage record. ZERO network calls.
+
+# A human reviews the stage record, then approves the pin + proposal as
+# one action. PINATA_JWT is injected for this single operation only
+# (e.g. PINATA_JWT="$(vault read ...)" xrpl-trade nft-pin-and-propose …)
+# — never exported into a shell, never stored, never logged:
+xrpl-trade nft-pin-and-propose --stage <stage-id>
+# → re-validates the file against the staged hash, pins art + metadata
+#   under YOUR Pinata account, proposes NFTokenMint
+```
+
+```bash
 xrpl-trade nft-list --token-id <64-hex-id> --price-xrp 25 \
     [--destination r...] [--expires-in 86400]
 # → proposes an XRP-denominated SELL offer
@@ -162,7 +181,8 @@ xrpl-trade nft-list --token-id <64-hex-id> --price-xrp 25 \
 ```bash
 xrpl-trade nft-inventory [r...]      # read-only: every NFT you own
 xrpl-trade nft-buy --offer-index <64-hex>
-# → verifies the SELL offer from the ledger, then proposes NFTokenAcceptOffer
+# → verifies the SELL offer from the ledger (seller, ISSUER/minter, URI,
+#   taxon), then proposes NFTokenAcceptOffer
 xrpl-trade nft-bid --token-id <64-hex> --seller r... --price-xrp 5 \
     [--expires-in 86400]
 # → proposes a BUY offer (bid); the bid XRP locks until accepted/cancelled/expired
@@ -181,12 +201,12 @@ xrpl-trade nft-send --token-id <64-hex> --to <favorite-name|r...> \
   gated by `max_mints_per_day` (rolling 24h) plus `max_transfer_fee`.
 - **Buying: verify the seller, not the picture.** `nft-buy` fetches the
   sell offer from the ledger and refuses buy offers, non-XRP amounts, and
-  vanished offers. It prints the on-ledger **seller, token URI, and
-  taxon** before proposing, and the signer re-verifies the offer at
+  vanished offers. It prints the on-ledger **seller, issuer, token URI,
+  and taxon** before proposing, and the signer re-verifies the offer at
   signing time — if the offer changed, signing is refused. Anyone can
-  mint the same artwork, so check that the seller is the minter you
-  expect. The skill reports on-ledger facts; it never calls a token
-  "authentic". Each NFT is one-of-one: there is no fungible order-book
+  mint the same artwork, so check that the issuer is the artist you
+  expect — the seller is only the current owner. The skill reports
+  on-ledger facts; it never calls a token "authentic". Each NFT is one-of-one: there is no fungible order-book
   price check, and price sanity is the human's call.
 - Accepting a sell offer spends XRP immediately: the offer's price plus
   fee runs through the per-transaction and rolling-24h spend caps.
@@ -270,6 +290,117 @@ refuses seed-shaped input with an explicit warning and never stores it.
 - Keep the public skill generic: memberships and interests are open
   tag lists, never hardcoded to one DAO or one user.
 
+## Friday community giveaway
+
+Every Friday at 7:37 AM, one random entrant wins a gift — funded by the
+community, drawn in public, verifiable by anyone. This skill covers entry,
+eligibility, the draw, the gift proposal, and the announcement draft. The
+scheduled Friday run lives on a cron; every gift stays human-approved, one
+at a time — **no automatic signing or sending, ever**.
+
+The pot: the **Musegives** donation wallet
+`rnkt27oqgJiRfsuwCogqrLwYx4NNooMFdB` (public by design — publishing it is
+how people find the pot). Anyone can contribute XRP to it.
+`~/.xrpl/giveaway.json` (owner-only `0600`) holds the donation wallet and
+the opt-in tag (defaults: Musegives, tag `777`), plus `max_gift_xrp`
+(default `10` — the largest XRP gift the tool will propose) and
+`network` (default `mainnet`). Every giveaway command takes
+`--donation-wallet r…`, so community leaders can run the same flow
+against their own wallet with no code changes.
+
+### Opting in: 1 drop, destination tag 777
+
+Entry is a single Payment of exactly **1 drop** (0.000001 XRP) to the
+donation wallet with destination tag **777** — it proves the entrant owns
+the address and costs ~nothing. `profile init` offers this as its last
+question (default: skip — silence is never consent). Answering yes first
+checks for an existing on-ledger opt-in, then adds the exact
+(donation wallet, tag 777) pair to the payment destination allowlist and
+creates a normal 1-drop Payment **proposal**. The human still approves it,
+and the profile is marked opted-in (`giveaway.opt_in: true` +
+`giveaway.opt_in_tx`) only after the payment is **validated on-ledger** —
+re-run `giveaway opt-in` after approving to record it. Creating a proposal
+is never treated as opt-in.
+
+```bash
+xrpl-trade giveaway opt-in                 # check for an entry, else PROPOSE one
+xrpl-trade giveaway entrants [--donation-wallet r…]
+xrpl-trade giveaway draw [--donation-wallet r…] [--ledger-offset N]
+xrpl-trade giveaway status [--donation-wallet r…]
+```
+
+### Eligibility + the draw
+
+- `entrants` scans the donation wallet's `account_tx` for incoming
+  successful Payments of exactly 1 drop with tag 777. Each entrant needs
+  ≥1 wallet action besides the opt-in itself: `OfferCreate`,
+  `OfferCancel`, non-opt-in `Payment`, `TrustSet`, `NFTokenMint`,
+  `NFTokenCreateOffer`, `NFTokenAcceptOffer`, `NFTokenCancelOffer`.
+- `draw` waits for validated ledger index + `--ledger-offset` (default
+  20), takes that future ledger's hash, and computes
+  `sha256(ledger_hash + ":" + opt-in tx hashes in address order) mod
+  entrants`. It prints the winner, the ledger index/hash, the digest,
+  and the method — anyone can recompute it independently. **Selection
+  only: no gift proposal is built, signed, or sent.**
+- `status` shows the pot: XRP balance, nonzero trustlines, owned NFTs.
+- `draw` saves its public proof to `~/.xrpl/giveaway_last_draw.json`
+  (ledger index/hash, method, digest, winner) so the announcement can be
+  recomputed later.
+
+### Gifting the prize (always propose → human `--approve` → sign)
+
+`gift` builds the prize proposal from the donation wallet — XRP, an IOU,
+or an NFT. It never signs and never sends; the human approves that exact
+proposal hash, then the donation wallet's key signs it. Three forms:
+
+```bash
+xrpl-trade giveaway gift --to rWinner… --amount 5            # 5 XRP
+xrpl-trade giveaway gift --to rWinner… --amount 25 --ccy USD --issuer r…
+xrpl-trade giveaway gift --to rWinner… --token-id <64-hex>   # 0-XRP NFT transfer offer
+```
+
+- Exactly one of `--amount` / `--token-id`. XRP is the default currency;
+  IOU gifts need `--issuer`. NFT gifts are 0-XRP transfer offers to the
+  winner with a 24h expiry (the wallet must actually own the NFT).
+- IOU gifts are doubly fail-closed at signing: the token must already be
+  in the approved token allowlist (`approved.json`) **and** have a
+  `spend_limits` entry in the giveaway policy — both deliberate human
+  edits, so no surprise token ever leaves the pot.
+- Guards: `--to` must be a valid classic address and cannot be the
+  donation wallet itself; anything seed-like is refused with a loud STOP
+  (a seed is never a destination). XRP gifts above `max_gift_xrp` are
+  refused — the cap is raised by editing `~/.xrpl/giveaway.json`
+  deliberately, never in the heat of the moment. A winner who hasn't
+  opted in gets a warning, not a block (Mike's call can override).
+- `setup` (interactive, local): writes the narrow giveaway signer policy
+  (`~/.xrpl/giveaway_policy.json` — only `Payment` +
+  `NFTokenCreateOffer`, network-locked, XRP spend capped at
+  `max_gift_xrp`, arbitrary winner destinations since the human approved
+  the exact one). It then offers to store the donation wallet's seed:
+  the preferred path is the `XRPL_GIVEAWAY_SEED` environment variable
+  (injected from the secure vault for the exact approved moment); the
+  fallback is a hidden prompt that stores it in `~/.xrpl/giveaway.json`
+  (`0600`). Either way the seed is never printed, logged, or echoed —
+  the CLI verifies it derives the configured donation address before
+  storing anything. The local fallback is deliberate and explicit, and
+  `xrpl-sign`'s `check_protected_files` covers `giveaway.json` and the
+  giveaway policy in giveaway mode — the signer refuses to run if either
+  is not owner-only.
+- `announce [--winner r…] [--prize "5 XRP"]` prints a draft winner
+  announcement from the last draw (winner, prize, ledger index/hash,
+  method, digest, entrant count, pot address, next Friday 7:37 AM). It
+  posts nothing — the draft is for review.
+- The proposal prints its giveaway signing command:
+  `xrpl-sign --hash <hash> --approve --seed-env XRPL_GIVEAWAY_SEED
+  --policy ~/.xrpl/giveaway_policy.json` (the `--approve` flag is never
+  the approval — the human's explicit go-ahead for that exact hash is).
+
+The Friday flow: cron runs `giveaway draw` → Mike picks the prize →
+`giveaway gift` builds the proposal → he approves that exact hash → the
+signer signs with the donation wallet's key under the giveaway policy →
+a validated-ledger result closes it → `giveaway announce` drafts the
+post. `draw` never transacts, and neither does `gift` on its own.
+
 ## XRPresso discovery: marketplace search (read-only)
 
 XRPresso (xrpresso.io) is a non-custodial P2P marketplace on XRPL —
@@ -323,6 +454,11 @@ Reading (no seed, no proposals):
 - `xrpresso listings|nfts|auctions|listing|categories|stats` — search
   the XRPresso marketplace (read-only, no key, no signup); results
   print deep links so you buy/bid in XRPresso's UI
+- `giveaway entrants|draw|status|announce [--donation-wallet r…]` —
+  opt-ins + eligibility, the deterministic draw (**selection only — no
+  gift is built or sent**), the pot: XRP balance, nonzero trustlines,
+  NFT inventory, and a draft winner announcement from the last draw
+  (read-only, nothing posted)
 
 Writing (always propose → human `--approve` → sign):
 
@@ -333,6 +469,15 @@ Writing (always propose → human `--approve` → sign):
 - `send --to r… --amount A --ccy XRP [--destination-tag N]`
 - `nft-send --token-id <64-hex> --to <favorite|r…>` — gift an owned NFT
   (0-XRP transfer offer; recipient must accept before expiry)
+- `giveaway opt-in [--donation-wallet r…]` — PROPOSE the 1-drop entry
+  payment to the donation wallet (tag 777); recorded as opted-in only
+  after the payment validates on-ledger
+- `giveaway gift --to r… --amount A [--ccy XRP] [--issuer r…]` |
+  `--token-id <64-hex> [--donation-wallet r…]` — PROPOSE the prize from
+  the donation wallet (XRP under `max_gift_xrp`, an IOU, or a 0-XRP NFT
+  transfer offer); signs only after the human approves that exact hash
+  with the donation wallet's key (`--seed-env XRPL_GIVEAWAY_SEED`) under
+  the giveaway policy
 
 `--amount` is always BASE units, `--price` is always QUOTE per BASE.
 `--pair NAME` resolves through `~/.xrpl/approved.json` (copy
