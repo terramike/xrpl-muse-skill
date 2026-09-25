@@ -13,6 +13,8 @@ independent human approval of that exact hash.
 
 Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile,
 nft-inventory, favorites, nft-new, xrpresso (XRPresso marketplace discovery).
+Local-only: profile (onboarding questionnaire — name, watch-only addresses,
+memberships, interests; never leaves this machine).
 NFT: nft-mint pins artwork + metadata to IPFS with the operator's own
 Pinata key (bring-your-own-key — the skill never hosts anyone's media),
 then proposes the mint; nft-list proposes an XRP-denominated sell offer.
@@ -740,6 +742,173 @@ def cmd_favorites(args):
         sys.exit(f"unknown favorites command {cmd!r}")
 
 
+def _profile_input(prompt, default="", _input=input):
+    try:
+        ans = _input(prompt).strip()
+    except EOFError:
+        return None  # signal: stop the questionnaire
+    if ans.lower() == "quit":
+        return None
+    return ans if ans else default
+
+
+def run_profile_init(prof, _input=input):
+    """Interactive onboarding questionnaire. Everything stays local.
+    Seed-like input at the address prompt is refused with the loud
+    warning and re-prompted — never stored."""
+    print("XRPL skill onboarding — everything stays on this machine "
+          "(~/.xrpl/profile.json, owner-only).")
+    print("Skip any question with Enter. Type 'quit' to stop.\n")
+
+    ans = _profile_input(
+        f"What should I call you? [{prof.get('display_name') or 'skip'}]: ",
+        default=prof.get("display_name") or "", _input=_input)
+    if ans is None:
+        print("onboarding stopped — nothing was saved")
+        return
+    if ans:
+        problem = C.set_profile_field(prof, "display_name", ans)
+        if problem:
+            print(f"  ({problem} — keeping previous)")
+
+    print("\nAdd WATCH-ONLY XRPL addresses (they start with 'r').")
+    print("NEVER enter a seed or secret key — those start with 's'.")
+    while True:
+        ans = _profile_input("  address [done]: ", default="", _input=_input)
+        if ans is None:
+            print("onboarding stopped — nothing was saved")
+            return
+        if not ans:
+            break
+        problem = C.add_profile_list_item(prof, "xrpl_addresses", ans)
+        if problem:
+            print(f"  {problem}")
+            continue
+        print(f"  added {ans.strip()}")
+
+    ans = _profile_input(
+        "\nAny DAO memberships? (comma-separated, e.g. xaodao) [skip]: ",
+        default="", _input=_input)
+    if ans is None:
+        print("onboarding stopped — nothing was saved")
+        return
+    for raw in ans.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        problem = C.add_profile_list_item(prof, "memberships", raw)
+        if problem:
+            print(f"  ({problem} — skipped)")
+
+    ans = _profile_input(
+        "\nWhat do you use the skill for? (comma-separated, e.g. "
+        + ", ".join(C.SUGGESTED_INTERESTS) + ") [skip]: ",
+        default="", _input=_input)
+    if ans is None:
+        print("onboarding stopped — nothing was saved")
+        return
+    for raw in ans.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        problem = C.add_profile_list_item(prof, "interests", raw)
+        if problem:
+            print(f"  ({problem} — skipped)")
+
+    ans = _profile_input(
+        "\nPrice-move alerts when XRP swings? (y/N): ",
+        default="", _input=_input)
+    if ans is None:
+        print("onboarding stopped — nothing was saved")
+        return
+    if ans.strip().lower() in C.PROFILE_BOOL_TRUE:
+        C.set_profile_field(prof, "alerts.price_moves", "true")
+        ans = _profile_input("  alert threshold in percent [3]: ",
+                            default="3", _input=_input)
+        if ans is None:
+            print("onboarding stopped — nothing was saved")
+            return
+        problem = C.set_profile_field(prof, "alerts.threshold_pct", ans)
+        if problem:
+            print(f"  ({problem} — keeping 3)")
+
+    C.save_profile(prof)
+    print("\nProfile saved to ~/.xrpl/profile.json — "
+          "review it anytime with: xrpl-trade profile show")
+
+
+def cmd_profile(args):
+    """Local assistant profile (onboarding). Entirely local: no network,
+    no proposals, no signing. Watch-only addresses only — seed-like
+    input is refused, never stored."""
+    try:
+        raw = C.load_profile()
+    except C.ProfileError as e:
+        sys.exit(str(e))
+    exists = bool(raw)
+    prof = C.normalize_profile(raw) if exists else C.default_profile()
+    cmd = args.prof_cmd
+    if cmd == "init":
+        if exists:
+            print("you already have a profile — `profile show` to review, "
+                  "`profile clear` to start over")
+            return
+        run_profile_init(prof)
+    elif cmd == "show":
+        if not exists:
+            print("no profile yet — run: xrpl-trade profile init")
+            return
+        print(f"  name:        {prof.get('display_name') or '—'}")
+        addrs = prof.get("xrpl_addresses") or []
+        print(f"  addresses:   {', '.join(addrs) if addrs else '—'}")
+        mems = prof.get("memberships") or []
+        print(f"  memberships: {', '.join(mems) if mems else '—'}")
+        ints = prof.get("interests") or []
+        print(f"  interests:   {', '.join(ints) if ints else '—'}")
+        al = prof.get("alerts") or {}
+        print(f"  alerts:      price_moves={al.get('price_moves')} "
+              f"threshold={al.get('threshold_pct')}%")
+    elif cmd == "set":
+        problem = C.set_profile_field(prof, args.field, args.value)
+        if problem:
+            sys.exit(problem)
+        C.save_profile(prof)
+        print(f"profile: {args.field} = {args.value}")
+    elif cmd in ("add-address", "remove-address"):
+        fn = (C.add_profile_list_item if cmd == "add-address"
+              else C.remove_profile_list_item)
+        problem = fn(prof, "xrpl_addresses", args.address)
+        if problem:
+            sys.exit(problem)
+        C.save_profile(prof)
+        verb = "added to" if cmd == "add-address" else "removed from"
+        print(f"address {args.address.strip()} {verb} your profile")
+    elif cmd in ("add-membership", "remove-membership"):
+        fn = (C.add_profile_list_item if cmd == "add-membership"
+              else C.remove_profile_list_item)
+        problem = fn(prof, "memberships", args.name)
+        if problem:
+            sys.exit(problem)
+        C.save_profile(prof)
+        verb = "added to" if cmd == "add-membership" else "removed from"
+        print(f"membership {args.name.strip().lower()} {verb} your profile")
+    elif cmd in ("add-interest", "remove-interest"):
+        fn = (C.add_profile_list_item if cmd == "add-interest"
+              else C.remove_profile_list_item)
+        problem = fn(prof, "interests", args.name)
+        if problem:
+            sys.exit(problem)
+        C.save_profile(prof)
+        verb = "added to" if cmd == "add-interest" else "removed from"
+        print(f"interest {args.name.strip().lower()} {verb} your profile")
+    elif cmd == "clear":
+        if C.PROFILE_PATH.exists():
+            C.PROFILE_PATH.unlink()
+        print("profile cleared — run `xrpl-trade profile init` to start over")
+    else:  # pragma: no cover — argparse restricts choices
+        sys.exit(f"unknown profile command {cmd!r}")
+
+
 def cmd_xrpresso(args):
     """Read-only XRPresso marketplace discovery.
 
@@ -1017,6 +1186,33 @@ def main():
     rn = fav.add_parser("rename", help="rename a favorite")
     rn.add_argument("old")
     rn.add_argument("new")
+    p = sub.add_parser("profile", help="your local assistant profile: name, "
+                                       "watch-only addresses, memberships, "
+                                       "interests (local only, never leaves "
+                                       "this machine)")
+    prof = p.add_subparsers(dest="prof_cmd", required=True)
+    prof.add_parser("init", help="interactive onboarding questionnaire")
+    prof.add_parser("show", help="show your profile")
+    s = prof.add_parser("set", help="set a scalar field")
+    s.add_argument("field", help="display_name | alerts.price_moves | "
+                                 "alerts.threshold_pct")
+    s.add_argument("value", help="new value")
+    aa = prof.add_parser("add-address",
+                         help="add a WATCH-ONLY classic address (never a seed)")
+    aa.add_argument("address")
+    ra = prof.add_parser("remove-address", help="remove a watch-only address")
+    ra.add_argument("address")
+    am = prof.add_parser("add-membership",
+                         help="add a DAO membership, e.g. xaodao")
+    am.add_argument("name")
+    rm = prof.add_parser("remove-membership", help="remove a DAO membership")
+    rm.add_argument("name")
+    ai = prof.add_parser("add-interest",
+                         help="add an interest, e.g. trading")
+    ai.add_argument("name")
+    ri = prof.add_parser("remove-interest", help="remove an interest")
+    ri.add_argument("name")
+    prof.add_parser("clear", help="delete your local profile")
     p = sub.add_parser("nft-new", help="new mints from favorite artists "
                                        "(read-only)")
     p.add_argument("--days", type=int, default=None,
@@ -1055,6 +1251,10 @@ def main():
     if args.cmd == "favorites":
         # Local-only: no config, no network client needed.
         cmd_favorites(args)
+        return
+    if args.cmd == "profile":
+        # Local-only: no config, no network client needed.
+        cmd_profile(args)
         return
     if args.cmd == "xrpresso":
         # Public HTTP API: no wallet, no XRPL client, no config needed.

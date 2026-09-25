@@ -70,6 +70,8 @@ STATE_PATH = XRPL_DIR / "state.json"
 STATE_LOCK_PATH = XRPL_DIR / "state.lock"
 AUDIT_PATH = XRPL_DIR / "audit.log"
 FAVORITES_PATH = XRPL_DIR / "favorites.json"    # named artist watchlist (read-only)
+PROFILE_PATH = XRPL_DIR / "profile.json"      # local assistant profile (onboarding)
+PROFILE_SCHEMA_VERSION = 1
 
 NETWORKS = {
     "mainnet": ["https://s1.ripple.com:51234", "https://s2.ripple.com:51234"],
@@ -974,6 +976,212 @@ def resolve_fav_or_addr(token, favs):
         return token, None
     return None, (f"{token!r} is neither a favorite name nor a valid "
                   "classic address (base58 checksum failed)")
+
+
+# ---------- assistant profile (onboarding) ----------
+
+class ProfileError(Exception):
+    """Profile file unreadable or from a newer skill version."""
+
+
+# Membership / interest tags: lowercase, 1-40 chars.
+PROFILE_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9 _-]{0,39}$")
+# XRPL family seeds are base58 starting with 's' (secp256k1 ~29 chars,
+# ed25519 'sEd…' longer). Classic addresses start with 'r' — a valid
+# address never matches this.
+SEED_LIKE_RE = re.compile(r"^s[1-9A-HJ-NP-Za-km-z]{27,60}$")
+PROFILE_BOOL_TRUE = {"true", "yes", "y", "1", "on"}
+PROFILE_BOOL_FALSE = {"false", "no", "n", "0", "off"}
+# Conventional interest tags the assistant may suggest. Free-form tags
+# are also accepted — this list only seeds suggestions.
+SUGGESTED_INTERESTS = ["trading", "nfts", "dao-governance", "discovery",
+                       "defi", "gaming"]
+
+
+def looks_like_secret(s):
+    """Heuristic: does this look like a wallet seed/secret, not an address?
+
+    Never used to *detect* a real secret for storage — only to REFUSE
+    one. False positives are safe (the user just retypes); a false
+    negative still fails classic-address validation downstream.
+    """
+    if not isinstance(s, str):
+        return False
+    t = s.strip()
+    if SEED_LIKE_RE.match(t):
+        return True
+    low = t.lower()
+    return "seed" in low or "secret" in low
+
+
+SEED_WARNING = (
+    "STOP — that looks like a wallet SEED/secret, not an address. "
+    "NEVER share your seed with anyone or anything, including this skill. "
+    "Your watch-only XRPL address starts with 'r'. Nothing was saved."
+)
+
+
+def validate_watch_address(addr):
+    """Returns a problem string, or None when the address is a usable
+    watch-only classic address. Seed-like input gets the loud refusal."""
+    if not isinstance(addr, str) or not addr.strip():
+        return "address is empty"
+    a = addr.strip()
+    if looks_like_secret(a):
+        return SEED_WARNING
+    if not is_valid_classic_address(a):
+        return ("address is not a valid classic address "
+                "(base58 checksum failed) — it must start with 'r'")
+    return None
+
+
+def default_profile():
+    now = int(time.time())
+    return {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "display_name": "",
+        "xrpl_addresses": [],
+        "memberships": [],
+        "interests": [],
+        "alerts": {"price_moves": False, "threshold_pct": 3.0},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def normalize_profile(prof):
+    """Fill defaults for missing keys so `show` always renders the full
+    shape. Returns the normalized dict (mutates the input)."""
+    base = default_profile()
+    for key, val in base.items():
+        if key not in prof:
+            prof[key] = val
+    if not isinstance(prof.get("alerts"), dict):
+        prof["alerts"] = {"price_moves": False, "threshold_pct": 3.0}
+    else:
+        for key, val in base["alerts"].items():
+            if key not in prof["alerts"]:
+                prof["alerts"][key] = val
+    for key in ("xrpl_addresses", "memberships", "interests"):
+        if not isinstance(prof.get(key), list):
+            prof[key] = []
+    return prof
+
+
+def load_profile(path=None):
+    """Load the assistant profile. {} when absent (not onboarded yet).
+    Raises ProfileError on corrupt JSON or a newer schema — fail loud,
+    never silently empty."""
+    p = Path(path) if path else PROFILE_PATH
+    if not p.exists():
+        return {}
+    try:
+        prof = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise ProfileError(
+            f"profile file is unreadable ({p}): {e} — fix or delete it")
+    if not isinstance(prof, dict):
+        raise ProfileError(f"profile file is not a JSON object ({p})")
+    ver = prof.get("schema_version", 1)
+    if ver > PROFILE_SCHEMA_VERSION:
+        raise ProfileError(
+            f"profile schema v{ver} is newer than this skill "
+            f"(v{PROFILE_SCHEMA_VERSION}) — upgrade the skill")
+    return normalize_profile(prof)
+
+
+def save_profile(prof, path=None):
+    """Persist the profile atomically, owner-only 0600. Stamps updated_at."""
+    p = Path(path) if path else PROFILE_PATH
+    prof = dict(prof)
+    prof["schema_version"] = PROFILE_SCHEMA_VERSION
+    prof["updated_at"] = int(time.time())
+    if "created_at" not in prof:
+        prof["created_at"] = prof["updated_at"]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(prof, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+
+
+def set_profile_field(prof, field, value):
+    """Set a scalar profile field. Returns a problem string, or None."""
+    if field == "display_name":
+        name = (value or "").strip()
+        if not name:
+            return "display_name must not be empty"
+        if len(name) > 40:
+            return "display_name is too long (max 40 chars)"
+        prof["display_name"] = name
+        return None
+    if field == "alerts.price_moves":
+        v = (value or "").strip().lower()
+        if v in PROFILE_BOOL_TRUE:
+            prof["alerts"]["price_moves"] = True
+            return None
+        if v in PROFILE_BOOL_FALSE:
+            prof["alerts"]["price_moves"] = False
+            return None
+        return (f"alerts.price_moves must be true/false (got {value!r})")
+    if field == "alerts.threshold_pct":
+        try:
+            pct = float(value)
+        except (TypeError, ValueError):
+            return (f"alerts.threshold_pct must be a number (got {value!r})")
+        if not 0.5 <= pct <= 50:
+            return "alerts.threshold_pct must be between 0.5 and 50"
+        prof["alerts"]["threshold_pct"] = pct
+        return None
+    return (f"unknown profile field {field!r} — settable: display_name, "
+            "alerts.price_moves, alerts.threshold_pct "
+            "(addresses/memberships/interests use add-*/remove-*)")
+
+
+def normalize_tag(name):
+    """Lowercase/strip a membership or interest tag. Returns (tag, problem)."""
+    if not isinstance(name, str):
+        return None, "tag must be text"
+    tag = name.strip().lower()
+    if not PROFILE_TAG_RE.match(tag):
+        return None, (f"tag {name!r} is invalid — use 1-40 chars: lowercase "
+                       "letters, digits, space, '-' or '_'")
+    return tag, None
+
+
+def add_profile_list_item(prof, key, value):
+    """Add to xrpl_addresses/memberships/interests. Returns problem or None."""
+    if key == "xrpl_addresses":
+        problem = validate_watch_address(value)
+        if problem:
+            return problem
+        addr = value.strip()
+        if addr in prof["xrpl_addresses"]:
+            return f"address {addr} is already in your profile"
+        prof["xrpl_addresses"].append(addr)
+        return None
+    tag, problem = normalize_tag(value)
+    if problem:
+        return problem
+    if tag in prof[key]:
+        return f"{key[:-1]} {tag!r} is already in your profile"
+    prof[key].append(tag)
+    return None
+
+
+def remove_profile_list_item(prof, key, value):
+    """Remove from xrpl_addresses/memberships/interests. Returns problem/None."""
+    if key == "xrpl_addresses":
+        addr = (value or "").strip()
+        if addr not in prof["xrpl_addresses"]:
+            return f"address {addr} is not in your profile"
+        prof["xrpl_addresses"].remove(addr)
+        return None
+    tag = (value or "").strip().lower()
+    if tag not in prof[key]:
+        return f"{key[:-1]} {tag!r} is not in your profile"
+    prof[key].remove(tag)
+    return None
 
 
 def decode_nft_uri(uri_hex, limit=90):

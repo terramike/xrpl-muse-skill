@@ -231,6 +231,45 @@ xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the waterm
   and prints the resolved address in the proposal; the destination is
   hash-bound in the envelope like everything else.
 
+## Onboarding: the user profile
+
+On first run — when `~/.xrpl/profile.json` doesn't exist — offer the
+questionnaire before anything else. Ask conversationally, one or two
+questions at a time, then save the answers with the `profile` commands.
+`xrpl-trade profile init` also runs it in a terminal.
+
+```bash
+xrpl-trade profile init                 # interactive questionnaire
+xrpl-trade profile show                 # review it anytime
+xrpl-trade profile set display_name "Mike"
+xrpl-trade profile set alerts.price_moves true
+xrpl-trade profile set alerts.threshold_pct 3
+xrpl-trade profile add-address r…       # WATCH-ONLY. Never a seed.
+xrpl-trade profile add-membership xaodao
+xrpl-trade profile add-interest trading
+xrpl-trade profile remove-interest trading
+xrpl-trade profile clear                # start over
+```
+
+What to ask: what to call them; watch-only XRPL addresses; DAO
+memberships (open list — `xaodao`, whatever they hold); what they use
+the skill for (`trading`, `nfts`, `dao-governance`, `discovery`, …);
+whether they want price-move alerts and at what threshold.
+
+**The seed rule (non-negotiable):** NEVER ask for a seed, secret key,
+or passphrase — ask for the watch-only classic address (starts with
+`r`). If the user pastes anything seed-like, STOP: warn them loudly,
+save nothing, and move on. The CLI enforces this too — `add-address`
+refuses seed-shaped input with an explicit warning and never stores it.
+
+- Stored in `~/.xrpl/profile.json`, owner-only `0600`, schema-versioned
+  (`schema_version: 1`). Local only — it never leaves the machine.
+- The profile drives personalization: `memberships` feeds reminders
+  (e.g. `xaodao` → DAO proposal vote reminders), `alerts.*` feeds
+  price-move alerts, `interests` shapes menus and suggestions.
+- Keep the public skill generic: memberships and interests are open
+  tag lists, never hardcoded to one DAO or one user.
+
 ## XRPresso discovery: marketplace search (read-only)
 
 XRPresso (xrpresso.io) is a non-custodial P2P marketplace on XRPL —
