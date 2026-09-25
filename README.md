@@ -67,6 +67,16 @@ xrpl-sign --hash a2c72140d080ca0f --approve
   entirely read-only — a local named watchlist of artist wallets plus a
   watermarked "what's new" digest showing new mints, listing prices, and
   xrp.cafe links. No proposals, no signing, no approvals involved.
+- **XRPresso discovery** (`xrpl-trade xrpresso …`): read-only search of
+  the XRPresso P2P marketplace (listings, NFTs, auctions, stats) via its
+  free anonymous Discovery API — no key, no signup. The agent finds,
+  the human buys: every result prints its XRPresso deep link
+  (`?ref=api_v1` preserved) to open in their UI and sign in your own
+  wallet. Links are validated (https on xrpresso.io only — anything
+  else is withheld, never printed), calls are throttled well under the
+  platform's rate limit, and the feature touches no policy, no
+  `~/.xrpl`, and no ledger. Honest limits: small early-stage catalog,
+  marketplace not a trading venue (no swap endpoints).
 
 ## What v0.3 hardens
 

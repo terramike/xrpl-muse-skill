@@ -217,6 +217,37 @@ xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the waterm
   (`nft-inventory lara`). Writes never accept names — exact addresses
   only.
 
+## XRPresso discovery: marketplace search (read-only)
+
+XRPresso (xrpresso.io) is a non-custodial P2P marketplace on XRPL —
+goods, gigs, music, NFTs. Its free Discovery API v1 needs no key and
+no signup; the skill searches it straight from chat.
+
+```bash
+xrpl-trade xrpresso listings --q "neon" --sort newest
+xrpl-trade xrpresso listings --category art --currency XRP --limit 10
+xrpl-trade xrpresso nfts --q "drift" --sort price_asc
+xrpl-trade xrpresso auctions
+xrpl-trade xrpresso listing <id>     # full detail for one listing
+xrpl-trade xrpresso stats            # marketplace aggregates
+xrpl-trade xrpresso categories       # category keys for --category
+```
+
+- Human-in-the-loop by design: the agent finds, the human buys.
+  Every result prints its XRPresso deep link (with `?ref=api_v1`
+  attribution preserved) — open it to buy/bid in XRPresso's UI and
+  sign in your own wallet. The v1 API has no buy/mint/offer/escrow
+  endpoints and the skill never recreates them.
+- Deep links are validated before display: only `https` URLs on
+  `xrpresso.io` (or a subdomain) are shown; anything else is withheld,
+  never printed.
+- Polite by construction: ≥3s between calls (well under the platform's
+  30/min IP limit), 15s timeout, 1MB response cap. No policy changes,
+  no approvals, no `~/.xrpl` writes — this feature cannot spend.
+- Honest limits: the catalog is small and early-stage; XRPresso is a
+  listings marketplace, not a trading venue — there are no swap
+  endpoints. For token swaps the skill's own DEX flow is the tool.
+
 ## Commands
 
 Reading (no seed, no proposals):
@@ -236,6 +267,9 @@ Reading (no seed, no proposals):
   (local only, no network, no approval)
 - `nft-new [--days N]` — new mints from your favorites since the last
   check, with listing prices and xrp.cafe links (read-only)
+- `xrpresso listings|nfts|auctions|listing|categories|stats` — search
+  the XRPresso marketplace (read-only, no key, no signup); results
+  print deep links so you buy/bid in XRPresso's UI
 
 Writing (always propose → human `--approve` → sign):
 

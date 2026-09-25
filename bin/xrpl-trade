@@ -12,7 +12,7 @@ The separate `xrpl-sign` program enforces policy and signs — only after
 independent human approval of that exact hash.
 
 Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile,
-nft-inventory, favorites, nft-new.
+nft-inventory, favorites, nft-new, xrpresso (XRPresso marketplace discovery).
 NFT: nft-mint pins artwork + metadata to IPFS with the operator's own
 Pinata key (bring-your-own-key — the skill never hosts anyone's media),
 then proposes the mint; nft-list proposes an XRP-denominated sell offer.
@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xrpl_common as C
+import xrpl_xrpresso as XP
 
 try:
     from xrpl.clients import JsonRpcClient
@@ -688,6 +689,57 @@ def cmd_favorites(args):
         sys.exit(f"unknown favorites command {cmd!r}")
 
 
+def cmd_xrpresso(args):
+    """Read-only XRPresso marketplace discovery.
+
+    Anonymous, no API key, no wallet, no signing. Every result that
+    carries a deep link shows it so the human can tap through and buy
+    in XRPresso's own UI — the agent never buys, mints, or escrows.
+    Deep links are validated: only https URLs on xrpresso.io are
+    displayed; anything else is withheld, never printed."""
+    cmd = args.xp_cmd
+    print("XRPresso discovery (read-only) — open a link below to "
+          "buy/bid in their UI.\n")
+    try:
+        if cmd == "listings":
+            items = XP.get_listings(category=args.category, q=args.q,
+                                    limit=args.limit, sort=args.sort,
+                                    currency=args.currency)
+            if not items:
+                print("no listings found")
+                return
+            for it in items:
+                print(XP.fmt_listing(it))
+                print()
+        elif cmd == "nfts":
+            items = XP.get_nft_listings(q=args.q, limit=args.limit,
+                                        sort=args.sort)
+            if not items:
+                print("no NFT listings found")
+                return
+            for it in items:
+                print(XP.fmt_nft(it))
+                print()
+        elif cmd == "auctions":
+            items = XP.get_nft_auctions(limit=args.limit)
+            if not items:
+                print("no live auctions")
+                return
+            for it in items:
+                print(XP.fmt_auction(it))
+                print()
+        elif cmd == "listing":
+            print(XP.fmt_listing(XP.get_listing(args.id), detail=True))
+        elif cmd == "stats":
+            print(XP.fmt_stats(XP.get_stats()))
+        elif cmd == "categories":
+            print(XP.fmt_categories(XP.get_categories()))
+        else:  # pragma: no cover — argparse restricts choices
+            sys.exit(f"unknown xrpresso command {cmd!r}")
+    except XP.XRPressoError as e:
+        sys.exit(f"XRPresso error: {e}")
+
+
 def cmd_nft_new(args, cfg, client):
     """Read-only: what's new from favorite artists.
 
@@ -909,11 +961,43 @@ def main():
     p.add_argument("--days", type=int, default=None,
                    help="window in days, 1-90 (default: since last check; "
                         "--days never moves the watermark)")
+    p = sub.add_parser("xrpresso", help="search the XRPresso marketplace "
+                                        "(read-only, no key)")
+    xp = p.add_subparsers(dest="xp_cmd", required=True)
+    l = xp.add_parser("listings", help="search marketplace listings")
+    l.add_argument("--category", default=None,
+                   help="category key (see: xrpresso categories)")
+    l.add_argument("--q", default=None,
+                   help="search title/description (min 2 chars)")
+    l.add_argument("--limit", type=int, default=20,
+                   help="1-50 (default 20)")
+    l.add_argument("--sort", default="newest",
+                   choices=["newest", "price_asc", "price_desc",
+                            "ending_soon"])
+    l.add_argument("--currency", default=None, choices=["XRP", "RLUSD"])
+    n = xp.add_parser("nfts", help="XRPresso-native NFT listings")
+    n.add_argument("--q", default=None,
+                   help="search token name (min 2 chars)")
+    n.add_argument("--limit", type=int, default=20,
+                   help="1-50 (default 20)")
+    n.add_argument("--sort", default="newest",
+                   choices=["newest", "price_asc", "price_desc"])
+    a = xp.add_parser("auctions", help="live NFT auctions")
+    a.add_argument("--limit", type=int, default=12,
+                   help="1-50 (default 12)")
+    d = xp.add_parser("listing", help="full detail for one listing")
+    d.add_argument("id", help="listing id")
+    xp.add_parser("stats", help="marketplace aggregate stats")
+    xp.add_parser("categories", help="listing category keys")
 
     args = ap.parse_args()
     if args.cmd == "favorites":
         # Local-only: no config, no network client needed.
         cmd_favorites(args)
+        return
+    if args.cmd == "xrpresso":
+        # Public HTTP API: no wallet, no XRPL client, no config needed.
+        cmd_xrpresso(args)
         return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
