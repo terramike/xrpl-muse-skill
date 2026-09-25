@@ -46,7 +46,9 @@ unless ALL of these hold:
 Seed: read ONLY from the XRPL_SEED environment variable. In production the
 Muse vault injects it after genuine human confirmation; it must never be a
 raw exported variable in a shared shell. The derived address must match the
-proposal's account, or signing is refused.
+proposal's account or that account's ledger-verified RegularKey (e.g. the
+main wallet whose master key is disabled and whose regular key is the
+Musegives key), or signing is refused.
 
 Giveaway mode: `xrpl-sign --hash <h> --approve --seed-env XRPL_GIVEAWAY_SEED
 --policy ~/.xrpl/giveaway_policy.json` signs donation-wallet gifts under a
@@ -430,10 +432,35 @@ def load_seed(seed_env="XRPL_SEED"):
     return seed
 
 
-def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env):
+def _authorized_signers(client, account):
+    """Addresses the validated ledger authorizes to sign for `account`.
+
+    Returns {account} plus the account's RegularKey when one is set, or
+    None when the ledger state cannot be verified. The caller fails
+    closed on None: without a proven authorization set, no signature is
+    produced. The set is read from the validated ledger at signing time —
+    never from the proposal — so a rotated RegularKey is honored and a
+    tampered proposal cannot widen the set.
+    """
+    try:
+        r = client.request(AccountInfo(account=account,
+                                       ledger_index="validated"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not r.is_successful():
+        return None
+    data = r.result.get("account_data", {})
+    allowed = {account}
+    regular = data.get("RegularKey")
+    if regular:
+        allowed.add(regular)
+    return allowed
+
+
+def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env, client):
     """Post-approval core: reserve budget, sign, bind reservation.
 
-    Returns (signed_tx, thash, last_ledger). The try/finally releases the
+    Returns (signed_tx, thash, last_ledger, auth_path). The try/finally releases the
     unbound reservation(s) on EVERY exception path from here through bind —
     including SystemExit from a missing seed and KeyboardInterrupt.
 
@@ -480,9 +507,24 @@ def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env):
                 wallet = Wallet.from_seed(seed)
             except Exception:
                 sys.exit("Seed invalid.")
-            if wallet.classic_address != tx["Account"]:
-                sys.exit(f"Seed derives {wallet.classic_address}, but proposal "
-                         f"is for {tx['Account']} — refusing (wallet mismatch).")
+            # v0.6.1: the seed may be the account's RegularKey rather than
+            # its master key (e.g. the main wallet's master is disabled and
+            # its regular key is the Musegives key). The authorized set is
+            # the account plus its RegularKey as recorded on the VALIDATED
+            # ledger, read here at signing time — never from the proposal.
+            allowed = _authorized_signers(client, tx["Account"])
+            if allowed is None:
+                sys.exit("Could not verify the authorized signing keys for "
+                         f"{tx['Account']} from the validated ledger — "
+                         "refusing to sign (fail closed).")
+            if wallet.classic_address not in allowed:
+                sys.exit(f"Seed derives {wallet.classic_address}, but the "
+                         f"validated ledger authorizes {sorted(allowed)} "
+                         f"for {tx['Account']} — refusing (wallet mismatch).")
+            auth_path = ("regular_key"
+                         if wallet.classic_address != tx["Account"]
+                         else "master")
+            print(f"  signing as {auth_path}: {wallet.classic_address}")
             del seed
 
             from xrpl.models.transactions import Transaction
@@ -498,7 +540,7 @@ def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env):
             tracker.bind_reservation(rid, thash, last_ledger)
             tracker.bind_reservation(mrid, thash, last_ledger)
             bound = True
-            return signed, thash, last_ledger
+            return signed, thash, last_ledger, auth_path
         finally:
             if not bound:
                 # release_reservation only drops UNBOUND pending entries and
@@ -616,11 +658,11 @@ def cmd_sign(args):
     # --- the point of no return: independent human approval was given ---
     # Reserve budget, sign, and bind — with guaranteed reservation cleanup
     # on every failure path (see _reserve_sign_bind).
-    signed, thash, last_ledger = _reserve_sign_bind(
-        prop, tx, policy, tracker, spends, args.seed_env)
+    signed, thash, last_ledger, auth_path = _reserve_sign_bind(
+        prop, tx, policy, tracker, spends, args.seed_env, client)
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"], "signed",
-            f"last_ledger={last_ledger}", spends)
+            f"last_ledger={last_ledger} auth={auth_path}", spends)
     net = "livenet" if prop["network"] == "mainnet" else "testnet"
     print(f"\nSigned {thash[:16]}… "
           f"(https://{net}.xrpl.org/transactions/{thash}) — submitting…")

@@ -209,8 +209,36 @@ def patch_sign_env(load_seed=None, wallet_cls=None, sign_fn=None):
     return restore
 
 
+# --- fake ledger client for the authorized-signers check ---
+class FakeAcctResp:
+    def __init__(self, regular_key=None, ok=True):
+        self._rk, self._ok = regular_key, ok
+
+    def is_successful(self):
+        return self._ok
+
+    @property
+    def result(self):
+        data = {"Flags": 0}
+        if self._rk:
+            data["RegularKey"] = self._rk
+        return {"account_data": data}
+
+
+class FakeClient:
+    """Stub for _authorized_signers' AccountInfo(validated) read."""
+    def __init__(self, regular_key=None, ok=True, down=False):
+        self._rk, self._ok, self._down = regular_key, ok, down
+
+    def request(self, _req):
+        if self._down:
+            raise ConnectionError("node down")
+        return FakeAcctResp(self._rk, self._ok)
+
+
 def run_bind(prop=None, tx=None, policy=None, fail_seed=None,
-             wallet_cls=FakeWallet, sign_fn=lambda t, w: FakeSigned()):
+             wallet_cls=FakeWallet, sign_fn=lambda t, w: FakeSigned(),
+             client=None):
     fresh_state()
     tracker = C.SpentTracker()
     def _ls(env):
@@ -220,7 +248,8 @@ def run_bind(prop=None, tx=None, policy=None, fail_seed=None,
         wallet_cls=wallet_cls, sign_fn=sign_fn)
     try:
         return S._reserve_sign_bind(prop or PROP, tx or TX, policy or POL,
-                                    tracker, SPENDS, "XRPL_SEED")
+                                    tracker, SPENDS, "XRPL_SEED",
+                                    client or FakeClient())
     finally:
         restore()
 
@@ -270,6 +299,52 @@ expect_exit("wallet mismatch aborts", lambda: run_bind(wallet_cls=WrongWallet),
 check("wallet mismatch leaves zero pending reservations",
       pending_entries() == [])
 
+# --- v0.6.1: RegularKey signing ---
+class RegularKeyWallet:
+    classic_address = DEST  # the account's RegularKey, not the account
+
+    @staticmethod
+    def from_seed(seed):
+        return RegularKeyWallet()
+
+
+# regular key authorized on the validated ledger -> signs, reports path
+try:
+    _s, _h, _l, _a = run_bind(wallet_cls=RegularKeyWallet,
+                             client=FakeClient(regular_key=DEST))
+    check("regular-key seed signs when ledger authorizes it", True)
+    check("regular-key seed reports regular_key auth path", _a == "regular_key")
+    _st = json.loads(C.STATE_PATH.read_text())["entries"]
+    check("regular-key success binds (not releases) the reservation",
+          len(_st) == 1 and _st[0]["tx_hash"] == "AA" * 32)
+except SystemExit as e:
+    check(f"regular-key seed signs when ledger authorizes it ({e})", False)
+
+# ledger authorizes a DIFFERENT regular key -> refuse
+expect_exit("wrong regular key aborts",
+            lambda: run_bind(wallet_cls=RegularKeyWallet,
+                             client=FakeClient(regular_key="rOTHER")),
+            "wallet mismatch")
+check("wrong regular key leaves zero pending reservations",
+      pending_entries() == [])
+
+# ledger node down at signing -> fail closed, no signature
+expect_exit("ledger read failure fails closed",
+            lambda: run_bind(client=FakeClient(down=True)),
+            "fail closed")
+check("ledger read failure leaves zero pending reservations",
+      pending_entries() == [])
+
+# ledger returns an error (e.g. account not found) -> fail closed
+expect_exit("ledger error response fails closed",
+            lambda: run_bind(client=FakeClient(ok=False)),
+            "fail closed")
+check("ledger error leaves zero pending reservations",
+      pending_entries() == [])
+
+# no RegularKey on ledger -> only the account itself may sign (existing
+# behavior preserved; WrongWallet above already covers the refusal)
+
 # signing throws (raw exception, e.g. serialization bug)
 try:
     def _boom(t, w):
@@ -299,9 +374,10 @@ restore = patch_sign_env(load_seed=lambda env: "s" * 29,
                          wallet_cls=FakeWallet,
                          sign_fn=lambda t, w: FakeSigned())
 try:
-    signed, thash, last_ledger = S._reserve_sign_bind(
-        PROP, TX, POL, tracker, SPENDS, "XRPL_SEED")
+    signed, thash, last_ledger, auth_path = S._reserve_sign_bind(
+        PROP, TX, POL, tracker, SPENDS, "XRPL_SEED", FakeClient())
     check("success path returns the tx hash", thash == "AA" * 32)
+    check("success path reports master auth", auth_path == "master")
     st = json.loads(C.STATE_PATH.read_text())["entries"]
     check("success path binds (not releases) the reservation",
           len(st) == 1 and st[0]["tx_hash"] == "AA" * 32
@@ -322,7 +398,8 @@ check("mint-quota denial leaves zero pending reservations",
 # corrupt state at reserve time -> clean abort naming recovery
 C.STATE_PATH.write_text("{corrupt")
 try:
-    S._reserve_sign_bind(PROP, TX, POL, C.SpentTracker(), SPENDS, "XRPL_SEED")
+    S._reserve_sign_bind(PROP, TX, POL, C.SpentTracker(), SPENDS, "XRPL_SEED",
+                       FakeClient())
     check("corrupt state at reserve aborts cleanly", False)
 except SystemExit as e:
     check("corrupt state at reserve aborts cleanly", "CORRUPT" in str(e))
@@ -335,7 +412,8 @@ BIG = {"XRP": Decimal("1000")}
 fresh_state()
 restore = patch_sign_env(load_seed=lambda env: "s" * 29)
 try:
-    S._reserve_sign_bind(PROP, TX, POL, C.SpentTracker(), BIG, "XRPL_SEED")
+    S._reserve_sign_bind(PROP, TX, POL, C.SpentTracker(), BIG, "XRPL_SEED",
+                       FakeClient())
     check("over-limit reserve denied", False)
 except SystemExit as e:
     check("over-limit reserve denied", "Daily-limit reservation failed" in str(e))
