@@ -827,6 +827,11 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
                   f"to:       {short_addr(tx['Destination'])}"]
         tag = tx.get("DestinationTag")
         lines += [f"dest tag: {tag if tag is not None else 'NONE'}"]
+        age = destination_allowlist_age(tx["Destination"], tag)
+        if age is not None and age < ALLOWLIST_NEW_DESTINATION_SECONDS:
+            lines += ["⚠️  NEW DESTINATION — added to the allowlist "
+                      f"{format_allowlist_age(age)}. If you did not add it "
+                      "yourself just now, DO NOT APPROVE."]
     elif ttype == "NFTokenMint":
         uri_raw = tx.get("URI", "")
         try:
@@ -2053,6 +2058,9 @@ def load_last_draw():
 def add_destination_allowlist_entry(address, destination_tag):
     """Add an exact (address, destination_tag) pair to ~/.xrpl/policy.json's
     destination_allowlist. Owner-only 0600, atomic. No duplicates.
+    New entries are timestamped (added_at) and the addition is written to
+    the audit log — allowlist edits are security-relevant and must leave
+    a trail.
     Returns a problem string, or None on success. Never exits: the caller
     (the opt-in flow) turns problems into text so onboarding can't be
     derailed."""
@@ -2060,17 +2068,85 @@ def add_destination_allowlist_entry(address, destination_tag):
         policy = load_policy()
     except SystemExit as e:
         return str(e)  # e.g. "No policy file. Run `xrpl-sign init-policy`…"
-    entry = {"address": address, "destination_tag": destination_tag}
     for existing in policy.get("destination_allowlist", []):
         if (existing.get("address") == address
                 and existing.get("destination_tag") == destination_tag):
             return None  # already there
+    entry = {"address": address,
+             "destination_tag": destination_tag,
+             "added_at": int(time.time())}
     policy.setdefault("destination_allowlist", []).append(entry)
     tmp = POLICY_PATH.with_name(POLICY_PATH.name + ".tmp")
     tmp.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
     os.chmod(tmp, 0o600)
     os.replace(tmp, POLICY_PATH)
+    audit("allowlist_add", None, None, "local", "-", "added",
+          note=f"address={address} destination_tag={destination_tag}")
     return None
+
+
+def remove_destination_allowlist_entry(address, destination_tag):
+    """Remove an exact (address, destination_tag) pair from the destination
+    allowlist. The removal is written to the audit log. Returns a problem
+    string, or None on success (including "not present" — idempotent)."""
+    try:
+        policy = load_policy()
+    except SystemExit as e:
+        return str(e)
+    entries = policy.get("destination_allowlist", [])
+    kept = [e for e in entries
+            if not (e.get("address") == address
+                    and e.get("destination_tag") == destination_tag)]
+    if len(kept) == len(entries):
+        return None  # not present — nothing to do
+    policy["destination_allowlist"] = kept
+    tmp = POLICY_PATH.with_name(POLICY_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, POLICY_PATH)
+    audit("allowlist_remove", None, None, "local", "-", "removed",
+          note=f"address={address} destination_tag={destination_tag}")
+    return None
+
+
+# A destination added to the allowlist within this window is flagged LOUDLY
+# in the signing ceremony — a prompt-injected allowlist add followed by a
+# quick-tapped proposal is the attack this is built to catch.
+ALLOWLIST_NEW_DESTINATION_SECONDS = 24 * 3600
+
+
+def destination_allowlist_age(address, destination_tag):
+    """Age in seconds of a destination-allowlist entry, or None.
+
+    None means: not on the allowlist at all, the policy can't be read, or
+    the entry predates timestamping (no added_at — grandfathered as
+    long-standing, NOT flagged new). Never raises."""
+    try:
+        policy = load_policy()
+    except SystemExit:
+        return None
+    except Exception:  # noqa: BLE001 — ceremony display must not crash
+        return None
+    for e in policy.get("destination_allowlist", []):
+        if (e.get("address") == address
+                and e.get("destination_tag") == destination_tag):
+            added = e.get("added_at")
+            if added is None:
+                return None  # grandfathered: no timestamp recorded
+            try:
+                return max(0, int(time.time()) - int(added))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def format_allowlist_age(age_seconds):
+    """Human 'Xm ago' / 'Xh ago' rendering for the ceremony warning."""
+    if age_seconds < 90:
+        return "just now"
+    if age_seconds < 3600:
+        return f"{age_seconds // 60}m ago"
+    return f"{age_seconds // 3600}h ago"
 
 
 def decode_nft_uri(uri_hex, limit=90):
