@@ -742,6 +742,9 @@ def cmd_sign(args):
                C.SpentTracker(C.GIVEAWAY_STATE_PATH, C.GIVEAWAY_STATE_LOCK_PATH)
                if giveaway_mode else C.SpentTracker())
 
+    C.check_protected_files(extra=(tracker.state_path, tracker.lock_path,
+        tracker.state_path.with_suffix(tracker.state_path.suffix + ".initialized")))
+
     # proposal TTL (created_at is hash-bound)
     age = int(time.time()) - prop["created_at"]
     if age > policy["proposal_ttl_seconds"]:

@@ -832,6 +832,7 @@ class _FakePinner:
         return "bafyfakemetacid"
 
 
+C.POLICY_PATH.write_text(json.dumps(_good_policy()))
 cfg5 = {"network": "testnet", "address": ACCT}
 h5 = T.pin_and_propose_stage(rec["stage_id"], cfg5, None,
                              pinner=_FakePinner(), approved_digest=rec["stage_digest"])
