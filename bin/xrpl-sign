@@ -929,6 +929,57 @@ def cmd_sync_profile(args):
           f"({pf['policy_sha256'][:16]}…)")
 
 
+def cmd_migrate_state(args):
+    """Copy all validated legacy liabilities into a profile namespace."""
+    import contextlib
+    import hashlib
+    profile = C.get_profile(args.profile)
+    key = C.canonical_hash({"network": profile["network"], "account": profile["account"]})
+    if args.legacy_state == "default":
+        source = C.STATE_PATH
+        cfg = json.loads(C.CONFIG_PATH.read_text()) if C.CONFIG_PATH.exists() else {}
+        if cfg.get("address") != profile["account"] or cfg.get("network", "testnet") != profile["network"]:
+            sys.exit("default legacy state does not match this profile's account/network")
+    else:
+        source = C.GIVEAWAY_STATE_PATH
+        gw = json.loads(C.GIVEAWAY_PATH.read_text()) if C.GIVEAWAY_PATH.exists() else {}
+        if gw.get("donation_wallet") != profile["account"] or gw.get("network", "mainnet") != profile["network"]:
+            sys.exit("giveaway legacy state does not match this profile's account/network")
+    target = C.XRPL_DIR / "accounts" / key / "state.json"
+    old = C.SpentTracker(source, source.with_suffix(".lock"))
+    new = C.SpentTracker(target, target.with_suffix(".lock"))
+    C.check_profile_protected(profile)
+    C.check_protected_files(extra=(source, source.with_suffix(".lock"),
+                                   target, target.with_suffix(".lock")))
+    if not source.exists():
+        sys.exit("legacy state does not exist")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if (args.state_sha256 != digest or args.approve_migration != digest
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+        sys.exit("Migration requires --state-sha256 and --approve-migration, each equal to the full current source SHA-256")
+    # Lock source and target in deterministic order to avoid deadlocks.
+    trackers = sorted((old, new), key=lambda t: str(t.lock_path))
+    with contextlib.ExitStack() as stack:
+        for tracker in trackers:
+            stack.enter_context(tracker._locked())
+        current_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        if current_digest != digest or args.state_sha256 != current_digest or args.approve_migration != current_digest:
+            sys.exit("Legacy state changed during migration; review the new digest")
+        entries = old._load()["entries"]
+        existing = new._load()["entries"]
+        if existing and existing != entries:
+            sys.exit("destination already contains different accounting; refusing overwrite")
+        new._save({"entries": entries})
+        C.atomic_private_json(source.with_name(source.name + ".migration.json"), {
+            "source_kind": args.legacy_state,
+            "source_sha256": digest,
+            "destination_key": key,
+            "entry_count": len(entries),
+        })
+    print(f"Copied {len(entries)} validated accounting entries to profile {args.profile!r}.")
+    print(f"Source retained at {source}; migration receipt binds its current SHA-256 {digest}.")
+
+
 def cmd_recover_state(args):
     """Restore operator-reconstructed accounting; unknown obligations stay blocked."""
     import hashlib
@@ -1019,10 +1070,12 @@ def main():
     ap.add_argument("--restore-from", help="reviewed reconstructed state JSON")
     ap.add_argument("--state-sha256", help="SHA-256 of original damaged state")
     ap.add_argument("--approve-recovery", help="full SHA-256 of reviewed replacement")
+    ap.add_argument("--legacy-state", choices=["default", "giveaway"], help="legacy accounting namespace to migrate")
+    ap.add_argument("--approve-migration", help="full SHA-256 of reviewed legacy state")
     ap.add_argument("--list", action="store_true", help="pending proposals")
     ap.add_argument("cmd", nargs="?", choices=["init-policy", "migrate-policy",
                                      "init-profiles", "sync-profile",
-                                     "recover-state"],
+                                     "recover-state", "migrate-state"],
                     help="init-policy: write the default policy file | "
                          "migrate-policy: upgrade a policy to v4")
     args = ap.parse_args()
@@ -1039,6 +1092,10 @@ def main():
         cmd_sync_profile(args)
     elif args.cmd == "recover-state":
         cmd_recover_state(args)
+    elif args.cmd == "migrate-state":
+        if not args.profile or not args.legacy_state:
+            sys.exit("usage: xrpl-sign migrate-state --profile <name> --legacy-state default|giveaway --state-sha256 <sha256> --approve-migration <sha256>")
+        cmd_migrate_state(args)
     elif args.list:
         cmd_list(args)
     elif args.hash:

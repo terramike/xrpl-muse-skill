@@ -147,9 +147,19 @@ class SecurityTests(unittest.TestCase):
         two=C.tracker_for_profile('renamed','mainnet',A)
         self.assertEqual(one.state_path,two.state_path)
         self.assertNotEqual(one.state_path,C.tracker_for_profile('main','testnet',A).state_path)
-    def test_legacy_state_blocks_profile_migration(self):
+    def test_legacy_state_requires_explicit_reviewed_migration(self):
         self.reserve()
         with self.assertRaises(C.StateCorruptError): C.tracker_for_profile('main','mainnet',A)
+        C.CONFIG_PATH.write_text(json.dumps({'address':A,'network':'mainnet'}))
+        pf={'network':'mainnet','account':A,'credential':{'kind':'env','env_var':'XRPL_SEED'},
+            'policy_path':str(C.POLICY_PATH),'policy_sha256':C._sha256_file(C.POLICY_PATH),'state':'default'}
+        C.PROFILES_PATH.write_text(json.dumps({'schema_version':1,'profiles':{'main':pf}}))
+        digest=C._sha256_file(C.STATE_PATH)
+        with self.assertRaises(SystemExit):
+            S.cmd_migrate_state(NS(profile='main',legacy_state='default',state_sha256=digest,approve_migration='0'*64))
+        S.cmd_migrate_state(NS(profile='main',legacy_state='default',state_sha256=digest,approve_migration=digest))
+        dest=C.tracker_for_profile('main','mainnet',A)
+        self.assertEqual(dest._load()['entries'],self.tr._load()['entries'])
     def test_short_approval_refused_before_context(self):
         tx=dict(TransactionType='Payment',Account=A,Destination=B,Amount='1000000',Fee='12',Sequence=1,LastLedgerSequence=100)
         h,_=C.save_proposal(tx,'testnet',A,'send',profile='adhoc-testnet',policy_sha256=C._sha256_file(C.POLICY_PATH))

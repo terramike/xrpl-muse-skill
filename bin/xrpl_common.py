@@ -529,13 +529,28 @@ def tracker_for_profile(profile, network, account):
     """
     key = canonical_hash({"network": network, "account": account})
     state = XRPL_DIR / "accounts" / key / "state.json"
-    for legacy in (STATE_PATH, GIVEAWAY_STATE_PATH):
-        if legacy.exists():
-            old_tracker = SpentTracker(legacy, legacy.with_suffix(".lock"))
-            with old_tracker._locked():
-                entries = old_tracker._load()["entries"]
-            if entries:
-                raise StateCorruptError("Legacy accounting requires reviewed migration before profile signing: " + str(legacy))
+    for kind, legacy in (("default", STATE_PATH), ("giveaway", GIVEAWAY_STATE_PATH)):
+        if not legacy.exists():
+            continue
+        old_tracker = SpentTracker(legacy, legacy.with_suffix(".lock"))
+        with old_tracker._locked():
+            entries = old_tracker._load()["entries"]
+            if not entries:
+                continue
+            receipt_path = legacy.with_name(legacy.name + ".migration.json")
+            try:
+                receipt = json.loads(receipt_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                receipt = {}
+            source_digest = _sha256_file(legacy)
+            if (receipt.get("source_sha256") == source_digest
+                    and receipt.get("destination_key") == key
+                    and receipt.get("source_kind") == kind):
+                continue
+            # Fully expired confirmed records no longer represent liabilities.
+            if not SpentTracker._prune(entries, int(time.time())):
+                continue
+            raise StateCorruptError("Legacy accounting requires explicit reviewed migration before profile signing: " + str(legacy))
     return SpentTracker(state, state.with_suffix(".lock"))
 
 
