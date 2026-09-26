@@ -1,13 +1,14 @@
-# xrpl-muse-skill v0.7
+# xrpl-muse-skill v0.8 (security remediation branch)
 
 Trade the XRP Ledger from the terminal — any token pair — with a hard safety
-boundary between **proposing** a trade and **signing** it. v0.7 adds named
+boundary between **proposing** a trade and **signing** it. v0.8 hardens named
 signing profiles, vault-only mainnet, and a hash-bound proposal envelope
-(v4) that ties every proposal to its exact policy, account, network, and
+(v5) that ties every proposal to its exact policy, account, network, and
 credential source.
 
-Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
-terminal), but safe for humans too.
+Built for Muse first. Other bots can use the command line, but only an
+independently verified vault integration can provide the intended credential
+and human approval boundary. This repository does not certify that runtime.
 
 ## The idea
 
@@ -32,15 +33,15 @@ This skill splits the job in two:
 xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
 # → full proposal + hash. Nothing submitted.
 
-xrpl-sign --profile main --hash a2c72140d080ca0f --approve
+xrpl-sign --profile main --hash <full-64-character-hash> --approve
 # → envelope verify → policy checks → sign → persist → validated result
 ```
 
 ## What v0.5 adds
 
 - **NFT minting** (`xrpl-trade nft-mint`): pins artwork + XLS-24d metadata
-  to IPFS through the operator's **own** Pinata account (`PINATA_JWT` from
-  the environment — the publisher hosts no one's media), then proposes an
+  to IPFS through the operator's **own** Pinata account (Muse vault
+  injection after approval — never paste/export the token), then proposes an
   `NFTokenMint` whose `URI` points at the metadata CID.
 - **XRP listings** (`xrpl-trade nft-list`): proposes XRP-denominated
   *sell* offers only. IOU prices are denied, every listing carries a
@@ -54,8 +55,8 @@ xrpl-sign --profile main --hash a2c72140d080ca0f --approve
   proposing `NFTokenAcceptOffer`. The signer re-verifies the offer at
   signing time; a changed or vanished offer is refused. The skill reports
   on-ledger facts and never calls a token "authentic" — anyone can mint
-  the same artwork, so the human verifies the seller is the minter they
-  expect. Buying spends XRP immediately and runs through the
+  the same artwork, so the human verifies the on-ledger issuer (minter) separately from the
+  seller (current owner). Buying spends XRP immediately and runs through the
   per-transaction and rolling-24h spend caps.
 - **NFT bids** (`xrpl-trade nft-bid --token-id … --seller r… --price-xrp …`):
   proposes a buy-side offer; the bid XRP locks until the offer is
@@ -87,6 +88,13 @@ xrpl-sign --profile main --hash a2c72140d080ca0f --approve
   platform's rate limit, and the feature touches no policy, no
   `~/.xrpl`, and no ledger. Honest limits: small early-stage catalog,
   marketplace not a trading venue (no swap endpoints).
+
+## Earlier security history
+
+The current signer uses `xrpl-proposal/5`, strict policy/profile schemas,
+full 64-character approval hashes, validated NFT reads, and fail-closed
+accounting recovery. See SECURITY.md for the current behavior and limits.
+The following sections describe earlier changes for history only.
 
 ## What v0.3 hardens
 
@@ -148,12 +156,26 @@ manager or agent vault after human approval. Testnet funds:
 
 ## Security
 
+Mainnet is gated on verification of the actual Muse vault and human approval
+flow. `xrpl-trade doctor` reports local checks and leaves those runtime
+properties explicitly unverified. Current deployment profiles include Muse vault signer, Xaman-human, and Autonomous-experimental; only Muse is in scope here, and the others do not establish vault-only protection. NFT policy checks do **not protect market value** or verify real world artwork ownership.
+
+## Security
+
+Mainnet remains gated on verifying the installed Muse vault and approval
+flow. `doctor` checks local configuration but cannot attest the Muse runtime.
+Same-user local execution alone does not establish vault isolation.
+
 See [SECURITY.md](SECURITY.md) — including the platform boundary: `--approve`
 is an assertion, not evidence of human approval, and the advisory that
 versions before commit `c3273e59` shipped inverted buy/sell and must not be
 used for trading.
 
 ## Tests
+
+Run the Linux release gate with `python tests/run_tests.py`; live testnet
+suites require the explicit `--testnet` option.
+
 
 ```bash
 python3 tests/test_v04.py          # 78 adversarial logic tests, no network

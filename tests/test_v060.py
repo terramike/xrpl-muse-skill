@@ -1035,7 +1035,7 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     T.provisional_spend_check({"XRP": Decimal("1")})
 check("provisional check defers to the signer on schema violation",
-      "fails schema validation" in buf.getvalue())
+      "policy schema violation" in buf.getvalue())
 C.POLICY_PATH.write_text(json.dumps(_good_policy()))
 
 # =====================================================================
@@ -1219,7 +1219,7 @@ try:
     S.load_seed()
     _seed_hint_ok = False
 except SystemExit as e:
-    _seed_hint_ok = ("the vault did not inject XRPL_SEED" in str(e)
+    _seed_hint_ok = ("vault injects it after" in str(e)
                      and "export XRPL_SEED" not in str(e))
 check("missing-seed hint names vault injection, not export", _seed_hint_ok)
 

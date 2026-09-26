@@ -7,7 +7,7 @@ mkdir -p "$DEST"
 cp -r "$SRC/SKILL.md" "$SRC/README.md" "$SRC/SECURITY.md" \
       "$SRC/requirements.txt" "$SRC/requirements-locked.txt" \
       "$SRC/approved.example.json" \
-      "$SRC/policy.example.json" "$SRC/bin" "$SRC/tests" "$SRC/references" "$DEST/"
+      "$SRC/policy.example.json" "$SRC/profiles.example.json" "$SRC/bin" "$SRC/tests" "$SRC/references" "$DEST/"
 pip install -r "$DEST/requirements-locked.txt"
 echo ""
 echo "Installed to $DEST"

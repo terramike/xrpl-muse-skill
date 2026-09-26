@@ -8,16 +8,14 @@ transaction, autofill it against the live network, print the full ceremony
 summary (account, network, assets+issuers, amounts, limit price, max spend,
 fee, expiry), hash the exact bytes-to-be-approved, and save a proposal.
 
-One deliberate exception: `wallet create` generates a fresh wallet locally
-and stores the seed in ~/.xrpl/config.json (0600, atomic) WITHOUT ever
-displaying it — the "local signer" deployment profile. The seed is shown
-exactly once, and only, by `wallet backup`, for write-down. See "Wallets"
-in SKILL.md and the platform boundary in SECURITY.md.
+Mainnet wallet generation and backup are vault-only. Testnet credentials,
+when generated locally, use a separate network-tagged file. Read-only
+`doctor` reports local checks but cannot attest a Muse vault boundary.
 
 The separate `xrpl-sign` program enforces policy and signs — only after
 independent human approval of that exact hash.
 
-Read-only: balance, quote, offers, pairs, inspect-token, plan-trade, reconcile,
+Read-only: doctor, balance, quote, offers, pairs, inspect-token, plan-trade, reconcile,
 nft-inventory, favorites, nft-new, xrpresso (XRPresso marketplace discovery),
 giveaway entrants/draw/status/announce (Friday community giveaway).
 Local-only: profile (onboarding questionnaire — name, watch-only addresses,
@@ -2013,12 +2011,58 @@ def cmd_giveaway_announce(args, gw):
     print("Next draw: Friday 7:37 AM PT.")
 
 
+def cmd_doctor():
+    """Read-only local checks. This cannot attest Muse or a vault boundary."""
+    import hashlib
+    print("XRPL skill doctor (local checks; no network or credential reads)")
+    checks = []
+    for path in (Path(__file__).resolve(), Path(__file__).with_name("xrpl-sign"),
+                 Path(__file__).with_name("xrpl_common.py"),
+                 Path(__file__).with_name("xrpl_display.py")):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        checks.append(("file present/hash " + path.name, True))
+        print(f"  {path.name}: sha256 {digest}")
+    try:
+        profiles = C.load_profiles()
+        checks.append(("profile schema", True))
+        for name, profile in profiles.items():
+            C.check_profile_protected(profile)
+            print(f"  profile {name}: {profile['network']} account {profile['account']} "
+                  f"policy {profile['policy_sha256']}")
+    except (SystemExit, OSError) as exc:
+        checks.append(("profile schema/protection", False))
+        print("  profile check: " + C.safe_terminal_text(str(exc)))
+    pending = 0
+    state_files = [C.STATE_PATH, C.GIVEAWAY_STATE_PATH]
+    if C.XRPL_DIR.joinpath("accounts").exists():
+        state_files.extend(C.XRPL_DIR.joinpath("accounts").glob("*/state.json"))
+    for path in state_files:
+        if path.exists():
+            try:
+                tracker = C.SpentTracker(path, path.with_suffix(".lock"))
+                with tracker._locked():
+                    entries = tracker._load()["entries"]
+                pending += sum(e["status"] == "pending" for e in entries)
+                print(f"  accounting {path}: {len(entries)} entries")
+            except (C.StateCorruptError, OSError) as exc:
+                checks.append(("accounting " + str(path), False))
+                print("  accounting error: " + C.safe_terminal_text(str(exc)))
+    if pending:
+        checks.append(("unresolved pending reservations", False))
+        print(f"  unresolved pending reservations: {pending}")
+    print("  Muse approval gate and vault credential isolation: UNVERIFIED here")
+    print("  protected signer execution boundary: deployment owner must verify")
+    failed = [name for name, ok in checks if not ok]
+    print(f"Result: {'CHECK FAILED: ' + ', '.join(failed) if failed else 'local checks passed; deployment boundary unverified'}")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="xrpl-trade",
                                  description="XRPL proposer: builds tx, never signs.")
     ap.add_argument("--network", choices=list(C.NETWORKS),
                     help="override configured network")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor", help="inspect local setup and liabilities (read-only)")
 
     sub.add_parser("setup", help="onboarding: new wallet or address+network")
     p = sub.add_parser("wallet", help="local wallet: create / one-time backup")
@@ -2264,6 +2308,9 @@ def main():
                    help="donation wallet (default: ~/.xrpl/giveaway.json)")
 
     args = ap.parse_args()
+    if args.cmd == "doctor":
+        cmd_doctor()
+        return
     if args.cmd == "favorites":
         # Local-only: no config, no network client needed.
         cmd_favorites(args)

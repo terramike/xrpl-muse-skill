@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "main": {
+      "network": "mainnet",
+      "account": "r9e34ga9YxYHYoCe7UtWWpuLjp4iKs3gkB",
+      "credential": {"kind": "env", "env_var": "XRPL_SEED"},
+      "policy_path": "/home/operator/.xrpl/policy.json",
+      "policy_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "state": "default"
+    }
+  }
+}

@@ -3,7 +3,7 @@
 Trade the XRP Ledger from the terminal — any token pair, with a hard safety
 boundary between proposing a trade and signing it.
 
-## Architecture: propose → approve → sign (v0.7)
+## Architecture: propose → approve → sign (v0.8)
 
 Two programs. The agent only ever runs the first.
 
@@ -22,7 +22,7 @@ Two programs. The agent only ever runs the first.
    transaction itself, and signs **only** when a human passes
    `--profile <name> --approve` for that exact hash.
 
-### Signing profiles (v0.7)
+### Signing profiles (v0.8)
 
 A profile names the complete signing context so a proposal can't drift
 across accounts, networks, policies, or wallets:
@@ -34,10 +34,10 @@ across accounts, networks, policies, or wallets:
     "main": {
       "account": "r9e34ga9YxYHYoCe7UtWWpuLjp4iKs3gkB",
       "network": "mainnet",
-      "credential_env": "XRPL_SEED",
+      "credential": {"kind": "env", "env_var": "XRPL_SEED"},
       "policy_path": "/home/user/.xrpl/policy.json",
-      "policy_sha256": "2d3aa5d2b830a43c…",
-      "spend_state": "default"
+      "policy_sha256": "<64 lowercase hex characters>",
+      "state": "default"
     }
   }
 }
@@ -49,9 +49,9 @@ across accounts, networks, policies, or wallets:
   account/network — *before* touching the credential.
 - One profile = one spend-state file, so the main wallet and the giveaway
   wallet can never share a budget.
-- Manage with `xrpl-sign init-profiles` / `xrpl-sign sync-profile <name>`.
+- Manage with `xrpl-sign init-profiles` / `xrpl-sign sync-profile --profile <name>`.
 
-### Vault-only mainnet (v0.7)
+### Vault-only mainnet (v0.8)
 
 Mainnet never keeps a seed on disk and never prints one to a terminal:
 
@@ -67,7 +67,7 @@ Mainnet never keeps a seed on disk and never prints one to a terminal:
 
 ### The envelope (what the hash binds)
 
-A proposal is `format: xrpl-proposal/4` and the approval hash covers:
+A proposal is `format: xrpl-proposal/5`; the hash also covers a fingerprint of the complete named profile:
 
 - `profile`, `policy_sha256`, `network`, `account`, `action`, `created_at`,
   `policy_version`
@@ -87,8 +87,8 @@ current `xrpl-trade`.
   `TakerPays`/`TakerGets` fields; `Account`, `Fee`, `Sequence`,
   `LastLedgerSequence` required; no `TxnSignature`/`SigningPubKey` in
   unsigned proposals; no far-future `created_at`.
-- **Transaction-type allowlist**: `OfferCreate`, `OfferCancel`, `TrustSet`,
-  `Payment` only. Anything else is rejected.
+- **Transaction-type allowlist**: the enabled policy transaction types.
+  NFT types remain subject to policy and strict schema checks.
 - **Strict per-type field schemas**: no `Paths`, `SendMax`, `DeliverMin`,
   `Memos`, partial-payment flags, or any other smuggled field.
 - **Numeric sanity**: NaN/Infinity amounts, fees, and sequences are rejected
@@ -113,7 +113,7 @@ current `xrpl-trade`.
   retains the consumed fee as a confirmed XRP spend.
 - **Strict accounting state**: spend state with negative, non-finite, or
   inconsistent entries fails closed (the signer refuses rather than silently
-  resetting limits); `xrpl-sign recover-state` reconciles a damaged file
+  resetting limits); `xrpl-sign recover-state` restores only an independently reviewed reconstruction; it preserves the damaged file and blocks unresolved liabilities
   without forgiving obligations.
 - **Offer safety**: `Expiration` required and bounded by
   `max_offer_lifetime_seconds`; limit price within `max_deviation_bps` of a
@@ -145,7 +145,7 @@ Every signed transaction is appended to `~/.xrpl/audit.log`
 
 ### The platform boundary (read this)
 
-`--approve` is an *assertion*, not evidence of human approval. v0.5 is
+`--approve` is an *assertion*, not evidence of human approval. Mainnet is
 mainnet-ready **only** when all of these hold:
 
 - Muse requires real user confirmation for each signing use (a typed
@@ -159,7 +159,7 @@ A same-user local agent does **not** satisfy this boundary, even with
 `0600` files: a same-UID process can read the signer's environment and
 rewrite its policy and state. Same-user installs are testnet-only.
 
-Without those platform guarantees, v0.5 is a hardened testnet tool — not
+Without those platform guarantees, this skill is a hardened testnet tool — not
 generically mainnet-safe. Three deployment profiles are documented in
 `README.md` (Muse vault / Xaman-human / autonomous-experimental); the
 design states all of this honestly in `SECURITY.md`.
@@ -172,7 +172,7 @@ xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
 # → NOTHING is submitted.
 
 # A human reviews the exact hash, then:
-xrpl-sign --profile main --hash a2c72140d080ca0f --approve
+xrpl-sign --profile main --hash <full-64-character-hash> --approve
 # → profile + envelope verify → policy checks → sign → persist →
 #   submit_and_wait → validated ledger result → audit log
 ```
@@ -217,8 +217,9 @@ is mandatory and must match the profile the proposal was built for.
 
 ## NFTs (v0.5): mint, list, inventory, buy, bid
 
-Minting is a deliberate **two-step** flow — pinning is an external write
-and happens inside the approved action, never before it:
+Minting is a deliberate **two-step** flow. Staging is offline. Pinning is
+an external write only after the operator supplies the independent full
+stage digest; a failed later step can leave unreferenced pins:
 
 ```bash
 xrpl-trade nft-stage --file art.png --name "Neon Drift" \
@@ -226,13 +227,12 @@ xrpl-trade nft-stage --file art.png --name "Neon Drift" \
 # → validates the artwork locally (approved media dir, size/type/sha256)
 #   and writes a reviewable stage record. ZERO network calls.
 
-# A human reviews the stage record, then approves the pin + proposal as
-# one action. PINATA_JWT is injected for this single operation only
-# (e.g. PINATA_JWT="$(vault read ...)" xrpl-trade nft-pin-and-propose …)
-# — never exported into a shell, never stored, never logged:
-xrpl-trade nft-pin-and-propose --stage <stage-id>
-# → re-validates the file against the staged hash, pins art + metadata
-#   under YOUR Pinata account, proposes NFTokenMint
+# A human reviews the full stage digest. Muse injects PINATA_JWT into
+# this one approved operation; do not paste/export it in a shell or chat:
+xrpl-trade nft-pin-and-propose --stage <stage-id> \
+    --approve-stage <full-64-character-stage-digest>
+# → requires the independent full digest before reading the credential,
+#   re-validates and uploads the exact bytes, then proposes NFTokenMint
 ```
 
 ```bash
@@ -589,7 +589,7 @@ The signer reads the seed **only** from `XRPL_SEED`, provided by your
 secret manager or the Muse vault after human approval. Fund a testnet
 wallet: `xrpl-trade faucet --network testnet`.
 
-## Wallets (v0.7): vault-only mainnet, local testnet
+## Wallets (v0.8): vault-only mainnet, local testnet
 
 Mainnet keys are created and backed up in your vault (password manager),
 outside this tool — the CLI refuses to create or display mainnet seeds:
@@ -642,3 +642,8 @@ lands, continue with the normal ceremony above.
 - `tests/test_e2e_testnet.py` — 52 end-to-end checks on testnet
   (propose → approve → sign → persist → validated), fully isolated in a
   temporary HOME — never touches the operator's real `~/.xrpl`
+
+
+## Local doctor
+
+`xrpl-trade doctor` checks profile files, local signer/helper hashes, and readable accounting state without network or credential access. It reports unresolved reservations and always reports Muse vault approval and protected execution as unverified; it cannot certify the installed runtime.
