@@ -933,6 +933,7 @@ def cmd_migrate_state(args):
     """Copy all validated legacy liabilities into a profile namespace."""
     import contextlib
     import hashlib
+    import re
     profile = C.get_profile(args.profile)
     key = C.canonical_hash({"network": profile["network"], "account": profile["account"]})
     if args.legacy_state == "default":
