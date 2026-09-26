@@ -243,8 +243,8 @@ def run_bind(prop=None, tx=None, policy=None, fail_seed=None,
              client=None):
     fresh_state()
     tracker = C.SpentTracker()
-    def _ls(env):
-        raise SystemExit(f"No seed. {env} is not set")
+    def _ls(seed_src, network, account):
+        raise SystemExit(f"No seed. {seed_src[1]} is not set")
     restore = patch_sign_env(
         load_seed=_ls if fail_seed else (lambda *args: "s" * 29),
         wallet_cls=wallet_cls, sign_fn=sign_fn)
