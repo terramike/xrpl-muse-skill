@@ -1,0 +1,27 @@
+name: Security tests
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      testnet:
+        description: "Run isolated live testnet suites using faucet wallets"
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --require-hashes -r requirements-locked.txt
+      - run: python tests/run_tests.py
+      - name: Run isolated faucet testnet suites
+        if: ${{ inputs.testnet }}
+        run: python tests/run_tests.py --testnet

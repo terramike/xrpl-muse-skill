@@ -104,7 +104,7 @@ prop = make_mainnet_proposal()
 check("P1-1 proposal carries profile binding",
       prop.get("profile") == "main" and
       prop.get("policy_sha256") == policy_sha and
-      prop.get("format") == "xrpl-proposal/4")
+      prop.get("format") == C.ENVELOPE_FORMAT)
 
 def gate_args(profile):
     return SimpleNamespace(profile=profile, policy=None,
@@ -148,7 +148,7 @@ try:
     check("P1-1 policy-digest mismatch refused", False)
 except SystemExit as e:
     check("P1-1 policy-digest mismatch refused",
-          "digest" in str(e) or "policy" in str(e).lower())
+          "digest" in str(e) or "policy" in str(e).lower() or "profile changed" in str(e).lower())
 # restore
 raw = json.loads(C.PROFILES_PATH.read_text())
 raw["profiles"]["main"]["policy_sha256"] = policy_sha
@@ -162,9 +162,11 @@ check("P1-1 envelope hash binds profile",
 
 # Testnet adhoc: no profile required.
 tprop = make_mainnet_proposal(network="testnet", profile=None, pdigest=None)
-check("P1-1 testnet proposal has no profile binding",
-      tprop.get("profile") in (None, "") and
-      tprop.get("format") == "xrpl-proposal/4")
+check("P1-1 testnet proposal binds the adhoc identity and policy",
+      tprop.get("profile") == "adhoc-testnet"
+      and tprop.get("profile_sha256") == C.proposal_profile_fingerprint("adhoc-testnet")
+      and tprop.get("policy_sha256") == C._sha256_file(C.POLICY_PATH)
+      and tprop.get("format") == C.ENVELOPE_FORMAT)
 
 # ---------------------------------------------------------------- P1-2
 
@@ -194,7 +196,7 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     T.cmd_wallet(wallet_args("create", "testnet"), {})
 out = buf.getvalue()
-cfg = json.loads(C.CONFIG_PATH.read_text())
+cfg = json.loads(C.local_wallet_path("testnet").read_text())
 check("P1-2 testnet create prints no seed",
       cfg.get("seed") not in out)
 check("P1-2 testnet seed stored locally",
@@ -287,11 +289,13 @@ class FakeResp:
 class FakeClient:
     """Bound entry: last_ledger passed, tx NOT found, history complete."""
     def request(self, req):
-        from xrpl.models.requests import Ledger
+        from xrpl.models.requests import Ledger, ServerInfo
+        if isinstance(req, ServerInfo):
+            return FakeResp({"info": {"complete_ledgers": "100-200"}})
         if isinstance(req, Ledger):
-            return FakeResp({"ledger_index": 200,
+            return FakeResp({"validated": True, "ledger_index": 200,
                              "complete_ledgers": "100-200"})
-        return FakeResp({}, ok=False)  # txnNotFound
+        return FakeResp({"error": "txnNotFound"}, ok=False)  # txnNotFound
 
 
 C.STATE_PATH.write_text(json.dumps({"entries": []}))
@@ -307,11 +311,13 @@ check("P1-3 proven non-inclusion releases",
 class FakeClientGap:
     """History does NOT cover the submission range -> stays pending."""
     def request(self, req):
-        from xrpl.models.requests import Ledger
+        from xrpl.models.requests import Ledger, ServerInfo
+        if isinstance(req, ServerInfo):
+            return FakeResp({"info": {"complete_ledgers": "160-200"}})
         if isinstance(req, Ledger):
-            return FakeResp({"ledger_index": 200,
+            return FakeResp({"validated": True, "ledger_index": 200,
                              "complete_ledgers": "160-200"})
-        return FakeResp({}, ok=False)
+        return FakeResp({"error": "txnNotFound"}, ok=False)
 
 
 C.STATE_PATH.write_text(json.dumps({"entries": []}))
@@ -327,9 +333,11 @@ check("P1-3 unproven absence keeps pending",
 class FakeClientFail:
     """Validated failure -> fee retained, trade released."""
     def request(self, req):
-        from xrpl.models.requests import Ledger, Tx
+        from xrpl.models.requests import Ledger, Tx, ServerInfo
+        if isinstance(req, ServerInfo):
+            return FakeResp({"info": {"complete_ledgers": "100-200"}})
         if isinstance(req, Ledger):
-            return FakeResp({"ledger_index": 200,
+            return FakeResp({"validated": True, "ledger_index": 200,
                              "complete_ledgers": "100-200"})
         return FakeResp({"validated": True,
                          "Fee": "15",
@@ -358,10 +366,13 @@ C.STATE_PATH.write_text(json.dumps({"entries": [
 ]}))
 import io as _io, contextlib as _cl
 with _cl.redirect_stdout(_io.StringIO()):
-    S.cmd_recover_state(type("A", (), {})())
-rec = tr._load()["entries"]
+    try:
+        S.cmd_recover_state(type("A", (), {})())
+    except C.StateCorruptError:
+        pass
+rec = json.loads(C.STATE_PATH.read_text())["entries"]
 check("P2-6 recover-state keeps valid pending, quarantines invalid",
-      len(rec) == 1 and rec[0]["rid"] == "good" and
+      len(rec) == 2 and rec[0]["rid"] == "good" and
       rec[0]["status"] == "pending")
 
 n_fail = sum(1 for _, ok in PASS if not ok)

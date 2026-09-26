@@ -237,18 +237,19 @@ def get_nft_auctions(limit=12):
 # ---------- display ----------
 
 def _text(v):
-    """Coerce an API string field to safe display text."""
-    if v is None:
-        return ""
-    s = str(v)
-    return s if len(s) <= 300 else s[:297] + "..."
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from xrpl_display import safe_terminal_text
+    return safe_terminal_text(v, 300)
+
 
 
 def _price(item):
     price, ccy = item.get("price"), item.get("currency") or ""
     if isinstance(price, bool) or not isinstance(price, (int, float)):
         return "price not shown"
-    ccy = str(ccy).upper()
+    ccy = _text(ccy).upper()
     return f"{price:g} {ccy}".strip()
 
 

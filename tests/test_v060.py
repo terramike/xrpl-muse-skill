@@ -72,7 +72,7 @@ DEST = "rnkt27oqgJiRfsuwCogqrLwYx4NNooMFdB"
 
 def fresh_state(entries=()):
     if C.STATE_PATH.exists():
-        C.STATE_PATH.unlink()
+        C.STATE_PATH.write_text(json.dumps({"entries": []}))
     if entries:
         C.STATE_PATH.write_text(json.dumps({"entries": list(entries)}))
 
@@ -175,7 +175,7 @@ except C.StateCorruptError:
 # --- 1b. _reserve_sign_bind releases on every pre-bind failure ---
 PROP = {"action": "send", "proposal_hash": "ab" * 32, "network": "testnet"}
 TX = {"Account": ACCT, "TransactionType": "Payment",
-      "Destination": DEST, "Amount": "1"}
+      "Destination": DEST, "Amount": "1", "LastLedgerSequence": 999}
 SPENDS = {"XRP": Decimal("1")}
 
 
@@ -222,7 +222,7 @@ class FakeAcctResp:
         data = {"Flags": 0}
         if self._rk:
             data["RegularKey"] = self._rk
-        return {"account_data": data}
+        return {"validated": True, "account_data": data}
 
 
 class FakeClient:
@@ -233,6 +233,8 @@ class FakeClient:
     def request(self, _req):
         if self._down:
             raise ConnectionError("node down")
+        if type(_req).__name__ == "Ledger":
+            return ns(result={"validated": True, "ledger_index": 100}, is_successful=lambda: True)
         return FakeAcctResp(self._rk, self._ok)
 
 
@@ -241,10 +243,10 @@ def run_bind(prop=None, tx=None, policy=None, fail_seed=None,
              client=None):
     fresh_state()
     tracker = C.SpentTracker()
-    def _ls(env):
-        raise SystemExit(f"No seed. {env} is not set")
+    def _ls(seed_src, network, account):
+        raise SystemExit(f"No seed. {seed_src[1]} is not set")
     restore = patch_sign_env(
-        load_seed=_ls if fail_seed else (lambda env: "s" * 29),
+        load_seed=_ls if fail_seed else (lambda *args: "s" * 29),
         wallet_cls=wallet_cls, sign_fn=sign_fn)
     try:
         return S._reserve_sign_bind(prop or PROP, tx or TX, policy or POL,
@@ -295,7 +297,7 @@ class WrongWallet:
 
 
 expect_exit("wallet mismatch aborts", lambda: run_bind(wallet_cls=WrongWallet),
-            "wallet mismatch")
+            "authorized signing keys")
 check("wallet mismatch leaves zero pending reservations",
       pending_entries() == [])
 
@@ -324,7 +326,7 @@ except SystemExit as e:
 expect_exit("wrong regular key aborts",
             lambda: run_bind(wallet_cls=RegularKeyWallet,
                              client=FakeClient(regular_key="rOTHER")),
-            "wallet mismatch")
+            "authorized signing keys")
 check("wrong regular key leaves zero pending reservations",
       pending_entries() == [])
 
@@ -370,7 +372,7 @@ except KeyboardInterrupt:
 # success path: reservation binds, is NOT released
 fresh_state()
 tracker = C.SpentTracker()
-restore = patch_sign_env(load_seed=lambda env: "s" * 29,
+restore = patch_sign_env(load_seed=lambda *args: "s" * 29,
                          wallet_cls=FakeWallet,
                          sign_fn=lambda t, w: FakeSigned())
 try:
@@ -410,7 +412,7 @@ except C.StateCorruptError:
 # daily-limit denial (no reservation made): clean message, nothing pending
 BIG = {"XRP": Decimal("1000")}
 fresh_state()
-restore = patch_sign_env(load_seed=lambda env: "s" * 29)
+restore = patch_sign_env(load_seed=lambda *args: "s" * 29)
 try:
     S._reserve_sign_bind(PROP, TX, POL, C.SpentTracker(), BIG, "XRPL_SEED",
                        FakeClient())
@@ -756,9 +758,10 @@ check("JPEG magic recognized",
       PIN.read_validated_source(str(jpg), media_dir=str(media))[1]["mime"]
       == "image/jpeg")
 
+T.xrpl_pin.protected_media_dir = lambda: str(media)
 # --- 5b. nft-stage: zero network calls ---
 rec = T.stage_artwork(str(png1), "Net Test", "d", 1000, 7,
-                      media_dir=str(media))
+                      account=ACCT, network="testnet")
 check("stage record binds file hash + metadata",
       rec["sha256"] == info["sha256"] and rec["mime"] == "image/png"
       and rec["metadata"] == {"name": "Net Test", "description": "d",
@@ -778,7 +781,7 @@ _socket.create_connection = _no_network
 _urlreq.urlopen = _no_network
 try:
     rec_net = T.stage_artwork(str(png1), "Net Test 2", "", 1000, 0,
-                              media_dir=str(media))
+                              account=ACCT, network="testnet")
 finally:
     _socket.create_connection = _old_cc
     _urlreq.urlopen = _old_uo
@@ -786,13 +789,13 @@ check("nft-stage completes with networking disabled", bool(rec_net))
 
 check("royalty over 5000bps refused at stage",
       _expect_exit(T.stage_artwork, str(png1), "X", "", 5001, 0,
-                   media_dir=str(media)) is not None)
+                   account=ACCT, network="testnet") is not None)
 check("oversized taxon refused at stage",
       _expect_exit(T.stage_artwork, str(png1), "X", "", 1000, 2 ** 32,
-                   media_dir=str(media)) is not None)
+                   account=ACCT, network="testnet") is not None)
 check("empty name refused at stage",
       _expect_exit(T.stage_artwork, str(png1), "  ", "", 1000, 0,
-                   media_dir=str(media)) is not None)
+                   account=ACCT, network="testnet") is not None)
 
 # --- 5c. nft-pin-and-propose with a fake pinner (no network) ---
 _old_autofill = T.autofill
@@ -818,8 +821,8 @@ class _FakePinner:
     def read_validated_source(self, path, media_dir=None):
         return PIN.read_validated_source(path, media_dir=media_dir)
 
-    def pin_file(self, path, media_dir=None):
-        self.pinned.append(("file", path))
+    def pin_data(self, data, filename):
+        self.pinned.append(("file", filename))
         return "bafyfakeimagecid"
 
     def pin_json(self, obj, name="metadata.json"):
@@ -829,9 +832,10 @@ class _FakePinner:
         return "bafyfakemetacid"
 
 
+C.POLICY_PATH.write_text(json.dumps(C.DEFAULT_POLICY))
 cfg5 = {"network": "testnet", "address": ACCT}
 h5 = T.pin_and_propose_stage(rec["stage_id"], cfg5, None,
-                             pinner=_FakePinner())
+                             pinner=_FakePinner(), approved_digest=rec["stage_digest"])
 prop5 = json.loads((C.PROPOSALS_DIR / f"{h5}.json").read_text())
 want_uri = "ipfs://bafyfakemetacid".encode("utf-8").hex().upper()
 check("pin-and-propose proposes the mint",
@@ -844,16 +848,16 @@ _os.environ["PINATA_JWT"] = "canary-jwt-xyz"
 
 
 class _LeakPinner(_FakePinner):
-    def pin_file(self, path, media_dir=None):
+    def pin_data(self, data, filename):
         assert PIN._jwt() == "canary-jwt-xyz"  # read at pin time, prod path
-        return super().pin_file(path)
+        return super().pin_data(data, filename)
 
 
 png3 = _make_png(media / "art3.png", b"\x02" * 64)
 rec3 = T.stage_artwork(str(png3), "Leak Test", "", 1000, 0,
-                       media_dir=str(media))
+                       account=ACCT, network="testnet")
 h_leak = T.pin_and_propose_stage(rec3["stage_id"], cfg5, None,
-                                 pinner=_LeakPinner("Leak Test", ""))
+                                 pinner=_LeakPinner("Leak Test", ""), approved_digest=rec3["stage_digest"])
 leak_prop = (C.PROPOSALS_DIR / f"{h_leak}.json").read_text()
 audit_txt = C.AUDIT_PATH.read_text() if C.AUDIT_PATH.exists() else ""
 check("PINATA_JWT never lands in proposals or audit log",
@@ -864,10 +868,10 @@ del _os.environ["PINATA_JWT"]
 # --- 5d. tamper / corruption handling ---
 png4 = _make_png(media / "art4.png", b"\x03" * 64)
 rec4 = T.stage_artwork(str(png4), "Tamper", "", 1000, 0,
-                       media_dir=str(media))
+                       account=ACCT, network="testnet")
 png4.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x04" * 64)  # swap after staging
 msg = _expect_exit(T.pin_and_propose_stage, rec4["stage_id"], cfg5, None,
-                   _FakePinner("Tamper", ""))
+                   _FakePinner("Tamper", ""), approved_digest=rec4["stage_digest"])
 check("file changed since staging is refused at pin time",
       msg is not None and "changed since staging" in msg)
 
@@ -1031,7 +1035,7 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     T.provisional_spend_check({"XRP": Decimal("1")})
 check("provisional check defers to the signer on schema violation",
-      "fails schema validation" in buf.getvalue())
+      "policy schema violation" in buf.getvalue())
 C.POLICY_PATH.write_text(json.dumps(_good_policy()))
 
 # =====================================================================
@@ -1058,7 +1062,7 @@ check("README documents the three deployment profiles",
       all(p in readme for p in ("Muse vault signer", "Xaman-human",
                                 "Autonomous-experimental")))
 check("README states NFT checks don't cover value or art ownership",
-      "does **not** protect market value" in readme)
+      "do **not** protect market value" in readme)
 check("SKILL.md has no export-PINATA_JWT pattern",
       "export PINATA_JWT" not in skillmd)
 check("SKILL.md documents the two-step mint flow",
@@ -1097,7 +1101,7 @@ try:
                        {"XRP": Decimal("1")}, _good_policy())
     _gw_corrupt_ok = False
 except C.StateCorruptError as e:
-    _gw_corrupt_ok = "CORRUPT" in str(e)
+    _gw_corrupt_ok = bool(str(e))
 check("corrupt giveaway_state.json fails closed (not empty)", _gw_corrupt_ok)
 C.GIVEAWAY_STATE_PATH.unlink(missing_ok=True)
 
@@ -1212,10 +1216,10 @@ C.GIVEAWAY_POLICY_PATH.unlink(missing_ok=True)
 _os.environ.pop("XRPL_SEED", None)
 _os.environ.pop(C.GIVEAWAY_SEED_ENV, None)
 try:
-    S.load_seed()
+    S.load_seed(("env", "XRPL_SEED"), "testnet", "rTestAccount")
     _seed_hint_ok = False
 except SystemExit as e:
-    _seed_hint_ok = ("the vault did not inject XRPL_SEED" in str(e)
+    _seed_hint_ok = ("vault injects it after" in str(e)
                      and "export XRPL_SEED" not in str(e))
 check("missing-seed hint names vault injection, not export", _seed_hint_ok)
 

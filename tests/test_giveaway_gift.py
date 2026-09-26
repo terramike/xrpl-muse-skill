@@ -256,14 +256,24 @@ check("write_giveaway_policy never overwrites",
       and json.loads(C.GIVEAWAY_POLICY_PATH.read_text())
       ["spend_limits"]["XRP"]["per_tx"] == "10")
 
+_old_fresh = fresh
+
+def fresh():
+    _old_fresh()
+    (C.XRPL_DIR / "local-giveaway-testnet.json").unlink(missing_ok=True)
+
+def read_test_seed():
+    path = C.XRPL_DIR / "local-giveaway-testnet.json"
+    return json.loads(path.read_text())["seed"] if path.exists() else None
+
 # ---------- seed roundtrip (never printed) ----------
 
 fresh()
-C.write_giveaway_seed(SEED_WALLET.seed)
-check("seed file is 0600", mode(C.GIVEAWAY_PATH) == "0o600")
-check("seed roundtrips", C.read_giveaway_seed() == SEED_WALLET.seed)
+C.write_giveaway_seed(SEED_WALLET.seed, network="testnet")
+check("seed file is 0600", mode(C.XRPL_DIR / "local-giveaway-testnet.json") == "0o600")
+check("seed roundtrips", read_test_seed() == SEED_WALLET.seed)
 fresh()
-check("no seed -> None", C.read_giveaway_seed() is None)
+check("no seed -> None", read_test_seed() is None)
 
 # ---------- `giveaway setup` ----------
 
@@ -271,7 +281,7 @@ import getpass  # noqa: E402
 
 fresh()
 C.GIVEAWAY_PATH.write_text(json.dumps(
-    {"donation_wallet": SEED_WALLET.classic_address}))
+    {"donation_wallet": SEED_WALLET.classic_address, "network": "testnet"}))
 real_getpass = getpass.getpass
 getpass.getpass = lambda prompt="": SEED_WALLET.seed
 buf = io.StringIO()
@@ -282,12 +292,12 @@ finally:
     getpass.getpass = real_getpass
 out = buf.getvalue()
 check("setup writes the policy", C.GIVEAWAY_POLICY_PATH.exists())
-check("setup stores the seed", C.read_giveaway_seed() == SEED_WALLET.seed)
+check("setup stores the seed", read_test_seed() == SEED_WALLET.seed)
 check("setup never echoes the seed", SEED_WALLET.seed not in out)
 
 fresh()
 C.GIVEAWAY_PATH.write_text(json.dumps(
-    {"donation_wallet": SEED_WALLET.classic_address}))
+    {"donation_wallet": SEED_WALLET.classic_address, "network": "testnet"}))
 OTHER = Wallet.create()
 getpass.getpass = lambda prompt="": OTHER.seed  # derives the wrong wallet
 try:
@@ -298,7 +308,7 @@ except SystemExit as e:
     check("wrong-wallet seed refused", "nothing was stored" in str(e))
 finally:
     getpass.getpass = real_getpass
-check("refused seed not stored", C.read_giveaway_seed() is None)
+check("refused seed not stored", read_test_seed() is None)
 
 getpass.getpass = lambda prompt="": ""  # Enter = skip, use the vault
 buf = io.StringIO()
@@ -309,7 +319,7 @@ finally:
     getpass.getpass = real_getpass
 check("skipping the seed is the vault path",
       "vault" in buf.getvalue().lower()
-      and C.read_giveaway_seed() is None)
+      and read_test_seed() is None)
 
 # ---------- sign command + signer seed loading ----------
 
@@ -329,8 +339,11 @@ saved_env = dict(os.environ)
 os.environ.pop(C.GIVEAWAY_SEED_ENV, None)
 os.environ.pop("XRPL_SEED", None)
 try:
-    check("signer falls back to giveaway.json seed",
-          S.load_seed(("env", C.GIVEAWAY_SEED_ENV)) == SEED_WALLET.seed)
+    try:
+        S.load_seed(("env", C.GIVEAWAY_SEED_ENV))
+        check("disk fallback refused", False)
+    except SystemExit:
+        check("disk fallback refused", True)
     os.environ[C.GIVEAWAY_SEED_ENV] = "sEd111ENVSEED"
     check("env wins over the file",
           S.load_seed(("env", C.GIVEAWAY_SEED_ENV)) == "sEd111ENVSEED")

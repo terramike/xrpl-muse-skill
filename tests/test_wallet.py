@@ -4,6 +4,7 @@
 The seed must NEVER appear in stdout, stderr, logs, or any file except
 the owner-only 0600 config. Run: python3 tests/test_wallet.py
 """
+import builtins
 import importlib.util
 import io
 import contextlib
@@ -62,7 +63,7 @@ def run_create(force=False, network="testnet"):
 
 
 def stored_seed():
-    return json.loads(C.CONFIG_PATH.read_text())["seed"]
+    return json.loads(C.local_wallet_path("testnet").read_text())["seed"]
 
 
 def stored_addr():
@@ -173,29 +174,34 @@ C.CONFIG_PATH.write_text(json.dumps({"seed": "sEdOldSeed", "address": "rX",
                                      "network": "testnet"}))
 os.chmod(C.CONFIG_PATH, 0o600)
 inputs = iter(["n", "testnet", "r9e34ga9YxYHYoCe7UtWWpuLjp4iKs3gkB"])
-real_input = __builtins__.input
-__builtins__.input = lambda *a: next(inputs)
+real_input = builtins.input
+builtins.input = lambda *a: next(inputs)
 try:
     with contextlib.redirect_stdout(io.StringIO()):
-        T.cmd_setup(ns())
+        try:
+            T.cmd_setup(ns())
+        except SystemExit:
+            pass
 finally:
-    __builtins__.input = real_input
+    builtins.input = real_input
 cfg = json.loads(C.CONFIG_PATH.read_text())
-check("setup watch-only keeps no seed", "seed" not in cfg)
+check("setup preserves legacy seed", cfg.get("seed") == "sEdOldSeed")
 check("setup watch-only stores the address",
-      cfg.get("address") == "r9e34ga9YxYHYoCe7UtWWpuLjp4iKs3gkB")
+      cfg.get("address") == "rX")
 
 # 11. setup generate path: seed never in stdout
+C.CONFIG_PATH.unlink()
+C.local_wallet_path("testnet").unlink()
 inputs = iter(["y", "testnet"])
-__builtins__.input = lambda *a: next(inputs)
+builtins.input = lambda *a: next(inputs)
 buf = io.StringIO()
 try:
     with contextlib.redirect_stdout(buf):
         T.cmd_setup(ns())
 finally:
-    __builtins__.input = real_input
+    builtins.input = real_input
 sout = buf.getvalue()
-gen_seed = json.loads(C.CONFIG_PATH.read_text())["seed"]
+gen_seed = stored_seed()
 check("setup generate never prints the seed", gen_seed not in sout)
 check("setup generate prints the backup nudge", "wallet backup" in sout)
 

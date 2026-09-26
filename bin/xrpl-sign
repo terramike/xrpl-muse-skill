@@ -48,11 +48,11 @@ Muse vault injects it after genuine human confirmation; it must never be a
 raw exported variable in a shared shell. The derived address must match the
 proposal's account, or signing is refused.
 
-Giveaway mode: `xrpl-sign --hash <h> --approve --seed-env XRPL_GIVEAWAY_SEED
+Giveaway mode: `xrpl-sign --hash <full-64-character-hash> --approve --seed-env XRPL_GIVEAWAY_SEED
 --policy ~/.xrpl/giveaway_policy.json` signs donation-wallet gifts under a
 separate narrow policy (Payment + NFTokenCreateOffer only, per-gift XRP
 cap, separate spend accounting). The vault injects XRPL_GIVEAWAY_SEED the
-same way; `xrpl-trade giveaway setup` is the deliberate local fallback.
+same way. Local testnet seed files are never a signer fallback.
 
 Submission is crash-safe: the transaction is signed, the reservation is
 bound to the signed hash + LastLedgerSequence, and both are persisted to
@@ -65,6 +65,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -398,6 +399,9 @@ def check_policy(prop, tx, policy, client, tracker):
     amount_problems = C.validate_amounts(tx)
     denials.extend(amount_problems)
 
+    if denials:
+        return denials, {}
+
     # 1. network lock (network is hash-bound in the envelope)
     if prop["network"] != policy["network_lock"]:
         denials.append(
@@ -505,28 +509,37 @@ def check_policy(prop, tx, policy, client, tracker):
 
 # ---------- signing ----------
 
-def load_seed(seed_src=("env", "XRPL_SEED")):
+def load_seed(seed_src=("env", "XRPL_SEED"), network=None, account=None):
     """Seed ONLY from the profile-bound source (P1-1).
 
     ("env", VAR): one-time injection — the vault sets VAR after genuine
     human approval. Never a raw exported variable in a shared shell.
-    ("file", PATH): seed read from a local file — TESTNET ONLY; mainnet
-    profiles may not use this kind (enforced in resolve_signing_context).
+    ("file", PATH): a typed, owner-only local test-wallet record bound to
+    its network and address. Raw seed files are rejected.
 
-    The old giveaway.json fallback is REMOVED on mainnet (P1-2 vault-only);
-    on testnet adhoc it survives via C.read_giveaway_seed().
+    Local giveaway fallback is disabled on every network.
     """
     kind, ref = seed_src
     seed = None
     if kind == "env":
         seed = os.environ.get(ref)
         if not seed and ref == C.GIVEAWAY_SEED_ENV:
-            seed = C.read_giveaway_seed()
+            sys.exit("Giveaway vault credential missing; local fallback is disabled")
     elif kind == "file":
+        from xrpl.wallet import Wallet
+        C.require_local_network(network)
         try:
-            seed = open(os.path.expanduser(ref)).read().strip()
-        except OSError:
-            seed = None
+            record = json.loads(Path(os.path.expanduser(ref)).read_text())
+            if (not isinstance(record, dict)
+                    or set(record) != {"format", "network", "address", "seed"}
+                    or record.get("format") != "xrpl-local-test-wallet/1"
+                    or record.get("network") != network
+                    or record.get("address") != account
+                    or Wallet.from_seed(record.get("seed", "")).classic_address != account):
+                sys.exit("Local test credential identity does not match this proposal")
+            seed = record["seed"]
+        except Exception as exc:  # noqa: BLE001 - malformed local record fails closed
+            sys.exit("Local test credential is unreadable or invalid: " + str(exc))
     if not seed:
         sys.exit(f"No seed from {kind}:{ref} — the vault injects it after "
                  f"genuine human approval. It is never exported by hand or "
@@ -571,7 +584,7 @@ def resolve_signing_context(args, prop):
             sys.exit(f"mainnet: profile {args.profile!r} uses a stored-file "
                      f"credential — vault-only mainnet requires one-time "
                      f"injection (kind 'env')")
-        policy = C.load_policy(profile["policy_path"])
+        policy = C.load_policy(profile["policy_path"], expected_digest=prop["policy_sha256"])
         return policy, ("env", cred["env_var"]), \
             (profile["state"] == "giveaway"), args.profile
 
@@ -587,7 +600,7 @@ def resolve_signing_context(args, prop):
             C.verify_policy_digest_binding(profile, prop)
         except C.ProposalError as e:
             sys.exit(f"profile binding failed: {e}")
-        policy = C.load_policy(profile["policy_path"])
+        policy = C.load_policy(profile["policy_path"], expected_digest=prop["policy_sha256"])
         cred = profile["credential"]
         seed_src = ("env", cred["env_var"]) if cred["kind"] == C.CRED_KIND_ENV \
             else ("file", cred["path"])
@@ -597,7 +610,7 @@ def resolve_signing_context(args, prop):
     if bound_profile != "adhoc-testnet":
         sys.exit(f"proposal is bound to profile {bound_profile!r} — sign "
                  f"with --profile {bound_profile}")
-    policy = C.load_policy(args.policy)
+    policy = C.load_policy(args.policy, expected_digest=prop.get("policy_sha256"))
     giveaway_mode = bool(policy.get("giveaway"))
     default_pp = (C.GIVEAWAY_POLICY_PATH if giveaway_mode else C.POLICY_PATH)
     eff_policy_path = args.policy or str(default_pp)
@@ -605,6 +618,105 @@ def resolve_signing_context(args, prop):
         sys.exit("policy file changed since this proposal was built — "
                  "rebuild the proposal under the current policy")
     return policy, ("env", args.seed_env), giveaway_mode, "adhoc-testnet"
+
+
+def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env, client):
+    """Post-approval core: reserve budget, sign, bind reservation.
+
+    Returns (signed_tx, thash, last_ledger, auth_path). The try/finally releases the
+    unbound reservation(s) on EVERY exception path from here through bind —
+    including SystemExit from a missing seed and KeyboardInterrupt.
+
+    load_seed() deliberately stays AFTER the --approve check in cmd_sign():
+    the vault injects the seed only at genuine human approval time, so
+    reading it earlier would be both useless and a boundary violation.
+    (Do not "fix" this by moving the seed load up.)
+    """
+    rid = None
+    mrid = None
+    bound = False
+    try:
+        try:
+            # Atomic daily-limit reservation: concurrent signers can't
+            # double-spend the daily budget between the check above and
+            # the signing below.
+            reserve_denials, rid = tracker.try_reserve(spends, policy)
+            if reserve_denials:
+                msg = "; ".join(reserve_denials)
+                C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
+                        prop["network"], tx["Account"], "policy_denied",
+                        "atomic reserve: " + msg, spends)
+                sys.exit(f"Daily-limit reservation failed: {msg}")
+
+            # NFT mints also consume one unit of the rolling mint quota,
+            # reserved atomically here (same lock) so parallel signers can't
+            # overshoot the cap between the provisional check and signing.
+            # The count entry rides the normal bind/confirm/release lifecycle
+            # with the spend entries.
+            if tx.get("TransactionType") == "NFTokenMint":
+                cap = int(C.nft_policy(policy)["max_mints_per_day"])
+                m_denials, mrid = tracker.try_reserve_count(
+                    C.NFT_MINT_ASSET, 1, cap)
+                if m_denials:
+                    msg = "; ".join(m_denials)
+                    C.audit(prop.get("action", "?"), prop["proposal_hash"],
+                            None, prop["network"], tx["Account"],
+                            "policy_denied",
+                            "atomic mint reserve: " + msg, spends)
+                    sys.exit(f"Mint-quota reservation failed: {msg}")
+
+            seed = load_seed(seed_env, prop["network"], tx["Account"])
+            try:
+                wallet = Wallet.from_seed(seed)
+            except Exception:
+                sys.exit("Seed invalid.")
+            # v0.6.1: the seed may be the account's RegularKey rather than
+            # its master key (e.g. the main wallet's master is disabled and
+            # its regular key is the Musegives key). The authorized set is
+            # the account plus its RegularKey as recorded on the VALIDATED
+            # ledger, read here at signing time — never from the proposal.
+            problem = C.check_ledger_key_authorization(client, tx["Account"], wallet.classic_address)
+            allowed = {wallet.classic_address} if problem is None else None
+            if allowed is None:
+                sys.exit("Could not verify the authorized signing keys for "
+                         f"{tx['Account']} from the validated ledger — "
+                         "refusing to sign (fail closed).")
+            if wallet.classic_address not in allowed:
+                sys.exit(f"Seed derives {wallet.classic_address}, but the "
+                         f"validated ledger authorizes {sorted(allowed)} "
+                         f"for {tx['Account']} — refusing (wallet mismatch).")
+            auth_path = ("regular_key"
+                         if wallet.classic_address != tx["Account"]
+                         else "master")
+            print(f"  signing as {auth_path}: {wallet.classic_address}")
+            del seed
+
+            from xrpl.models.transactions import Transaction
+            tx_obj = Transaction.from_xrpl(tx)  # tx stored in PascalCase wire format
+            submit_ledger, problem = C.get_validated_ledger(client)
+            if problem or submit_ledger > tx["LastLedgerSequence"]:
+                sys.exit(problem or "Transaction has expired; rebuild proposal")
+            signed = sign_tx(tx_obj, wallet)
+            thash = signed.get_hash()
+            last_ledger = tx.get("LastLedgerSequence")
+
+            # Bind the reservation(s) to the signed tx, then persist BEFORE
+            # submitting: a crash between sign and submit still leaves a
+            # reconciliation trail (hash + last ledger), and the budget stays
+            # reserved until the ledger outcome is known.
+            tracker.bind_reservation(rid, thash, last_ledger, submit_ledger)
+            tracker.bind_reservation(mrid, thash, last_ledger, submit_ledger)
+            bound = True
+            return signed, thash, last_ledger, auth_path
+        finally:
+            if not bound:
+                # release_reservation only drops UNBOUND pending entries and
+                # is a no-op for None, so this is safe on every path —
+                # including a partially completed bind.
+                tracker.release_reservation(rid)
+                tracker.release_reservation(mrid)
+    except C.StateCorruptError as e:
+        sys.exit("CORRUPT state: " + str(e))
 
 
 def cmd_sign(args):
@@ -620,6 +732,9 @@ def cmd_sign(args):
                 "proposal_rejected", str(e))
         sys.exit(f"Proposal rejected: {e}")
 
+    if args.approve:
+        C.require_full_hash_for_approve(args.hash, prop)
+
     # P1-1: the signing context (policy + credential + account + network +
     # state) is resolved from the bound profile BEFORE any credential access.
     policy, seed_src, giveaway_mode, profile_name = resolve_signing_context(
@@ -627,14 +742,18 @@ def cmd_sign(args):
 
     # The protected deployment boundary: policy, allowlist, spend state,
     # profiles, and audit log must be owner-only, or limits are fiction.
-    # Giveaway mode additionally protects the giveaway policy and
-    # giveaway.json (which may hold the donation-wallet seed).
+    # Giveaway mode additionally protects the giveaway policy and legacy
+    # giveaway.json location so an old seed cannot silently survive.
     C.check_protected_files(
         extra=(C.GIVEAWAY_POLICY_PATH, C.GIVEAWAY_PATH)
         if giveaway_mode else ())
-    tracker = (C.SpentTracker(state_path=C.GIVEAWAY_STATE_PATH,
-                              lock_path=C.GIVEAWAY_STATE_LOCK_PATH)
+    tracker = (C.tracker_for_profile(profile_name, prop["network"], tx["Account"])
+               if profile_name != "adhoc-testnet" else
+               C.SpentTracker(C.GIVEAWAY_STATE_PATH, C.GIVEAWAY_STATE_LOCK_PATH)
                if giveaway_mode else C.SpentTracker())
+
+    C.check_protected_files(extra=(tracker.state_path, tracker.lock_path,
+        tracker.state_path.with_suffix(".initialized")))
 
     # proposal TTL (created_at is hash-bound)
     age = int(time.time()) - prop["created_at"]
@@ -658,7 +777,7 @@ def cmd_sign(args):
     print(f"  account:  {tx['Account']}")
     print("=" * 60)
     for ln in C.describe_tx(tx, prop.get("action", "?")):
-        print("  " + ln)
+        print("  " + C.safe_terminal_text(ln))
     if tx.get("TransactionType") == "NFTokenAcceptOffer":
         # The buy ceremony: re-verify the sell offer from the ledger AT
         # SIGNING time and show the authoritative facts. If the offer
@@ -667,10 +786,10 @@ def cmd_sign(args):
         rlines, rdenials, _ = C.nft_sell_offer_report(
             client, tx.get("NFTokenSellOffer", ""))
         print("  --- sell offer re-verified from the ledger at signing ---")
-        print("  VERIFY the seller below is the minter you expect; anyone "
+        print("  VERIFY the issuer below is the artist you expect; anyone "
               "can mint the same artwork.")
         for ln in rlines:
-            print("  " + ln)
+            print("  " + C.safe_terminal_text(ln))
         if rdenials:
             print("  ✗ the offer changed since the proposal:")
             for d in rdenials:
@@ -696,84 +815,17 @@ def cmd_sign(args):
     if not args.approve:
         print("\nNot approved. A HUMAN must review the exact hash above, then run:")
         if prop.get("action") == C.GIFT_ACTION:
-            print(f"  {C.giveaway_sign_command(prop['proposal_hash'])}")
+            print(f"  {C.giveaway_sign_command(prop['proposal_hash'], profile_name)}")
             print(f"The vault releases {C.GIVEAWAY_SEED_ENV} only on that "
                   "genuine human approval.")
         else:
-            print(f"  xrpl-sign --hash {prop['proposal_hash'][:16]} --approve")
+            print(f"  xrpl-sign --hash {prop['proposal_hash']} --approve"
+                  + (f" --profile {profile_name}" if profile_name != "adhoc-testnet" else ""))
             print("The vault releases the seed only on that genuine human approval.")
         return
 
-    # --- the point of no return: independent human approval was given ---
-    # Atomic daily-limit reservation: concurrent signers can't double-spend
-    # the daily budget between the check above and the signing below.
-    reserve_denials, rid = tracker.try_reserve(spends, policy)
-    if reserve_denials:
-        msg = "; ".join(reserve_denials)
-        C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
-                prop["network"], tx["Account"], "policy_denied",
-                "atomic reserve: " + msg, spends)
-        sys.exit(f"Daily-limit reservation failed: {msg}")
-
-    # NFT mints also consume one unit of the rolling mint quota, reserved
-    # atomically here (same lock) so parallel signers can't overshoot the
-    # cap between the provisional check and signing. The count entry rides
-    # the normal bind/confirm/release lifecycle with the spend entries.
-    mrid = None
-    if tx.get("TransactionType") == "NFTokenMint":
-        cap = int(C.nft_policy(policy)["max_mints_per_day"])
-        m_denials, mrid = tracker.try_reserve_count(
-            C.NFT_MINT_ASSET, 1, cap)
-        if m_denials:
-            msg = "; ".join(m_denials)
-            tracker.release_reservation(rid)
-            C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
-                    prop["network"], tx["Account"], "policy_denied",
-                    "atomic mint reserve: " + msg, spends)
-            sys.exit(f"Mint-quota reservation failed: {msg}")
-
-    seed = load_seed(seed_src)
-    try:
-        wallet = Wallet.from_seed(seed)
-    except Exception:
-        tracker.release_reservation(rid)
-        tracker.release_reservation(mrid)
-        sys.exit("Seed invalid.")
-    if wallet.classic_address != tx["Account"]:
-        tracker.release_reservation(rid)
-        tracker.release_reservation(mrid)
-        sys.exit(f"Seed derives {wallet.classic_address}, but proposal is for "
-                 f"{tx['Account']} — refusing (wallet mismatch).")
-    # P1-1: honor disabled master keys. A seed deriving to the account
-    # itself is the master seed; if the ledger disabled it, refuse here
-    # with a clear reason instead of submitting a doomed transaction.
-    key_problem = C.check_ledger_key_authorization(
-        client, tx["Account"], wallet.classic_address)
-    if key_problem:
-        tracker.release_reservation(rid)
-        tracker.release_reservation(mrid)
-        sys.exit(key_problem)
-    del seed
-
-    from xrpl.models.transactions import Transaction
-    tx_obj = Transaction.from_xrpl(tx)  # tx stored in PascalCase wire format
-    signed = sign_tx(tx_obj, wallet)
-    thash = signed.get_hash()
-    last_ledger = tx.get("LastLedgerSequence")
-
-    # Bind the reservation(s) to the signed tx, then persist BEFORE submitting:
-    # a crash between sign and submit still leaves a reconciliation trail
-    # (hash + last ledger), and the budget stays reserved until the ledger
-    # outcome is known.
-    # P1-3: anchor the submission ledger range for proven-non-inclusion.
-    try:
-        from xrpl.models.requests import Ledger as _Ledger
-        submit_ledger = int(client.request(
-            _Ledger(ledger_index="validated")).result["ledger_index"])
-    except Exception:  # noqa: BLE001
-        submit_ledger = None  # sweep keeps pending until provable
-    tracker.bind_reservation(rid, thash, last_ledger, submit_ledger)
-    tracker.bind_reservation(mrid, thash, last_ledger, submit_ledger)
+    signed, thash, last_ledger, auth_path = _reserve_sign_bind(
+        prop, tx, policy, tracker, spends, seed_src, client)
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"], "signed",
             f"last_ledger={last_ledger}", spends)
@@ -811,7 +863,8 @@ def cmd_sign(args):
         path.unlink()  # proposal consumed
     else:
         # P1-3: the failed tx still consumed its fee — retain it.
-        tracker.release_tx(thash, fee_drops=tx.get("Fee", "0"))
+        if validated and isinstance(tres, str) and tres.startswith("tec"):
+            tracker.release_tx(thash, fee_drops=tx.get("Fee", "0"))
         sys.exit(f"Not applied: {tres}")
 
 
@@ -820,11 +873,11 @@ def cmd_init_profiles(_args):
 
     Builds the 'main' profile from config.json and the 'musegives' profile
     from giveaway.json (if present), recording each policy file's sha256.
-    After ANY reviewed policy edit, run `xrpl-sign sync-profile <name>`.
+    After ANY reviewed policy edit, run `xrpl-sign sync-profile --profile <name>`.
     """
     if C.PROFILES_PATH.exists():
         sys.exit(f"profiles already exist: {C.PROFILES_PATH} "
-                 f"(edit it directly, then `xrpl-sign sync-profile <name>`)")
+                 f"(edit it directly, then `xrpl-sign sync-profile --profile <name>`)")
     profiles = {}
     if C.CONFIG_PATH.exists():
         cfg = json.loads(C.CONFIG_PATH.read_text())
@@ -842,7 +895,7 @@ def cmd_init_profiles(_args):
     if C.GIVEAWAY_PATH.exists():
         gw = json.loads(C.GIVEAWAY_PATH.read_text())
         dw = gw.get("donation_wallet")
-        if dw and C.is_valid_classic_address(dw):
+        if dw and C.is_valid_classic_address(dw) and C.GIVEAWAY_POLICY_PATH.exists():
             profiles["musegives"] = {
                 "network": "mainnet",
                 "account": dw,
@@ -866,7 +919,7 @@ def cmd_init_profiles(_args):
         print(f"  {name}: {pf['account'][:12]}… on {pf['network']} "
               f"(policy {pf['policy_path']})")
     print("\nMainnet signing now requires --profile <name>. After any "
-          "reviewed policy edit, run `xrpl-sign sync-profile <name>`.")
+          "reviewed policy edit, run `xrpl-sign sync-profile --profile <name>`.")
 
 
 def cmd_sync_profile(args):
@@ -886,52 +939,112 @@ def cmd_sync_profile(args):
           f"({pf['policy_sha256'][:16]}…)")
 
 
-def cmd_recover_state(args):
-    """Reconcile corrupt spend state WITHOUT resetting limits (P2-6).
-
-    Backs up the damaged file, keeps every valid entry (including PENDING
-    obligations — they are never silently dropped), quarantines invalid
-    records for operator review, and writes a clean state file. The
-    operator reviews the quarantine list; nothing is auto-forgiven.
-    """
-    import shutil
-    tracker = C.SpentTracker()
-    sp = tracker.state_path
-    if not sp.exists():
-        print("no state file — nothing to recover.")
-        return
-    bak = sp.with_name(sp.name + f".corrupt-{int(__import__('time').time())}.bak")
-    shutil.copy2(sp, bak)
-    print(f"backed up damaged state to {bak}")
-    try:
-        raw = json.loads(sp.read_text())
-        raw_entries = raw.get("entries", [])
-    except (json.JSONDecodeError, OSError) as ex:
-        raw_entries = []
-        print(f"state file unreadable ({ex}); rebuilding from ledger sweep")
-    valid, quarantined = [], []
-    for e in raw_entries:
-        try:
-            tracker._validate_entry(e)
-            valid.append(e)
-        except C.SpentTracker.StateError as ex:
-            quarantined.append((e, str(ex)))
-    # Pending obligations are reconstructed as pending — never reset.
-    n_pending = sum(1 for e in valid if e.get("status") == "pending")
-    with tracker._locked():
-        tracker._save({"entries": valid})
-    print(f"recovered {len(valid)} valid entries ({n_pending} still pending).")
-    if quarantined:
-        print(f"\nQUARANTINED {len(quarantined)} invalid records "
-              f"(NOT counted toward limits — review manually):")
-        for e, why in quarantined:
-            print(f"  - {why}")
-        print("\nIf any quarantined record represents real spending, add it")
-        print("back manually; when in doubt, keep limits tight.")
+def cmd_migrate_state(args):
+    """Copy all validated legacy liabilities into a profile namespace."""
+    import contextlib
+    import hashlib
+    import re
+    profile = C.get_profile(args.profile)
+    key = C.canonical_hash({"network": profile["network"], "account": profile["account"]})
+    if args.legacy_state == "default":
+        source = C.STATE_PATH
+        cfg = json.loads(C.CONFIG_PATH.read_text()) if C.CONFIG_PATH.exists() else {}
+        if cfg.get("address") != profile["account"] or cfg.get("network", "testnet") != profile["network"]:
+            sys.exit("default legacy state does not match this profile's account/network")
     else:
-        print("no invalid records found.")
-    print("\nNext: re-run the signing command; sweep_pending() will resolve")
-    print("pending entries against the ledger.")
+        source = C.GIVEAWAY_STATE_PATH
+        gw = json.loads(C.GIVEAWAY_PATH.read_text()) if C.GIVEAWAY_PATH.exists() else {}
+        if gw.get("donation_wallet") != profile["account"] or gw.get("network", "mainnet") != profile["network"]:
+            sys.exit("giveaway legacy state does not match this profile's account/network")
+    target = C.XRPL_DIR / "accounts" / key / "state.json"
+    old = C.SpentTracker(source, source.with_suffix(".lock"))
+    new = C.SpentTracker(target, target.with_suffix(".lock"))
+    C.check_profile_protected(profile)
+    C.check_protected_files(extra=(source, source.with_suffix(".lock"),
+                                   target, target.with_suffix(".lock")))
+    if not source.exists():
+        sys.exit("legacy state does not exist")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if (args.state_sha256 != digest or args.approve_migration != digest
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+        sys.exit("Migration requires --state-sha256 and --approve-migration, each equal to the full current source SHA-256")
+    # Lock source and target in deterministic order to avoid deadlocks.
+    trackers = sorted((old, new), key=lambda t: str(t.lock_path))
+    with contextlib.ExitStack() as stack:
+        for tracker in trackers:
+            stack.enter_context(tracker._locked())
+        current_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        if current_digest != digest or args.state_sha256 != current_digest or args.approve_migration != current_digest:
+            sys.exit("Legacy state changed during migration; review the new digest")
+        entries = old._load()["entries"]
+        existing = new._load()["entries"]
+        if existing and existing != entries:
+            sys.exit("destination already contains different accounting; refusing overwrite")
+        new._save({"entries": entries})
+        C.atomic_private_json(source.with_name(source.name + ".migration.json"), {
+            "source_kind": args.legacy_state,
+            "source_sha256": digest,
+            "destination_key": key,
+            "entry_count": len(entries),
+        })
+    print(f"Copied {len(entries)} validated accounting entries to profile {args.profile!r}.")
+    print(f"Source retained at {source}; migration receipt binds its current SHA-256 {digest}.")
+
+
+def cmd_recover_state(args):
+    """Restore operator-reconstructed accounting; unknown obligations stay blocked."""
+    import hashlib
+    if getattr(args, "profile", None):
+        pf = C.get_profile(args.profile)
+        key = C.canonical_hash({"network": pf["network"], "account": pf["account"]})
+        sp = C.XRPL_DIR / "accounts" / key / "state.json"
+        tracker = C.SpentTracker(sp, sp.with_suffix(".lock"))
+    else:
+        tracker = C.SpentTracker()
+    with tracker._locked():
+        sp = tracker.state_path
+        original = sp.read_bytes() if sp.exists() else b""
+        original_hash = hashlib.sha256(original).hexdigest()
+        if not getattr(args, "restore_from", None):
+            tracker._load()  # corrupt or missing-initialized state stays blocked
+            print("State is valid; nothing changed. Reconcile pending transactions through the signer.")
+            return
+        if args.state_sha256 != original_hash:
+            sys.exit("State changed or source digest missing; review recovery again")
+        raw = Path(args.restore_from).read_bytes()
+        if args.approve_recovery != hashlib.sha256(raw).hexdigest():
+            sys.exit("Recovery requires the full reviewed replacement SHA-256")
+        try:
+            replacement = json.loads(raw)
+            if set(replacement) != {"entries"} or not isinstance(replacement["entries"], list):
+                raise ValueError("Expected entries array")
+            entries = [tracker._validate_entry(e) for e in replacement["entries"]]
+            try:
+                prior = tracker._load()["entries"]
+            except C.StateCorruptError:
+                # Only a malformed original can be reconstructed by an
+                # independently approved replacement. Keep the raw backup.
+                prior = []
+            # Never silently discard any recoverable recent/pending obligation.
+            for e in prior:
+                try:
+                    tracker._validate_entry(e)
+                    if tracker._prune([e], int(time.time())) and e not in entries:
+                        raise ValueError("Replacement omits an existing obligation")
+                except C.StateCorruptError:
+                    continue  # malformed records require the explicit reviewed reconstruction
+        except (ValueError, TypeError, C.StateCorruptError) as ex:
+            sys.exit("Recovery refused: " + str(ex))
+        backup = sp.with_name(sp.name + ".recovery-" + original_hash + ".bak")
+        if not backup.exists():
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                out.write(original)
+                out.flush()
+                os.fsync(out.fileno())
+        tracker._save({"entries": entries})
+        print("Reviewed accounting restored; original preserved at " + str(backup))
+
 
 
 def cmd_list(_args):
@@ -951,7 +1064,7 @@ def cmd_list(_args):
 def main():
     ap = argparse.ArgumentParser(prog="xrpl-sign",
                                  description="Policy-gated XRPL signer.")
-    ap.add_argument("--hash", default=None, help="proposal hash (prefix ok)")
+    ap.add_argument("--hash", default=None, help="full 64-character hash for approval; prefix for review only")
     ap.add_argument("--approve", action="store_true",
                     help="HUMAN approval of this exact hash: sign & submit")
     ap.add_argument("--profile", default=None,
@@ -965,10 +1078,15 @@ def main():
                     help="policy file (default ~/.xrpl/policy.json; giveaway "
                          "gifts use ~/.xrpl/giveaway_policy.json; "
                          "testnet adhoc only — rejected on mainnet)")
+    ap.add_argument("--restore-from", help="reviewed reconstructed state JSON")
+    ap.add_argument("--state-sha256", help="SHA-256 of original damaged state")
+    ap.add_argument("--approve-recovery", help="full SHA-256 of reviewed replacement")
+    ap.add_argument("--legacy-state", choices=["default", "giveaway"], help="legacy accounting namespace to migrate")
+    ap.add_argument("--approve-migration", help="full SHA-256 of reviewed legacy state")
     ap.add_argument("--list", action="store_true", help="pending proposals")
     ap.add_argument("cmd", nargs="?", choices=["init-policy", "migrate-policy",
                                      "init-profiles", "sync-profile",
-                                     "recover-state"],
+                                     "recover-state", "migrate-state"],
                     help="init-policy: write the default policy file | "
                          "migrate-policy: upgrade a policy to v4")
     args = ap.parse_args()
@@ -985,6 +1103,10 @@ def main():
         cmd_sync_profile(args)
     elif args.cmd == "recover-state":
         cmd_recover_state(args)
+    elif args.cmd == "migrate-state":
+        if not args.profile or not args.legacy_state:
+            sys.exit("usage: xrpl-sign migrate-state --profile <name> --legacy-state default|giveaway --state-sha256 <sha256> --approve-migration <sha256>")
+        cmd_migrate_state(args)
     elif args.list:
         cmd_list(args)
     elif args.hash:

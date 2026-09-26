@@ -3,7 +3,7 @@
 Trade the XRP Ledger from the terminal — any token pair, with a hard safety
 boundary between proposing a trade and signing it.
 
-## Architecture: propose → approve → sign (v0.7)
+## Architecture: propose → approve → sign (v0.8)
 
 Two programs. The agent only ever runs the first.
 
@@ -22,7 +22,7 @@ Two programs. The agent only ever runs the first.
    transaction itself, and signs **only** when a human passes
    `--profile <name> --approve` for that exact hash.
 
-### Signing profiles (v0.7)
+### Signing profiles (v0.8)
 
 A profile names the complete signing context so a proposal can't drift
 across accounts, networks, policies, or wallets:
@@ -34,10 +34,10 @@ across accounts, networks, policies, or wallets:
     "main": {
       "account": "r9e34ga9YxYHYoCe7UtWWpuLjp4iKs3gkB",
       "network": "mainnet",
-      "credential_env": "XRPL_SEED",
+      "credential": {"kind": "env", "env_var": "XRPL_SEED"},
       "policy_path": "/home/user/.xrpl/policy.json",
-      "policy_sha256": "2d3aa5d2b830a43c…",
-      "spend_state": "default"
+      "policy_sha256": "<64 lowercase hex characters>",
+      "state": "default"
     }
   }
 }
@@ -49,9 +49,9 @@ across accounts, networks, policies, or wallets:
   account/network — *before* touching the credential.
 - One profile = one spend-state file, so the main wallet and the giveaway
   wallet can never share a budget.
-- Manage with `xrpl-sign init-profiles` / `xrpl-sign sync-profile <name>`.
+- Manage with `xrpl-sign init-profiles` / `xrpl-sign sync-profile --profile <name>`.
 
-### Vault-only mainnet (v0.7)
+### Vault-only mainnet (v0.8)
 
 Mainnet never keeps a seed on disk and never prints one to a terminal:
 
@@ -67,7 +67,7 @@ Mainnet never keeps a seed on disk and never prints one to a terminal:
 
 ### The envelope (what the hash binds)
 
-A proposal is `format: xrpl-proposal/4` and the approval hash covers:
+A proposal is `format: xrpl-proposal/5`; the hash also covers a fingerprint of the complete named profile:
 
 - `profile`, `policy_sha256`, `network`, `account`, `action`, `created_at`,
   `policy_version`
@@ -87,8 +87,8 @@ current `xrpl-trade`.
   `TakerPays`/`TakerGets` fields; `Account`, `Fee`, `Sequence`,
   `LastLedgerSequence` required; no `TxnSignature`/`SigningPubKey` in
   unsigned proposals; no far-future `created_at`.
-- **Transaction-type allowlist**: `OfferCreate`, `OfferCancel`, `TrustSet`,
-  `Payment` only. Anything else is rejected.
+- **Transaction-type allowlist**: the enabled policy transaction types.
+  NFT types remain subject to policy and strict schema checks.
 - **Strict per-type field schemas**: no `Paths`, `SendMax`, `DeliverMin`,
   `Memos`, partial-payment flags, or any other smuggled field.
 - **Numeric sanity**: NaN/Infinity amounts, fees, and sequences are rejected
@@ -113,7 +113,7 @@ current `xrpl-trade`.
   retains the consumed fee as a confirmed XRP spend.
 - **Strict accounting state**: spend state with negative, non-finite, or
   inconsistent entries fails closed (the signer refuses rather than silently
-  resetting limits); `xrpl-sign recover-state` reconciles a damaged file
+  resetting limits); `xrpl-sign recover-state` restores only an independently reviewed reconstruction; it preserves the damaged file and blocks unresolved liabilities
   without forgiving obligations.
 - **Offer safety**: `Expiration` required and bounded by
   `max_offer_lifetime_seconds`; limit price within `max_deviation_bps` of a
@@ -145,7 +145,7 @@ Every signed transaction is appended to `~/.xrpl/audit.log`
 
 ### The platform boundary (read this)
 
-`--approve` is an *assertion*, not evidence of human approval. v0.5 is
+`--approve` is an *assertion*, not evidence of human approval. Mainnet is
 mainnet-ready **only** when all of these hold:
 
 - Muse requires real user confirmation for each signing use (a typed
@@ -159,7 +159,7 @@ A same-user local agent does **not** satisfy this boundary, even with
 `0600` files: a same-UID process can read the signer's environment and
 rewrite its policy and state. Same-user installs are testnet-only.
 
-Without those platform guarantees, v0.5 is a hardened testnet tool — not
+Without those platform guarantees, this skill is a hardened testnet tool — not
 generically mainnet-safe. Three deployment profiles are documented in
 `README.md` (Muse vault / Xaman-human / autonomous-experimental); the
 design states all of this honestly in `SECURITY.md`.
@@ -171,8 +171,8 @@ xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
 # → prints the full proposal + hash, e.g. a2c72140d080ca0f…
 # → NOTHING is submitted.
 
-# A human reviews the exact hash, then:
-xrpl-sign --profile main --hash a2c72140d080ca0f --approve
+# Muse receives this exact full digest only after genuine human review:
+xrpl-sign --profile main --hash <full-64-character-hash> --approve
 # → profile + envelope verify → policy checks → sign → persist →
 #   submit_and_wait → validated ledger result → audit log
 ```
@@ -217,8 +217,9 @@ is mandatory and must match the profile the proposal was built for.
 
 ## NFTs (v0.5): mint, list, inventory, buy, bid
 
-Minting is a deliberate **two-step** flow — pinning is an external write
-and happens inside the approved action, never before it:
+Minting is a deliberate **two-step** flow. Staging is offline. Pinning is
+an external write only after the operator supplies the independent full
+stage digest; a failed later step can leave unreferenced pins:
 
 ```bash
 xrpl-trade nft-stage --file art.png --name "Neon Drift" \
@@ -226,13 +227,12 @@ xrpl-trade nft-stage --file art.png --name "Neon Drift" \
 # → validates the artwork locally (approved media dir, size/type/sha256)
 #   and writes a reviewable stage record. ZERO network calls.
 
-# A human reviews the stage record, then approves the pin + proposal as
-# one action. PINATA_JWT is injected for this single operation only
-# (e.g. PINATA_JWT="$(vault read ...)" xrpl-trade nft-pin-and-propose …)
-# — never exported into a shell, never stored, never logged:
-xrpl-trade nft-pin-and-propose --stage <stage-id>
-# → re-validates the file against the staged hash, pins art + metadata
-#   under YOUR Pinata account, proposes NFTokenMint
+# A human reviews the full stage digest. Muse injects PINATA_JWT into
+# this one approved operation; do not paste/export it in a shell or chat:
+xrpl-trade nft-pin-and-propose --stage <stage-id> \
+    --approve-stage <full-64-character-stage-digest>
+# → requires the independent full digest before reading the credential,
+#   re-validates and uploads the exact bytes, then proposes NFTokenMint
 ```
 
 ```bash
@@ -363,13 +363,12 @@ at a time — **no automatic signing or sending, ever**.
 
 The pot: the **Musegives** donation wallet
 `rnkt27oqgJiRfsuwCogqrLwYx4NNooMFdB` (public by design — publishing it is
-how people find the pot). Anyone can contribute XRP to it.
-`~/.xrpl/giveaway.json` (owner-only `0600`) holds the donation wallet and
-the opt-in tag (defaults: Musegives, tag `777`), plus `max_gift_xrp`
-(default `10` — the largest XRP gift the tool will propose) and
-`network` (default `mainnet`). Every giveaway command takes
-`--donation-wallet r…`, so community leaders can run the same flow
-against their own wallet with no code changes.
+how people find the pot). Anyone can contribute XRP to it. The selected
+signing profile supplies its network, wallet address, giveaway policy, and
+limits. Mainnet signing requires Muse's secure credential vault; legacy
+`giveaway.json` seed material is rejected and must be migrated out before
+mainnet signing. `--donation-wallet` selects a public account for read-only
+queries; it does not select or authorize signing credentials.
 
 ### Opting in: 1 drop, destination tag 777
 
@@ -432,31 +431,25 @@ xrpl-trade giveaway gift --to rWinner… --token-id <64-hex>   # 0-XRP NFT trans
 - Guards: `--to` must be a valid classic address and cannot be the
   donation wallet itself; anything seed-like is refused with a loud STOP
   (a seed is never a destination). XRP gifts above `max_gift_xrp` are
-  refused — the cap is raised by editing `~/.xrpl/giveaway.json`
-  deliberately, never in the heat of the moment. A winner who hasn't
+  refused — the cap is raised through a deliberate policy edit and fresh
+  approval, never in the heat of the moment. A winner who hasn't
   opted in gets a warning, not a block (Mike's call can override).
-- `setup` (interactive, local): writes the narrow giveaway signer policy
+- `setup` (interactive): writes the narrow giveaway signer policy
   (`~/.xrpl/giveaway_policy.json` — only `Payment` +
   `NFTokenCreateOffer`, network-locked, XRP spend capped at
   `max_gift_xrp`, arbitrary winner destinations since the human approved
-  the exact one). It then offers to store the donation wallet's seed:
-  the preferred path is the `XRPL_GIVEAWAY_SEED` environment variable
-  (injected from the secure vault for the exact approved moment); the
-  fallback is a hidden prompt that stores it in `~/.xrpl/giveaway.json`
-  (`0600`). Either way the seed is never printed, logged, or echoed —
-  the CLI verifies it derives the configured donation address before
-  storing anything. The local fallback is deliberate and explicit, and
-  `xrpl-sign`'s `check_protected_files` covers `giveaway.json` and the
-  giveaway policy in giveaway mode — the signer refuses to run if either
-  is not owner-only.
+  the exact one). Local giveaway seed storage is testnet-only. Mainnet giveaway credentials must come from Muse's
+  secure vault after genuine approval. Setup refuses local seed storage on
+  mainnet. Testnet-only seed files are network-tagged and are not read by
+  the signer. The seed is never printed, logged, or echoed.
 - `announce [--winner r…] [--prize "5 XRP"]` prints a draft winner
   announcement from the last draw (winner, prize, ledger index/hash,
   method, digest, entrant count, pot address, next Friday 7:37 AM). It
   posts nothing — the draft is for review.
 - The proposal prints its giveaway signing command:
-  `xrpl-sign --hash <hash> --approve --seed-env XRPL_GIVEAWAY_SEED
-  --policy ~/.xrpl/giveaway_policy.json` (the `--approve` flag is never
-  the approval — the human's explicit go-ahead for that exact hash is).
+  `xrpl-sign --profile <profile> --hash <full-64-character-hash> --approve`
+  (the CLI flag alone is not human approval; Muse must gate the call and
+  credential injection on a real confirmation).
 
 The Friday flow: cron runs `giveaway draw` → Mike picks the prize →
 `giveaway gift` builds the proposal → he approves that exact hash → the
@@ -589,7 +582,7 @@ The signer reads the seed **only** from `XRPL_SEED`, provided by your
 secret manager or the Muse vault after human approval. Fund a testnet
 wallet: `xrpl-trade faucet --network testnet`.
 
-## Wallets (v0.7): vault-only mainnet, local testnet
+## Wallets (v0.8): vault-only mainnet, local testnet
 
 Mainnet keys are created and backed up in your vault (password manager),
 outside this tool — the CLI refuses to create or display mainnet seeds:
@@ -642,3 +635,20 @@ lands, continue with the normal ceremony above.
 - `tests/test_e2e_testnet.py` — 52 end-to-end checks on testnet
   (propose → approve → sign → persist → validated), fully isolated in a
   temporary HOME — never touches the operator's real `~/.xrpl`
+
+
+## Accounting migration
+
+When moving legacy `state.json` or `giveaway_state.json` into named profiles,
+first inspect the source state and identify every transaction liability. Then
+run `xrpl-sign migrate-state --profile <name> --legacy-state default` (or
+`giveaway`) with `--state-sha256 <full-source-digest>` and
+`--approve-migration <same-full-digest>`. The command locks source and target,
+validates and copies every record, retains the legacy file, and writes a
+receipt bound to the source digest and account/network namespace. It refuses a
+profile whose identity does not match the legacy wallet. Do not hand-edit or
+delete legacy state to bypass this migration.
+
+## Local doctor
+
+`xrpl-trade doctor` checks profile files, local signer/helper hashes, and readable accounting state without network or credential access. It reports unresolved reservations and always reports Muse vault approval and protected execution as unverified; it cannot certify the installed runtime.
