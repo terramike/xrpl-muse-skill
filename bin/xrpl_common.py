@@ -2002,11 +2002,11 @@ def read_giveaway_seed():
 
 
 def write_giveaway_seed(seed, network=None):
-    require_local_network(network)
-    """Atomically store the seed in giveaway.json (owner-only 0600).
+    """Atomically store a tagged testnet seed in its dedicated file (0600).
 
-    Called ONLY by the interactive `giveaway setup` (getpass, never
-    echoed). Never prints the seed."""
+    Called ONLY by interactive testnet setup. Never prints the seed. Mainnet
+    credentials must be supplied by the configured secure vault."""
+    require_local_network(network)
     from xrpl.wallet import Wallet
     address = Wallet.from_seed(seed).classic_address
     atomic_private_json(XRPL_DIR / ("local-giveaway-" + network + ".json"),

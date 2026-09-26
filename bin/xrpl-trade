@@ -2269,18 +2269,18 @@ def main():
     e = gp.add_parser("entrants", help="list opt-ins + eligibility "
                                        "(read-only)")
     e.add_argument("--donation-wallet", default=None,
-                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+                   help="public donation wallet to inspect (read-only; defaults to profile account)")
     d = gp.add_parser("draw", help="deterministic draw from a future ledger "
                                    "hash (read-only; selects only)")
     d.add_argument("--donation-wallet", default=None,
-                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+                   help="public donation wallet to inspect (read-only; defaults to profile account)")
     d.add_argument("--ledger-offset", type=int, default=20,
                    help="ledgers ahead of the current validated index to "
                         "draw from (default 20)")
     s = gp.add_parser("status", help="the pot: XRP balance, nonzero "
                                      "trustlines, NFT inventory (read-only)")
     s.add_argument("--donation-wallet", default=None,
-                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+                   help="public donation wallet to inspect (read-only; defaults to profile account)")
     g = gp.add_parser("gift", help="PROPOSE a gift from the donation wallet "
                                   "(human approval still required; never "
                                   "auto-sends)")
@@ -2294,14 +2294,13 @@ def main():
     g.add_argument("--token-id", default=None,
                    help="NFT id to gift (0-XRP transfer offer)")
     g.add_argument("--donation-wallet", default=None,
-                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+                   help="public donation wallet to inspect (read-only; defaults to profile account)")
     g.add_argument("--expires-in", type=int, default=86400,
                    help="NFT transfer offer expiry in seconds (default 86400)")
-    gp.add_parser("setup", help="interactive donation-wallet setup: signer "
-                               "policy + optional local seed (getpass, never "
-                               "echoed)").add_argument(
+    gp.add_parser("setup", help="interactive giveaway policy setup; mainnet "
+                               "credentials must use the Muse vault").add_argument(
         "--donation-wallet", default=None,
-        help="donation wallet to set up (default: ~/.xrpl/giveaway.json)")
+        help="public donation wallet to configure (credentials remain profile/vault bound)")
     a = gp.add_parser("announce", help="print a draft winner announcement "
                                       "(read-only, nothing posted)")
     a.add_argument("--winner", default=None,
@@ -2309,7 +2308,7 @@ def main():
     a.add_argument("--prize", default=None,
                    help="prize description, e.g. '5 XRP'")
     a.add_argument("--donation-wallet", default=None,
-                   help="donation wallet (default: ~/.xrpl/giveaway.json)")
+                   help="public donation wallet to inspect (read-only; defaults to profile account)")
 
     args = ap.parse_args()
     if args.cmd == "doctor":

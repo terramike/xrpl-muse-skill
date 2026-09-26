@@ -363,13 +363,12 @@ at a time — **no automatic signing or sending, ever**.
 
 The pot: the **Musegives** donation wallet
 `rnkt27oqgJiRfsuwCogqrLwYx4NNooMFdB` (public by design — publishing it is
-how people find the pot). Anyone can contribute XRP to it.
-`~/.xrpl/giveaway.json` (owner-only `0600`) holds the donation wallet and
-the opt-in tag (defaults: Musegives, tag `777`), plus `max_gift_xrp`
-(default `10` — the largest XRP gift the tool will propose) and
-`network` (default `mainnet`). Every giveaway command takes
-`--donation-wallet r…`, so community leaders can run the same flow
-against their own wallet with no code changes.
+how people find the pot). Anyone can contribute XRP to it. The selected
+signing profile supplies its network, wallet address, giveaway policy, and
+limits. Mainnet signing requires Muse's secure credential vault; legacy
+`giveaway.json` seed material is rejected and must be migrated out before
+mainnet signing. `--donation-wallet` selects a public account for read-only
+queries; it does not select or authorize signing credentials.
 
 ### Opting in: 1 drop, destination tag 777
 
@@ -432,14 +431,14 @@ xrpl-trade giveaway gift --to rWinner… --token-id <64-hex>   # 0-XRP NFT trans
 - Guards: `--to` must be a valid classic address and cannot be the
   donation wallet itself; anything seed-like is refused with a loud STOP
   (a seed is never a destination). XRP gifts above `max_gift_xrp` are
-  refused — the cap is raised by editing `~/.xrpl/giveaway.json`
-  deliberately, never in the heat of the moment. A winner who hasn't
+  refused — the cap is raised through a deliberate policy edit and fresh
+  approval, never in the heat of the moment. A winner who hasn't
   opted in gets a warning, not a block (Mike's call can override).
-- `setup` (interactive, local): writes the narrow giveaway signer policy
+- `setup` (interactive): writes the narrow giveaway signer policy
   (`~/.xrpl/giveaway_policy.json` — only `Payment` +
   `NFTokenCreateOffer`, network-locked, XRP spend capped at
   `max_gift_xrp`, arbitrary winner destinations since the human approved
-  the exact one). Mainnet giveaway credentials must come from Muse's
+  the exact one). Local giveaway seed storage is testnet-only. Mainnet giveaway credentials must come from Muse's
   secure vault after genuine approval. Setup refuses local seed storage on
   mainnet. Testnet-only seed files are network-tagged and are not read by
   the signer. The seed is never printed, logged, or echoed.

@@ -113,6 +113,9 @@ def main():
         sys.path.insert(0, str(SKILL_BIN))
         import xrpl_common as C
         C.XRPL_DIR = xrpl
+        # Paths are resolved at module import; bind every file path used by
+        # proposal creation to this suite's isolated home as well.
+        C.POLICY_PATH = xrpl / "policy.json"
         C.PROPOSALS_DIR = xrpl / "proposals"
         C.FAVORITES_PATH = xrpl / "favorites.json"
         import asyncio

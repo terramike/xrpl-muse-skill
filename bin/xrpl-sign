@@ -742,8 +742,8 @@ def cmd_sign(args):
 
     # The protected deployment boundary: policy, allowlist, spend state,
     # profiles, and audit log must be owner-only, or limits are fiction.
-    # Giveaway mode additionally protects the giveaway policy and
-    # giveaway.json (which may hold the donation-wallet seed).
+    # Giveaway mode additionally protects the giveaway policy and legacy
+    # giveaway.json location so an old seed cannot silently survive.
     C.check_protected_files(
         extra=(C.GIVEAWAY_POLICY_PATH, C.GIVEAWAY_PATH)
         if giveaway_mode else ())
