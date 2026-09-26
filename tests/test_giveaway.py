@@ -322,7 +322,11 @@ os.chmod(C.POLICY_PATH, 0o600)
 check("allowlist add works", C.add_destination_allowlist_entry(DW, 777) is None)
 pol = json.loads(C.POLICY_PATH.read_text())
 check("allowlist entry is exact (address, tag)",
-      pol["destination_allowlist"] == [{"address": DW, "destination_tag": 777}])
+      [e for e in pol["destination_allowlist"]
+       if e.get("address") == DW and e.get("destination_tag") == 777] != [])
+check("allowlist entry carries an added_at timestamp",
+      any(e.get("address") == DW and isinstance(e.get("added_at"), int)
+          for e in pol["destination_allowlist"]))
 check("allowlist add is idempotent",
       C.add_destination_allowlist_entry(DW, 777) is None
       and len(json.loads(C.POLICY_PATH.read_text())["destination_allowlist"]) == 1)
@@ -381,8 +385,8 @@ check("proposal built for the 1-drop opt-in",
       and tx.destination_tag == 777 and tx.account == USER)
 check("proposal kind labeled", proposed["kind"] == "giveaway-opt-in")
 check("allowlist got the exact pair",
-      {"address": DW, "destination_tag": 777}
-      in json.loads(C.POLICY_PATH.read_text())["destination_allowlist"])
+      any(e.get("address") == DW and e.get("destination_tag") == 777
+          for e in json.loads(C.POLICY_PATH.read_text())["destination_allowlist"]))
 check("proposal does NOT mark the profile opted in",
       prof["giveaway"] == {"opt_in": False, "opt_in_tx": None})
 check("caller told to re-run after approval",

@@ -231,8 +231,12 @@ is mandatory and must match the profile the proposal was built for.
 - `allowed_tx_types` — the safe trading types plus, for v0.5,
   `NFTokenMint`, `NFTokenCreateOffer`, and `NFTokenAcceptOffer` when the
   operator enables them.
-- `destination_allowlist` — `[{address, destination_tag}]` pairs
-  (empty = no payments).
+- `destination_allowlist` — `[{address, destination_tag, added_at}]` pairs
+  (empty = no payments). Entries added through the tooling are timestamped
+  and every add/remove is written to the audit log. The signing ceremony
+  flags Payments to destinations added within the last 24h with a loud
+  **NEW DESTINATION** warning — a prompt-injected allowlist add followed by
+  a quick-tapped proposal is the attack this catches.
 - `max_fee_drops`, `max_deviation_bps`, `proposal_ttl_seconds`
   (proposals expire after 24h by default).
 - `max_spread_bps` (default 1000), `min_book_depth` (default "5", in QUOTE
@@ -556,6 +560,29 @@ Hard rules, from the file's own header — never weakened:
 - Before displaying an address as belonging to a person or project,
   confirm it from an official source or describe the association as
   unverified.
+
+## Menu presentation (standard)
+
+When presenting this skill in chat, **always use clickable button menus
+by default** — not raw command lists. The user navigates by tapping,
+not by typing commands.
+
+**Main menu buttons:**
+- XRPL Actions
+- NFT
+- Artists
+- Wallets
+- XRP News
+- XRPLF
+- Coffee & Crypto
+- xBoost
+
+Each button opens its own focused submenu of tappable exact-command
+buttons. After showing command results, attach a fresh set of the most
+useful follow-up commands as buttons.
+
+The `xrpl-trade menu` command provides the same navigation in a
+terminal (arrow-key navigable). But in chat, buttons are the standard.
 
 ## Commands
 
