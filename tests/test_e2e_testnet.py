@@ -162,6 +162,11 @@ def main():
         check("signed hash reported", bool(tm))
         check("validated tesSUCCESS",
               "validated: True" in p.stdout and "tesSUCCESS" in p.stdout)
+        if p.returncode != 0 or "validated: True" not in p.stdout or "tesSUCCESS" not in p.stdout:
+            print("signer stdout on failed payment:")
+            print(p.stdout[-4000:])
+            print("signer stderr on failed payment:")
+            print(p.stderr[-4000:])
         if not tm:
             print(p.stdout[-2000:]); print(p.stderr[-2000:])
             return 1
