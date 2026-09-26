@@ -1062,7 +1062,7 @@ check("README documents the three deployment profiles",
       all(p in readme for p in ("Muse vault signer", "Xaman-human",
                                 "Autonomous-experimental")))
 check("README states NFT checks don't cover value or art ownership",
-      "does **not** protect market value" in readme)
+      "do **not** protect market value" in readme)
 check("SKILL.md has no export-PINATA_JWT pattern",
       "export PINATA_JWT" not in skillmd)
 check("SKILL.md documents the two-step mint flow",
