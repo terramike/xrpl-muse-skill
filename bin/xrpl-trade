@@ -2284,6 +2284,12 @@ def main():
     if network not in C.NETWORKS:
         sys.exit(f"unknown network {network!r}")
     cfg["network"] = network
+    if args.cmd == "setup":
+        cmd_setup(args)
+        return
+    if args.cmd == "nft-stage":
+        cmd_nft_stage(args, cfg, None)
+        return
     client = get_client(network)
 
     if args.cmd == "profile":

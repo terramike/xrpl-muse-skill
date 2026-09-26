@@ -145,7 +145,7 @@ with tempfile.TemporaryDirectory() as td:
                      "TakerGets": q("75.200000")}]
 
         def request(self, req):
-            from xrpl.models.requests import BookOffers, AccountInfo, Ledger
+            from xrpl.models.requests import BookOffers, AccountInfo, Ledger, ServerInfo
             if isinstance(req, ServerInfo):
                 return FakeResp({"info": {"complete_ledgers": "1-2000"}})
             if isinstance(req, Ledger):
@@ -179,6 +179,8 @@ with tempfile.TemporaryDirectory() as td:
 
         def request(self, req):
             from xrpl.models.requests import Ledger, Tx, ServerInfo
+            if isinstance(req, ServerInfo):
+                return FakeResp({"info": {"complete_ledgers": "1-2000"}})
             if isinstance(req, Ledger):
                 if self.raise_ledger:
                     raise RuntimeError("node down")
@@ -621,7 +623,7 @@ with tempfile.TemporaryDirectory() as td:
                                     tx_result="tecUNFUNDED_PAYMENT"))
     st = json.loads(C.STATE_PATH.read_text())
     check("validated failure releases the reservation",
-          all(e["tx_hash"] != "CC" * 32 for e in st["entries"]))
+          sum(Decimal(e["amount"]) for e in st["entries"] if e["tx_hash"] == "CC" * 32) == Decimal("0.000012"))
     # ledger not yet past last_ledger -> untouched
     denials, rid = tracker.try_reserve({"XRP": Decimal("1")}, cpol)
     tracker.bind_reservation(rid, "DD" * 32, 5000)

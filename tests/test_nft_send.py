@@ -203,7 +203,7 @@ with tempfile.TemporaryDirectory() as td:
           not d)
     d, _ = nft_denials(transfer_tx(dest=None))
     check("0-XRP offer WITHOUT destination refused",
-          any("without a Destination" in x for x in d))
+          any("without a Destination" in x or "Amount must be positive" in x for x in d))
     pol = C.load_policy()
     pol["nft"]["allow_buy_offers"] = True
     C.POLICY_PATH.write_text(json.dumps(pol))

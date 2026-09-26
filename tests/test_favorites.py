@@ -344,7 +344,7 @@ with tempfile.TemporaryDirectory() as td:
     check("lookup failure is soft", price is None and perr is not None)
 
     # --- 11. validated ledger ---
-    fc = FakeClient({"ledger": lambda d: FakeResp({"ledger_index": 12345})})
+    fc = FakeClient({"ledger": lambda d: FakeResp({"ledger_index": 12345, "validated": True})})
     idx, prob = C.get_validated_ledger(fc)
     check("validated ledger index read", idx == 12345 and prob is None)
     fc = FakeClient({"ledger": lambda d: FakeResp({}, ok=False)})
@@ -367,7 +367,7 @@ with tempfile.TemporaryDirectory() as td:
                        created_meta(NID1, URI_HEX))], "marker": None})
 
     fc = FakeClient({
-        "ledger": lambda d: FakeResp({"ledger_index": 999999}),
+        "ledger": lambda d: FakeResp({"ledger_index": 999999, "validated": True}),
         "account_tx": new_handler,
         "nft_sell_offers": lambda d: FakeResp({"offers": [
             {"Amount": "2500000", "nft_offer_index": "C" * 64}]}),

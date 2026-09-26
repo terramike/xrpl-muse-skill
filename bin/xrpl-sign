@@ -517,8 +517,7 @@ def load_seed(seed_src=("env", "XRPL_SEED")):
     ("file", PATH): seed read from a local file — TESTNET ONLY; mainnet
     profiles may not use this kind (enforced in resolve_signing_context).
 
-    The old giveaway.json fallback is REMOVED on mainnet (P1-2 vault-only);
-    on testnet adhoc it survives via C.read_giveaway_seed().
+    Local giveaway fallback is disabled on every network.
     """
     kind, ref = seed_src
     seed = None
@@ -575,7 +574,7 @@ def resolve_signing_context(args, prop):
             sys.exit(f"mainnet: profile {args.profile!r} uses a stored-file "
                      f"credential — vault-only mainnet requires one-time "
                      f"injection (kind 'env')")
-        policy = C.load_policy(profile["policy_path"])
+        policy = C.load_policy(profile["policy_path"], expected_digest=prop["policy_sha256"])
         return policy, ("env", cred["env_var"]), \
             (profile["state"] == "giveaway"), args.profile
 
@@ -591,7 +590,7 @@ def resolve_signing_context(args, prop):
             C.verify_policy_digest_binding(profile, prop)
         except C.ProposalError as e:
             sys.exit(f"profile binding failed: {e}")
-        policy = C.load_policy(profile["policy_path"])
+        policy = C.load_policy(profile["policy_path"], expected_digest=prop["policy_sha256"])
         cred = profile["credential"]
         seed_src = ("env", cred["env_var"]) if cred["kind"] == C.CRED_KIND_ENV \
             else ("file", cred["path"])
@@ -601,7 +600,7 @@ def resolve_signing_context(args, prop):
     if bound_profile != "adhoc-testnet":
         sys.exit(f"proposal is bound to profile {bound_profile!r} — sign "
                  f"with --profile {bound_profile}")
-    policy = C.load_policy(args.policy)
+    policy = C.load_policy(args.policy, expected_digest=prop.get("policy_sha256"))
     giveaway_mode = bool(policy.get("giveaway"))
     default_pp = (C.GIVEAWAY_POLICY_PATH if giveaway_mode else C.POLICY_PATH)
     eff_policy_path = args.policy or str(default_pp)
@@ -707,7 +706,7 @@ def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env, client):
                 tracker.release_reservation(rid)
                 tracker.release_reservation(mrid)
     except C.StateCorruptError as e:
-        sys.exit(str(e))
+        sys.exit("CORRUPT state: " + str(e))
 
 
 def cmd_sign(args):
@@ -774,7 +773,7 @@ def cmd_sign(args):
         rlines, rdenials, _ = C.nft_sell_offer_report(
             client, tx.get("NFTokenSellOffer", ""))
         print("  --- sell offer re-verified from the ledger at signing ---")
-        print("  VERIFY the issuer below is the minter you expect; anyone "
+        print("  VERIFY the issuer below is the artist you expect; anyone "
               "can mint the same artwork.")
         for ln in rlines:
             print("  " + C.safe_terminal_text(ln))
@@ -861,11 +860,11 @@ def cmd_init_profiles(_args):
 
     Builds the 'main' profile from config.json and the 'musegives' profile
     from giveaway.json (if present), recording each policy file's sha256.
-    After ANY reviewed policy edit, run `xrpl-sign sync-profile <name>`.
+    After ANY reviewed policy edit, run `xrpl-sign sync-profile --profile <name>`.
     """
     if C.PROFILES_PATH.exists():
         sys.exit(f"profiles already exist: {C.PROFILES_PATH} "
-                 f"(edit it directly, then `xrpl-sign sync-profile <name>`)")
+                 f"(edit it directly, then `xrpl-sign sync-profile --profile <name>`)")
     profiles = {}
     if C.CONFIG_PATH.exists():
         cfg = json.loads(C.CONFIG_PATH.read_text())
@@ -883,7 +882,7 @@ def cmd_init_profiles(_args):
     if C.GIVEAWAY_PATH.exists():
         gw = json.loads(C.GIVEAWAY_PATH.read_text())
         dw = gw.get("donation_wallet")
-        if dw and C.is_valid_classic_address(dw):
+        if dw and C.is_valid_classic_address(dw) and C.GIVEAWAY_POLICY_PATH.exists():
             profiles["musegives"] = {
                 "network": "mainnet",
                 "account": dw,
@@ -907,7 +906,7 @@ def cmd_init_profiles(_args):
         print(f"  {name}: {pf['account'][:12]}… on {pf['network']} "
               f"(policy {pf['policy_path']})")
     print("\nMainnet signing now requires --profile <name>. After any "
-          "reviewed policy edit, run `xrpl-sign sync-profile <name>`.")
+          "reviewed policy edit, run `xrpl-sign sync-profile --profile <name>`.")
 
 
 def cmd_sync_profile(args):

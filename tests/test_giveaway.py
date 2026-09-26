@@ -125,7 +125,7 @@ class FakeClient:
             return StubResp(True, res)
         if isinstance(req, Ledger):
             if req.ledger_index == "validated":
-                return StubResp(True, {"ledger_index": self.ledger_index})
+                return StubResp(True, {"ledger_index": self.ledger_index, "validated": True})
             h = self.ledger_hashes.get(req.ledger_index)
             if h:
                 return StubResp(True, {"ledger_hash": h,

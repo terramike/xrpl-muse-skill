@@ -444,7 +444,7 @@ with tempfile.TemporaryDirectory() as td:
           od["Flags"] == 1 and od["Amount"] == "2500000")
 
     # --- 15. nft-buy / nft-bid (stub ledger, no network) ---
-    from xrpl.models.requests import AccountNFTs, LedgerEntry
+    from xrpl.models.requests import AccountNFTs, LedgerEntry, Ledger
 
     OFFER_IDX = "AB" * 32
     TOKEN = "CD" * 32
@@ -470,12 +470,14 @@ with tempfile.TemporaryDirectory() as td:
             self.nfts = nfts
 
         def request(self, req):
+            if isinstance(req, Ledger):
+                return StubResp(True, {"ledger_index": 100, "validated": True})
             if isinstance(req, LedgerEntry):
                 if self.offer is None:
                     return StubResp(False, {"error": "entryNotFound"})
-                return StubResp(True, {"node": self.offer})
+                return StubResp(True, {"node": self.offer, "validated": True, "ledger_index": 100})
             if isinstance(req, AccountNFTs):
-                return StubResp(True, {"account_nfts": self.nfts})
+                return StubResp(True, {"account_nfts": self.nfts, "validated": True, "ledger_index": 100})
             raise AssertionError("unexpected request type")
 
     seller_nfts = [{"NFTokenID": TOKEN, "URI": GOOD_URI,

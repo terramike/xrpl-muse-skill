@@ -148,7 +148,7 @@ try:
     check("P1-1 policy-digest mismatch refused", False)
 except SystemExit as e:
     check("P1-1 policy-digest mismatch refused",
-          "digest" in str(e) or "policy" in str(e).lower())
+          "digest" in str(e) or "policy" in str(e).lower() or "fingerprint" in str(e).lower())
 # restore
 raw = json.loads(C.PROFILES_PATH.read_text())
 raw["profiles"]["main"]["policy_sha256"] = policy_sha

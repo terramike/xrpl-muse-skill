@@ -840,7 +840,7 @@ def describe_tx(tx: dict, action_hint: str = "?") -> list:
         exp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                             time.gmtime(tx["Expiration"] + RIPPLE_EPOCH))
         lines.append(f"expires:  {exp}")
-    return lines
+    return [safe_terminal_text(line) for line in lines]
 
 
 # ---------- strict transaction shape ----------
@@ -2027,10 +2027,10 @@ def write_giveaway_policy(max_gift_xrp, network):
 def giveaway_sign_command(proposal_hash, profile_name="adhoc-testnet"):
     """The exact signer invocation for a giveaway-gift proposal."""
     if profile_name == "adhoc-testnet":
-        return (f"xrpl-sign --hash {proposal_hash[:16]} --approve "
+        return (f"xrpl-sign --hash {proposal_hash} --approve "
                 f"--seed-env {GIVEAWAY_SEED_ENV} --policy {GIVEAWAY_POLICY_PATH}")
     return (f"xrpl-sign --profile {profile_name} "
-            f"--hash {proposal_hash[:16]} --approve")
+            f"--hash {proposal_hash} --approve")
 
 
 def save_last_draw(record):
@@ -2096,8 +2096,8 @@ def get_validated_ledger(client):
     if not r.is_successful():
         return None, f"could not read the validated ledger: {r.result}"
     idx = (r.result or {}).get("ledger_index")
-    if not isinstance(idx, int):
-        return None, "validated ledger response had no ledger_index"
+    if type(idx) is not int or idx < 1 or r.result.get("validated") is not True:
+        return None, "validated ledger response lacked a validated ledger_index"
     return idx, None
 
 
@@ -2559,12 +2559,15 @@ def validate_policy(pol):
     return pol
 
 
-def load_policy(path=None):
+def load_policy(path=None, expected_digest=None):
     p = Path(path) if path else POLICY_PATH
     if not p.exists():
         sys.exit(f"No policy file. Run `xrpl-sign init-policy` first ({p}).")
     try:
-        pol = json.loads(p.read_text())
+        raw = p.read_bytes()
+        if expected_digest is not None and hashlib.sha256(raw).hexdigest() != expected_digest:
+            sys.exit("Policy changed since approval; rebuild the proposal")
+        pol = json.loads(raw)
     except json.JSONDecodeError:
         sys.exit(f"Policy file is not valid JSON: {p}")
     if not isinstance(pol, dict):
