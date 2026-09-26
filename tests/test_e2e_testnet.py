@@ -30,7 +30,7 @@ for _k in ("no_proxy", "NO_PROXY"):
 
 # The checkout under test — not an installed copy.
 SKILL_BIN = Path(__file__).resolve().parent.parent / "bin"
-PYP = str(Path.home() / "workspace" / "tools" / "xrpl-pkgs")
+PYP = str(SKILL_BIN)
 
 CHECKS = []
 
@@ -155,7 +155,7 @@ def main():
         print("== approve + sign + submit ==")
         bal_before = balance_xrp(addr_b)
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", h[:16], "--approve"],
+                 "--hash", h, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         tm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("approve run exits 0", p.returncode == 0)
@@ -244,7 +244,7 @@ def main():
               "royalty" in p.stdout and "1.000%" in p.stdout)
 
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", mh[:16], "--approve"],
+                 "--hash", mh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         mm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-mint approve run exits 0",
@@ -296,7 +296,7 @@ def main():
               "SELL offer" in p.stdout)
 
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", oh[:16], "--approve"],
+                 "--hash", oh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         om = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-list approve run exits 0",
@@ -350,7 +350,7 @@ def main():
         bh = bm.group(1)
         bal_b = balance_xrp(addr_b)
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", bh[:16], "--approve"],
+                 "--hash", bh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_b}, timeout=180)
         buy_m = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-buy approve run exits 0",
@@ -404,7 +404,7 @@ def main():
                                       policy_sha256=C._sha256_file(
                                           C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", mh2[:16], "--approve"],
+                 "--hash", mh2, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         mm2 = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("second nft-mint validated",
@@ -447,7 +447,7 @@ def main():
             print(p.stdout[-2000:]); print(p.stderr[-2000:])
             return 1
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", dm.group(1)[:16], "--approve"],
+                 "--hash", dm.group(1), "--approve"],
                 home, extra_env={"XRPL_SEED": seed_b}, timeout=180)
         check("nft-bid validated tesSUCCESS",
               p.returncode == 0 and "validated: True" in p.stdout
@@ -479,7 +479,7 @@ def main():
                                     policy_sha256=C._sha256_file(
                                         C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", eh[:16], "--approve"],
+                 "--hash", eh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a})
         check("over-cap royalty denied even with --approve",
               p.returncode != 0 and ("DENIED" in p.stdout
@@ -495,7 +495,7 @@ def main():
                                     policy_sha256=C._sha256_file(
                                         C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", eh2[:16], "--approve"],
+                 "--hash", eh2, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a})
         check("IOU-denominated listing denied even with --approve",
               p.returncode != 0 and ("DENIED" in p.stdout
@@ -561,7 +561,7 @@ def main():
                                     policy_sha256=C._sha256_file(
                                         C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", eh[:16], "--approve"],
+                 "--hash", eh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a})
         check("AccountSet denied even with --approve",
               p.returncode != 0 and ("DENIED" in p.stdout

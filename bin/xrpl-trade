@@ -796,7 +796,7 @@ def cmd_nft_stage(args, cfg, client):
                         account=acct, network=network)
     print("STAGED - nothing has left this machine (zero network calls).")
     print(f"  stage id: {rec['stage_id']}")
-    print(f"  stage digest: {rec['stage_digest']}... "
+    print(f"  stage digest: {rec['stage_digest']} "
           f"(full digest is bound into the pin approval)")
     print(f"  file:     {C.safe_terminal_text(rec['source_path'])}")
     print(f"  sha256:   {rec['sha256']}")
@@ -808,7 +808,8 @@ def cmd_nft_stage(args, cfg, client):
           f"(immutable after mint - verify it)")
     print(f"  taxon:    {rec['taxon']}")
     print(f"\nReview the above, then run:")
-    print(f"  xrpl-trade nft-pin-and-propose --stage {rec['stage_id']}")
+    print(f"  xrpl-trade nft-pin-and-propose --stage {rec['stage_id']} "
+          f"--approve-stage {rec['stage_digest']}")
     print("That step re-verifies the digest, pins to IPFS (external "
           "write), and proposes the mint.")
 

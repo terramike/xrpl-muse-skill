@@ -743,7 +743,7 @@ def cmd_sign(args):
                if giveaway_mode else C.SpentTracker())
 
     C.check_protected_files(extra=(tracker.state_path, tracker.lock_path,
-        tracker.state_path.with_suffix(tracker.state_path.suffix + ".initialized")))
+        tracker.state_path.with_suffix(".initialized")))
 
     # proposal TTL (created_at is hash-bound)
     age = int(time.time()) - prop["created_at"]
@@ -958,9 +958,10 @@ def cmd_recover_state(args):
                 raise ValueError("Expected entries array")
             entries = [tracker._validate_entry(e) for e in replacement["entries"]]
             try:
-                previous = json.loads(original)
-                prior = previous.get("entries", []) if isinstance(previous, dict) else []
-            except ValueError:
+                prior = tracker._load()["entries"]
+            except C.StateCorruptError:
+                # Only a malformed original can be reconstructed by an
+                # independently approved replacement. Keep the raw backup.
                 prior = []
             # Never silently discard any recoverable recent/pending obligation.
             for e in prior:

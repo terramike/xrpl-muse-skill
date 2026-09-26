@@ -23,7 +23,7 @@ for _k in ("no_proxy", "NO_PROXY"):
         os.environ[_k] = ",".join(p for p in _v.split(",") if "[" not in p)
 
 SKILL_BIN = Path(__file__).resolve().parent.parent / "bin"
-PYP = str(Path.home() / "workspace" / "tools" / "xrpl-pkgs")
+PYP = str(SKILL_BIN)
 TESTNET_RPC = "https://s.altnet.rippletest.net:51234"
 
 CHECKS = []
@@ -139,7 +139,7 @@ def main():
         mtxd.pop("TxnSignature", None)
         mh, mpath = C.save_proposal(mtxd, "testnet", addr_a, "nft-mint")
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", mh[:16], "--approve"],
+                 "--hash", mh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         mm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("mint validated tesSUCCESS",
@@ -202,7 +202,7 @@ def main():
 
         print("== approve: transfer offer lands on ledger ==")
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", sh[:16], "--approve"],
+                 "--hash", sh, "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         tm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-send validated tesSUCCESS",
@@ -242,7 +242,7 @@ def main():
             print(p.stdout[-2000:]); print(p.stderr[-2000:])
             return 1
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", bm.group(1)[:16], "--approve"],
+                 "--hash", bm.group(1), "--approve"],
                 home, extra_env={"XRPL_SEED": seed_b}, timeout=180)
         buy_m = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("accept validated tesSUCCESS",
