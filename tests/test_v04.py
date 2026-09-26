@@ -145,13 +145,18 @@ with tempfile.TemporaryDirectory() as td:
                      "TakerGets": q("75.200000")}]
 
         def request(self, req):
-            from xrpl.models.requests import BookOffers, AccountInfo
+            from xrpl.models.requests import BookOffers, AccountInfo, Ledger
+            if isinstance(req, Ledger):
+                # P1-5: the signer pins one validated ledger first.
+                return FakeResp({"ledger_index": 100, "validated": True})
             if isinstance(req, BookOffers):
                 self.calls += 1
                 if self.book_error:
                     raise RuntimeError("node down")
                 side = "asks" if self.calls % 2 == 1 else "bids"
-                return FakeResp({"offers": self._book(side)})
+                # P1-5: the server echoes the pinned ledger index.
+                return FakeResp({"offers": self._book(side),
+                                 "ledger_index": 100})
             if isinstance(req, AccountInfo):
                 if self.tag_error:
                     raise RuntimeError("node down")
@@ -175,14 +180,18 @@ with tempfile.TemporaryDirectory() as td:
             if isinstance(req, Ledger):
                 if self.raise_ledger:
                     raise RuntimeError("node down")
-                return FakeResp({"ledger_index": self.ledger_index})
+                # P1-3: complete_ledgers proves non-inclusion over a range.
+                return FakeResp({"ledger_index": self.ledger_index,
+                                 "complete_ledgers": "0-2000"})
             if isinstance(req, Tx):
                 if self.raise_tx:
                     raise RuntimeError("node down")
                 if not self.tx_found:
                     return FakeResp({"error": "txnNotFound"}, ok=False)
+                # P1-3: only a VALIDATED result settles the reservation.
                 return FakeResp(
-                    {"meta": {"TransactionResult": self.tx_result}})
+                    {"validated": True,
+                     "meta": {"TransactionResult": self.tx_result}})
             raise AssertionError(f"unexpected request {req!r}")
 
     def xrp(drops):
@@ -198,7 +207,13 @@ with tempfile.TemporaryDirectory() as td:
                 "Fee": "12", "Sequence": seq, "LastLedgerSequence": 999}
 
     def prop_of(tx, network="testnet", action="buy"):
-        h, path = C.save_proposal(tx, network, ACCT, action)
+        # P1-1: bind the adhoc-testnet profile + current policy digest,
+        # mirroring what resolve_proposal_profile returns for testnet.
+        # (The test must not depend on the operator's real profiles file.)
+        pdigest = C._sha256_file(C.POLICY_PATH)
+        h, path = C.save_proposal(tx, network, ACCT, action,
+                                  profile="adhoc-testnet",
+                                  policy_sha256=pdigest)
         return json.loads(path.read_text()), path, h
 
     def policy_denials(tx, network="testnet", client=None, action="buy"):
@@ -363,6 +378,8 @@ with tempfile.TemporaryDirectory() as td:
                 "account": ACCT, "action": "send",
                 "created_at": int(time.time()),
                 "policy_version": C.POLICY_VERSION,
+                "profile": "adhoc-testnet",
+                "policy_sha256": "00" * 32,
                 "tx": nan_pay, "tx_binary": "00"}
     core = {k: evil_env[k] for k in C.ENVELOPE_HASH_KEYS}
     evil_env["proposal_hash"] = C.canonical_hash(core)
@@ -575,7 +592,7 @@ with tempfile.TemporaryDirectory() as td:
     tracker = C.SpentTracker()
     denials, rid = tracker.try_reserve({"XRP": Decimal("1")}, cpol)
     check("reservation created", denials == [] and rid)
-    tracker.bind_reservation(rid, "AA" * 32, 999)
+    tracker.bind_reservation(rid, "AA" * 32, 999, submit_ledger=900)
     # node down during sweep -> stays pending (fail closed, never released)
     tracker.sweep_pending(FakeSweep(ledger_index=2000, raise_tx=True))
     st = json.loads(C.STATE_PATH.read_text())

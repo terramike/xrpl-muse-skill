@@ -121,8 +121,6 @@ class FakeClient:
         if isinstance(req, AccountNFTs):
             i = int(req.marker) if getattr(req, "marker", None) else 0
             page = self.nft_pages[i] if i < len(self.nft_pages) else []
-            # Real nodes confirm validated: true; the v0.6.0 item-2 check
-            # refuses anything less.
             res = {"account_nfts": page, "validated": True}
             if i + 1 < len(self.nft_pages):
                 res["marker"] = str(i + 1)
@@ -332,19 +330,19 @@ os.environ.pop(C.GIVEAWAY_SEED_ENV, None)
 os.environ.pop("XRPL_SEED", None)
 try:
     check("signer falls back to giveaway.json seed",
-          S.load_seed(C.GIVEAWAY_SEED_ENV) == SEED_WALLET.seed)
+          S.load_seed(("env", C.GIVEAWAY_SEED_ENV)) == SEED_WALLET.seed)
     os.environ[C.GIVEAWAY_SEED_ENV] = "sEd111ENVSEED"
     check("env wins over the file",
-          S.load_seed(C.GIVEAWAY_SEED_ENV) == "sEd111ENVSEED")
+          S.load_seed(("env", C.GIVEAWAY_SEED_ENV)) == "sEd111ENVSEED")
     del os.environ[C.GIVEAWAY_SEED_ENV]
     fresh()
     try:
-        S.load_seed(C.GIVEAWAY_SEED_ENV)
+        S.load_seed(("env", C.GIVEAWAY_SEED_ENV))
         check("missing seed exits", False)
     except SystemExit as e:
-        check("missing seed exits", "giveaway setup" in str(e))
+        check("missing seed exits", "vault" in str(e).lower())
     try:
-        S.load_seed("XRPL_SEED")
+        S.load_seed(("env", "XRPL_SEED"))
         check("main seed still env-only", False)
     except SystemExit as e:
         check("main seed still env-only", "XRPL_SEED" in str(e))

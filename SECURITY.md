@@ -18,13 +18,14 @@ do not use it for trading.** Update to `c3273e59` or later, rebuild the
 proposal, review the signer's derived ceremony output, and confirm the
 validated ledger result before relying on it.
 
-## Safety model (v0.5)
+## Safety model (v0.7)
 
 The skill is split into a proposer (`xrpl-trade`, never sees the seed) and a
 policy-gated signer (`xrpl-sign`, the only program that touches the seed).
-Every write is a hash-bound proposal envelope: the approval hash covers the
-network, account, action, creation time, policy version, and the canonical
-XRPL binary of the complete transaction. The signer re-verifies the envelope,
+Every write is a hash-bound proposal envelope (v4): the approval hash covers
+the network, account, action, creation time, policy version, bound signing
+profile, policy SHA-256 digest, and the canonical XRPL binary of the complete
+transaction. The signer re-verifies the envelope,
 derives the summary from the transaction itself (nothing stored is trusted),
 and enforces:
 

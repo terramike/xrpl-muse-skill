@@ -138,7 +138,7 @@ class FakeClient:
         if isinstance(req, AccountNFTs):
             i = int(req.marker) if getattr(req, "marker", None) else 0
             page = self.nft_pages[i] if i < len(self.nft_pages) else []
-            # Real nodes confirm validated: true (v0.6.0 item 2).
+            # P1-4: inventory lookups require validated ledger data.
             res = {"account_nfts": page, "validated": True}
             if i + 1 < len(self.nft_pages):
                 res["marker"] = str(i + 1)

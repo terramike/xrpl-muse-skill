@@ -41,6 +41,7 @@ nft-list proposes an XRP-denominated sell offer.
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import sys
@@ -178,11 +179,12 @@ def donation_wallet_owns_nft(client, wallet, token_id):
 
 def build_offer_tx(account, base, base_issuer, quote, quote_issuer,
                   amount: Decimal, price: Decimal, side: str, expires_in: int):
-    """side=buy: TakerPays=BASE received, TakerGets=QUOTE paid.
-    side=sell: TakerPays=QUOTE received, TakerGets=BASE sold."""
+    """side=buy: BUY base, SELL quote (TakerPays=base amount, TakerGets=quote cost).
+    side=sell: SELL base, BUY quote (TakerPays=quote proceeds, TakerGets=base amount).
+    (XRPL: TakerPays is the currency the offer creator BUYS; TakerGets is what they SELL.)"""
     if side == "buy":
-        taker_pays = make_amount(base, base_issuer, amount)
         cost = (amount * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        taker_pays = make_amount(base, base_issuer, amount)
         taker_gets = make_amount(quote, quote_issuer, cost)
     elif side == "sell":
         proceeds = (amount * price).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
@@ -224,7 +226,13 @@ def propose(tx, client, cfg, action, summary_lines):
         exp = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                             time.gmtime(txd["Expiration"] + C.RIPPLE_EPOCH))
         lines.append(f"expires:  {exp}")
-    h, _ = C.save_proposal(txd, cfg["network"], txd["Account"], action)
+    # P1-1 approval binding: the proposal is bound to the signing profile
+    # (account+network+credential+policy+state) and the exact policy digest
+    # the human reviews against. The signer rejects cross-profile use.
+    prof_name, _prof, _ppath, pdigest = C.resolve_proposal_profile(
+        cfg["network"], txd["Account"], action)
+    h, _ = C.save_proposal(txd, cfg["network"], txd["Account"], action,
+                           profile=prof_name, policy_sha256=pdigest)
     print("=" * 60)
     print("PROPOSAL — review carefully. Nothing has been submitted.")
     print("=" * 60)
@@ -233,10 +241,11 @@ def propose(tx, client, cfg, action, summary_lines):
     print("=" * 60)
     print(f"proposal hash: {h}")
     print(f"\nA HUMAN must review the hash above, then run:")
+    print(f"  bound profile: {prof_name} (policy sha256 {pdigest[:16]}…)")
     if action == C.GIFT_ACTION:
         # Donation-wallet gifts sign under the giveaway policy with the
         # giveaway seed — never the main wallet's key or policy.
-        print(f"  {C.giveaway_sign_command(h)}")
+        print(f"  {C.giveaway_sign_command(h, prof_name)}")
         if C.GIVEAWAY_POLICY_PATH.exists():
             print(f"\nGiveaway policy: {C.GIVEAWAY_POLICY_PATH}")
         else:
@@ -244,7 +253,10 @@ def propose(tx, client, cfg, action, summary_lines):
                   "(missing — run `giveaway setup` first)")
         print(f"Seed: {C.GIVEAWAY_SEED_ENV} (vault-injected) or `giveaway setup`")
     else:
-        print(f"  xrpl-sign --hash {h} --approve")
+        if prof_name == "adhoc-testnet":
+            print(f"  xrpl-sign --hash {h} --approve")
+        else:
+            print(f"  xrpl-sign --profile {prof_name} --hash {h} --approve")
     print(f"\nFull autofilled transaction saved to:\n"
           f"  {C.PROPOSALS_DIR / (h + '.json')}")
     return h
@@ -280,6 +292,21 @@ def amt_value(a):
     if isinstance(a, dict):
         return Decimal(a["value"]), C.display_currency(a["currency"])
     return Decimal(drops_to_xrp(a)), "XRP"
+
+
+def funded_amt(offer, field):
+    """P1-5: the funded quantity of a book level. Prefers the funded field
+    (taker_gets_funded/taker_pays_funded) when present; a present-but-zero
+    funded value means no real liquidity (never falls back to nominal).
+    Returns (Decimal, currency-display)."""
+    funded_key = {"TakerGets": "taker_gets_funded",
+                  "TakerPays": "taker_pays_funded"}[field]
+    if funded_key in offer:
+        f = offer[funded_key]
+        if isinstance(f, dict):
+            return Decimal(f["value"]), C.display_currency(f["currency"])
+        return Decimal(drops_to_xrp(f)), "XRP"
+    return amt_value(offer[field])
 
 
 def cmd_quote(args, cfg, client):
@@ -362,13 +389,16 @@ def cmd_plan_trade(args, cfg, client):
         get_f, pay_f = "TakerPays", "TakerGets"
     if not book:
         sys.exit("Empty book — no liquidity.")
-    best_q, best_b = amt_value(book[0][pay_f]), amt_value(book[0][get_f])
+    # P1-5: preview on FUNDED amounts, like the signer's guard.
+    best_q, best_b = funded_amt(book[0], pay_f), funded_amt(book[0], get_f)
     mid = best_q[0] / best_b[0]
     dev = (price - mid) / mid * 100
     # walk depth at-or-better than our limit
     filled_base = Decimal(0); spent_quote = Decimal(0)
     for o in book:
-        qv, _ = amt_value(o[pay_f]); bv, _ = amt_value(o[get_f])
+        qv, _ = funded_amt(o, pay_f); bv, _ = funded_amt(o, get_f)
+        if bv == 0:
+            continue  # unfunded level: no real liquidity
         px = qv / bv
         if (side == "buy" and px > price) or (side == "sell" and px < price):
             break
@@ -499,30 +529,71 @@ def cmd_send(args, cfg, client):
     propose(tx, client, cfg, "send", lines)
 
 
-# ---------- NFT mint: two-step pin flow (v0.6.0 item 5) ----------
+# ---------- NFT mint: two-step pin flow (v0.6.0 item 5; P1-4 digest-bound) ----------
 #
 # Pinning is an external write (and an exfiltration vector), so it must
 # never happen pre-consent inside a single command. Step 1 (nft-stage)
-# is fully local: validate + hash the artwork, build the metadata, write
-# a reviewable stage record - ZERO network calls. Step 2
-# (nft-pin-and-propose) is the explicitly-run, approval-gated step: the
-# human reviewed the stage record, then runs it to pin + propose.
+# is fully local: validate + hash the artwork, compute a STAGE DIGEST
+# binding the file bytes, the mint metadata, the minting account and
+# network, and the permitted media directory, then write a reviewable
+# stage record - ZERO network calls. Step 2 (nft-pin-and-propose) is the
+# explicitly-run, approval-gated step: it recomputes the digest from
+# CURRENT state and refuses ANY mismatch before contacting Pinata, then
+# uploads the EXACT bytes that were hashed (no file reopen - no TOCTOU).
+# The human's --approve of the proposal hash approves THAT digest.
 # PINATA_JWT is read from the environment only at pin time - never
 # stored, logged, or written into proposal files.
 
-STAGE_FORMAT = "nft-stage/1"
+STAGE_FORMAT = "nft-stage/2"
+
+# The exact mint flags every staged NFT is minted with. Bound into the
+# stage digest so a tampered stage record cannot change mint semantics.
+NFT_MINT_FLAGS = (int(NFTokenMintFlag.TF_TRANSFERABLE)
+                  | int(NFTokenMintFlag.TF_BURNABLE))
+
+
+def _compute_stage_digest(file_sha256, name, description, royalty_bps,
+                          taxon, mint_flags, account, network, source_path,
+                          media_dir):
+    """The stage digest: sha256 over canonical JSON binding the artwork
+    bytes, the full mint metadata, the mint flags, and the account +
+    network that will mint. Any change to any bound value — edited stage
+    record, swapped file, different minter or network — produces a
+    different digest, and the pin step refuses the mismatch."""
+    payload = {
+        "file_sha256": file_sha256,
+        "name": name,
+        "description": description,
+        "royalty_bps": int(royalty_bps),
+        "taxon": int(taxon),
+        "mint_flags": int(mint_flags),
+        "account": account,
+        "network": network,
+        "source_path": source_path,
+        "media_dir": media_dir,
+    }
+    canonical = json.dumps(payload, sort_keys=True,
+                           separators=(",", ":")).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
-                  media_dir=None):
+                  account=None, network="testnet"):
     """Validate artwork and write a stage record. Zero network calls.
 
-    Returns the stage record dict. The record binds the file's sha256 so
-    nft-pin-and-propose can prove the file is byte-identical before any
+    Returns the stage record dict. The record carries a stage digest
+    binding the file's bytes, the mint metadata, the minting account and
+    network, and the permitted media directory — nft-pin-and-propose
+    recomputes it from current state and refuses ANY mismatch before a
     byte leaves the machine. Raises SystemExit on any refusal.
+
+    Artwork must live inside the protected NFT media directory
+    (xrpl_pin.protected_media_dir()); anything outside is refused.
     """
     if xrpl_pin is None:
         sys.exit("xrpl_pin module missing - cannot stage.")
+    if not account:
+        sys.exit("an account is required to stage (the future minter)")
     royalty_bps = int(royalty_bps)
     if not 0 <= royalty_bps <= 5000:
         sys.exit("royalty must be 0..5000 bps (protocol max is 50%)")
@@ -531,7 +602,14 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
         sys.exit("taxon must fit in a uint32")
     if not name or not str(name).strip():
         sys.exit("NFT name is required")
-    _data, info = xrpl_pin.read_validated_source(file, media_dir=media_dir)
+    mdir = xrpl_pin.protected_media_dir()
+    data, info = xrpl_pin.read_validated_source(file, media_dir=mdir)
+    file_sha256 = hashlib.sha256(data).hexdigest()
+    if file_sha256 != info["sha256"]:
+        sys.exit("internal error: hash mismatch on validated bytes")
+    digest = _compute_stage_digest(
+        file_sha256, name, description, royalty_bps, taxon,
+        NFT_MINT_FLAGS, account, network, info["path"], info["media_dir"])
     created = int(time.time())
     sid = hashlib.sha256(
         f"{info['sha256']}:{created}:{name}".encode()).hexdigest()[:16]
@@ -551,8 +629,14 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
                      "image": None},
         "royalty_bps": royalty_bps,
         "taxon": taxon,
-        # Which media dir validated this file; the pin step re-validates
-        # against the same directory (plus the sha256 re-check).
+        # The full stage digest. The pin step recomputes it from CURRENT
+        # bytes + CURRENT record values + CURRENT account/network and
+        # refuses any mismatch — the stage record is NOT trusted.
+        "stage_digest": digest,
+        "account": account,
+        "network": network,
+        # Informational only: the pin step re-resolves the protected
+        # media dir itself and ignores this field.
         "media_dir": info["media_dir"],
     }
     C.STAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -576,11 +660,20 @@ def load_stage_record(stage_id):
     except (ValueError, OSError) as e:
         sys.exit(f"Stage record unreadable: {e}")
     if not isinstance(rec, dict) or rec.get("format") != STAGE_FORMAT:
-        sys.exit("Stage record has an unsupported format - re-run nft-stage.")
+        sys.exit("Stage record has an unsupported format - re-run nft-stage "
+                 "(old stage records predate the digest binding and are "
+                 "not accepted).")
     for key in ("stage_id", "source_path", "sha256", "bytes", "mime",
-                "name", "description", "metadata", "royalty_bps", "taxon"):
+                "name", "description", "metadata", "royalty_bps", "taxon",
+                "stage_digest", "account", "network"):
         if key not in rec:
             sys.exit(f"Stage record is missing {key!r} - re-run nft-stage.")
+    if (not isinstance(rec["stage_digest"], str)
+            or len(rec["stage_digest"]) != 64
+            or any(c not in "0123456789abcdef"
+                   for c in rec["stage_digest"])):
+        sys.exit("Stage record has a malformed stage digest - re-run "
+                 "nft-stage.")
     meta = rec["metadata"]
     if (not isinstance(meta, dict)
             or set(meta) != {"name", "description", "image"}
@@ -595,29 +688,67 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
     """Pin the staged artwork + metadata, then propose the NFTokenMint.
 
     The approval-gated step: the human reviewed the stage record and ran
-    this command deliberately. Prints exactly what is about to leave the
-    machine before pinning. Returns the proposal hash.
+    this command deliberately. Before ANY byte leaves the machine, the
+    stage digest is recomputed from the CURRENT file bytes, the CURRENT
+    stage-record values, and the CURRENT account/network, and compared
+    against the digest recorded at staging time. ANY mismatch — edited
+    metadata, swapped file, changed path, different minter or network —
+    refuses without contacting Pinata. The upload then sends the EXACT
+    bytes that were hashed (no file reopen between hash and upload).
+
+    Prints the full stage digest as part of the approval ceremony: the
+    human's --approve of the proposal hash approves THAT digest.
+    Returns the proposal hash.
     """
     if xrpl_pin is None:
         sys.exit("xrpl_pin module missing - cannot pin.")
     pinner = pinner or xrpl_pin
     rec = load_stage_record(stage_id)
-    # Re-validate against the same media dir: the file must be
-    # byte-identical to what was staged.
-    _data, info = pinner.read_validated_source(
-        rec["source_path"], media_dir=rec.get("media_dir"))
-    if info["sha256"] != rec["sha256"]:
+    # The permitted media directory comes from protected configuration —
+    # the stage record's media_dir field is informational only and is
+    # NOT trusted here.
+    mdir = xrpl_pin.protected_media_dir()
+    # Read the artwork ONCE: these are the bytes we hash AND upload.
+    data, info = pinner.read_validated_source(
+        rec["source_path"], media_dir=mdir)
+    file_sha256 = hashlib.sha256(data).hexdigest()
+    if file_sha256 != rec["sha256"]:
         sys.exit("refusing: the artwork file changed since staging "
                  "(hash mismatch) - re-run `xrpl-trade nft-stage`.")
-    name = rec["name"]
     acct = need_account(cfg)
+    network = cfg.get("network", "testnet")
+    # Recompute the digest from CURRENT state. The stage record is not
+    # trusted: any edit to its metadata (or a swapped file, path, minter,
+    # or network) fails this check before Pinata is contacted.
+    recomputed = _compute_stage_digest(
+        file_sha256, rec["name"], rec["description"],
+        rec["royalty_bps"], rec["taxon"], NFT_MINT_FLAGS,
+        acct, network, info["path"], info["media_dir"])
+    if not hmac.compare_digest(recomputed, rec["stage_digest"]):
+        sys.exit(
+            "refusing: the stage digest does not match what was recorded "
+            "at staging time.\n"
+            "Something changed after staging: the stage record's metadata "
+            "(name, description, royalty, taxon), the artwork file, its "
+            "path, the minting account, or the network.\n"
+            f"  staged digest:    {rec['stage_digest']}\n"
+            f"  recomputed now:   {recomputed}\n"
+            "Re-run `xrpl-trade nft-stage` and review the new record "
+            "before approving. Pinata was NOT contacted.")
+    name = rec["name"]
     print("pinning to IPFS via Pinata (external write):")
+    print(f"  stage digest: {rec['stage_digest']}")
+    print(f"    ^ the human approval below covers THIS digest. If it does")
+    print(f"      not match the digest shown at staging time, STOP.")
     print(f"  file:      {C.safe_terminal_text(info['path'])}")
-    print(f"  sha256:    {info['sha256'][:16]}...")
+    print(f"  sha256:    {file_sha256}")
     print(f"  size/mime: {info['bytes']} bytes, {info['mime']}")
     print(f"  name:      {C.safe_terminal_text(name, 120)}")
-    image_cid = pinner.pin_file(info["path"],
-                                media_dir=rec.get("media_dir"))
+    print(f"  account:   {acct}")
+    print(f"  network:   {network}")
+    # TOCTOU-safe: upload the exact bytes that were hashed above. The
+    # file is never reopened between the hash check and the upload.
+    image_cid = pinner.pin_data(data, os.path.basename(info["path"]))
     meta = dict(rec["metadata"])
     meta["image"] = f"ipfs://{image_cid}"
     metadata_cid = pinner.pin_json(meta, name=f"{name}-metadata.json")
@@ -632,11 +763,13 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
         nftoken_taxon=int(rec["taxon"]),
         uri=uri_hex,
         transfer_fee=transfer_fee,
-        flags=int(NFTokenMintFlag.TF_TRANSFERABLE)
-        | int(NFTokenMintFlag.TF_BURNABLE),
+        flags=NFT_MINT_FLAGS,
     )
     return propose(tx, client, cfg, "nft-mint",
-                   [f"nft:      {C.safe_terminal_text(name, 120)}",
+                   [f"stage digest: {rec['stage_digest']}",
+                    "  ^ approving the proposal hash below approves the "
+                    "mint of EXACTLY this staged artwork + metadata",
+                    f"nft:      {C.safe_terminal_text(name, 120)}",
                     f"image:    ipfs://{image_cid}",
                     f"metadata: {uri}",
                     f"royalty:  {int(rec['royalty_bps']) / 100:.2f}% "
@@ -649,20 +782,28 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
 
 def cmd_nft_stage(args, cfg, client):
     """Step 1: validate + hash artwork locally, write a stage record."""
+    acct = need_account(cfg)
+    network = cfg.get("network", "testnet")
     rec = stage_artwork(args.file, args.name, args.description or "",
-                        args.royalty_bps, args.taxon)
+                        args.royalty_bps, args.taxon,
+                        account=acct, network=network)
     print("STAGED - nothing has left this machine (zero network calls).")
     print(f"  stage id: {rec['stage_id']}")
+    print(f"  stage digest: {rec['stage_digest'][:16]}... "
+          f"(full digest is bound into the pin approval)")
     print(f"  file:     {C.safe_terminal_text(rec['source_path'])}")
     print(f"  sha256:   {rec['sha256']}")
     print(f"  size:     {rec['bytes']} bytes ({rec['mime']})")
     print(f"  name:     {C.safe_terminal_text(rec['name'], 120)}")
+    print(f"  account:  {rec['account']} (the minter)")
+    print(f"  network:  {rec['network']}")
     print(f"  royalty:  {rec['royalty_bps'] / 100:.2f}% "
           f"(immutable after mint - verify it)")
     print(f"  taxon:    {rec['taxon']}")
     print(f"\nReview the above, then run:")
     print(f"  xrpl-trade nft-pin-and-propose --stage {rec['stage_id']}")
-    print("That step pins to IPFS (external write) and proposes the mint.")
+    print("That step re-verifies the digest, pins to IPFS (external "
+          "write), and proposes the mint.")
 
 
 def cmd_nft_pin_and_propose(args, cfg, client):
@@ -717,15 +858,9 @@ def provisional_spend_check(spends):
         print("  note: policy version mismatch — spend limits enforced by "
               "xrpl-sign")
         return
-    try:
-        pol = C.validate_policy({**C.DEFAULT_POLICY, **pol})
-    except C.PolicyError:
-        # Best-effort stays best-effort: never do limit math on a
-        # schema-violating policy. The signer validates strictly and
-        # will refuse — say so now, cleanly.
-        print("  note: policy file fails schema validation — spend limits "
-              "enforced by xrpl-sign (it will refuse)")
-        return
+    # Best-effort: merge over defaults. The signer validates the schema
+    # strictly and will refuse a violating policy — say so now, cleanly.
+    pol = {**C.DEFAULT_POLICY, **pol}
     try:
         denials = C.SpentTracker().check(spends, pol)
     except C.StateCorruptError as e:
@@ -1320,32 +1455,52 @@ def generate_wallet_into_config(network, force=False):
 
 
 def cmd_wallet(args, cfg):
-    """Local-only wallet management: create + one-time backup display."""
+    """Wallet management: vault-flow create for mainnet, local for testnet."""
     if args.wallet_cmd == "create":
         network = args.network or (cfg or {}).get("network", "testnet")
         if network not in C.NETWORKS:
             sys.exit(f"unknown network {network!r}")
+        if network == "mainnet":
+            # P1-2 vault-only mainnet: the CLI never generates, displays,
+            # or stores a mainnet seed. Secret material in stdout/stderr
+            # lands in transcripts and logs — the audit requires
+            # secret-free output on mainnet wallet flows. Generate the
+            # wallet in your password manager (the vault) or with Xaman,
+            # then bind it with a signing profile (credential kind 'env').
+            sys.exit(
+                "refusing: mainnet wallets are vault-only — generate the "
+                "wallet in your password manager (or Xaman), store the seed "
+                "there, then run `xrpl-sign init-profiles` to bind the "
+                "account with credential kind 'env'. This tool never creates "
+                "or displays mainnet seed material.")
         if args.force:
             print("WARNING: --force replaces the stored seed. The old wallet is")
             print("no longer controlled by this machine — if its seed was ever")
             print("exposed, move any funds first.\n")
         address = generate_wallet_into_config(network, force=args.force)
-        print("New wallet generated locally (ed25519).")
+        print("New TESTNET wallet generated locally (ed25519).")
         print(f"  address: {address}")
         print(f"  network: {network}")
         print("  seed: stored in ~/.xrpl/config.json (0600) — never displayed,")
         print("        never logged, never leaves this machine via this tool.")
+        print("        (Local seed storage is TESTNET-ONLY. Mainnet wallets")
+        print("         use the vault flow: `wallet create --network mainnet`.)")
         print()
         print("Back it up ONCE, right now (write it on paper, offline):")
-        print("  xrpl-trade wallet backup")
+        print("  xrpl-trade wallet backup --network testnet")
         print()
-        print("This wallet is NOT funded. To activate on mainnet, send at")
-        print(f"least 1 XRP to {address} (base reserve).")
         print("On testnet:  xrpl-trade faucet --network testnet")
     elif args.wallet_cmd == "backup":
+        network = args.network or (cfg or {}).get("network", "testnet")
+        if network == "mainnet":
+            # P1-2: mainnet seeds are vault-only; they are never in local
+            # files, so there is nothing to back up — and printing one
+            # would put it in capturable output.
+            sys.exit("refusing: mainnet wallets are vault-only — the seed "
+                     "lives in your password manager, not in local files. "
+                     "There is nothing to back up from disk.")
         seed = (cfg or {}).get("seed")
         address = (cfg or {}).get("address")
-        network = (cfg or {}).get("network", "mainnet")
         if not seed:
             sys.exit("no seed stored in ~/.xrpl/config.json — nothing to back "
                      "up (create one with `xrpl-trade wallet create`)")
@@ -1363,6 +1518,35 @@ def cmd_wallet(args, cfg):
         print("your own terminal instead.")
         C.audit("wallet_backup", None, None, network, address, "displayed",
                 note="seed shown once for write-down; seed never in the log")
+    elif args.wallet_cmd == "forget-seed":
+        # P1-2 migration: remove a legacy seed from a local file AFTER the
+        # operator confirms it is vault-backed. Never silent, never forced.
+        target = args.path or str(C.CONFIG_PATH)
+        try:
+            data = json.loads(open(target).read())
+        except (OSError, json.JSONDecodeError):
+            sys.exit(f"cannot read {target}")
+        if not data.get("seed"):
+            print(f"no seed in {target} — nothing to do.")
+            return
+        print(f"{target} holds a seed for address {data.get('address')}.")
+        print("This is the vault-only migration: the seed must ALREADY be")
+        print("stored in your password manager before removal.")
+        ans = input("Confirm the seed is vault-backed and REMOVE it from disk? "
+                    "(type the address to confirm): ").strip()
+        if ans != str(data.get("address")):
+            sys.exit("confirmation did not match — seed NOT removed.")
+        data.pop("seed", None)
+        tmp = target + ".tmp"
+        open(tmp, "w").write(json.dumps(data, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        print(f"seed removed from {target}. Mainnet signing is now unblocked")
+        print("(via --profile with vault injection).")
+        C.audit("wallet_forget_seed", None, None,
+                data.get("network", "?"), data.get("address"),
+                "seed-removed-from-disk",
+                note="operator-confirmed vault backup before removal")
     else:
         sys.exit(f"unknown wallet subcommand {args.wallet_cmd!r}")
 
@@ -1390,8 +1574,15 @@ def cmd_setup(_args):
     cfg = {}
     if C.CONFIG_PATH.exists():
         cfg = json.loads(C.CONFIG_PATH.read_text())
+    if cfg.get("seed"):
+        # P1-2: NEVER silently delete key material. The operator must
+        # migrate it to the vault first (wallet forget-seed), with an
+        # explicit confirmation — a watch-only switch must not destroy
+        # the only copy of a seed.
+        sys.exit(f"refusing: {C.CONFIG_PATH} already holds a seed. "
+                 f"Migrate it to your vault first with "
+                 f"`xrpl-trade wallet forget-seed`, then re-run setup.")
     cfg.update({"network": net, "address": address})
-    cfg.pop("seed", None)  # watch-only path: no seed is kept here
     tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     os.chmod(tmp, 0o600)
@@ -1834,6 +2025,12 @@ def main():
                     help="replace an already-stored seed")
     w.add_parser("backup",
                  help="ONE-TIME display of the stored seed — write it down")
+    wf = w.add_parser("forget-seed",
+                      help="vault migration: remove a legacy seed from a local "
+                           "file after operator-confirmed vault backup")
+    wf.add_argument("--path", default=None,
+                    help="file to strip the seed from "
+                         "(default ~/.xrpl/config.json)")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
     p = sub.add_parser("quote", help="order book for any pair")

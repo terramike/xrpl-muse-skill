@@ -68,12 +68,18 @@ TESTNET_RPC = "https://s.altnet.rippletest.net:51234"
 
 
 def balance_xrp(addr):
-    r = httpx.post(TESTNET_RPC,
-                   json={"method": "account_info",
-                         "params": [{"account": addr,
-                                     "ledger_index": "validated"}]},
-                   timeout=30.0).json()
-    return int(r["result"]["account_data"]["Balance"]) / 1_000_000
+    # Faucet funding can take a few ledgers to validate; retry briefly.
+    for _ in range(12):
+        r = httpx.post(TESTNET_RPC,
+                       json={"method": "account_info",
+                             "params": [{"account": addr,
+                                         "ledger_index": "validated"}]},
+                       timeout=30.0).json()
+        ad = r.get("result", {}).get("account_data")
+        if ad:
+            return int(ad["Balance"]) / 1_000_000
+        time.sleep(5)
+    raise AssertionError(f"account {addr} has no validated account_data: {r}")
 
 
 def main():
@@ -149,7 +155,7 @@ def main():
         print("== approve + sign + submit ==")
         bal_before = balance_xrp(addr_b)
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", h, "--approve"],
+                 "--hash", h[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         tm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("approve run exits 0", p.returncode == 0)
@@ -195,6 +201,7 @@ def main():
         import xrpl_common as C
         # point the module at the isolated dir (it read HOME at import)
         C.XRPL_DIR = xrpl
+        C.POLICY_PATH = xrpl / "policy.json"
         C.PROPOSALS_DIR = xrpl / "proposals"
         C.FAVORITES_PATH = xrpl / "favorites.json"
         import asyncio
@@ -222,7 +229,11 @@ def main():
         mtxd = xrpl_autofill(mint, nclient).to_xrpl()
         mtxd.pop("SigningPubKey", None)
         mtxd.pop("TxnSignature", None)
-        mh, mpath = C.save_proposal(mtxd, "testnet", addr_a, "nft-mint")
+        # P1-1: bind the adhoc-testnet profile + policy digest.
+        _pd = C._sha256_file(C.POLICY_PATH)
+        mh, mpath = C.save_proposal(mtxd, "testnet", addr_a, "nft-mint",
+                                    profile="adhoc-testnet",
+                                    policy_sha256=_pd)
         check("nft-mint proposal saved", mpath.exists())
 
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
@@ -233,7 +244,7 @@ def main():
               "royalty" in p.stdout and "1.000%" in p.stdout)
 
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", mh, "--approve"],
+                 "--hash", mh[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         mm = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-mint approve run exits 0",
@@ -273,7 +284,10 @@ def main():
         otxd = xrpl_autofill(offer, nclient).to_xrpl()
         otxd.pop("SigningPubKey", None)
         otxd.pop("TxnSignature", None)
-        oh, opath = C.save_proposal(otxd, "testnet", addr_a, "nft-list")
+        # P1-1: bind the adhoc-testnet profile + policy digest.
+        oh, opath = C.save_proposal(otxd, "testnet", addr_a, "nft-list",
+                                    profile="adhoc-testnet",
+                                    policy_sha256=C._sha256_file(C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
                  "--hash", oh[:16]], home)
         check("nft-list policy PASS (no approval)",
@@ -282,7 +296,7 @@ def main():
               "SELL offer" in p.stdout)
 
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", oh, "--approve"],
+                 "--hash", oh[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         om = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-list approve run exits 0",
@@ -336,7 +350,7 @@ def main():
         bh = bm.group(1)
         bal_b = balance_xrp(addr_b)
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", bh, "--approve"],
+                 "--hash", bh[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_b}, timeout=180)
         buy_m = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("nft-buy approve run exits 0",
@@ -385,9 +399,12 @@ def main():
         m2txd = xrpl_autofill(mint2, nclient).to_xrpl()
         m2txd.pop("SigningPubKey", None)
         m2txd.pop("TxnSignature", None)
-        mh2, mpath2 = C.save_proposal(m2txd, "testnet", addr_a, "nft-mint")
+        mh2, mpath2 = C.save_proposal(m2txd, "testnet", addr_a, "nft-mint",
+                                      profile="adhoc-testnet",
+                                      policy_sha256=C._sha256_file(
+                                          C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", mh2, "--approve"],
+                 "--hash", mh2[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a}, timeout=180)
         mm2 = re.search(r"transactions/([0-9A-F]{64})", p.stdout)
         check("second nft-mint validated",
@@ -430,7 +447,7 @@ def main():
             print(p.stdout[-2000:]); print(p.stderr[-2000:])
             return 1
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", dm.group(1), "--approve"],
+                 "--hash", dm.group(1)[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_b}, timeout=180)
         check("nft-bid validated tesSUCCESS",
               p.returncode == 0 and "validated: True" in p.stdout
@@ -457,9 +474,12 @@ def main():
         print("== hostile NFT proposals denied ==")
         evil_mint = dict(mtxd)
         evil_mint["TransferFee"] = 50000  # over the 10% policy cap
-        eh, epath = C.save_proposal(evil_mint, "testnet", addr_a, "nft-mint")
+        eh, epath = C.save_proposal(evil_mint, "testnet", addr_a, "nft-mint",
+                                    profile="adhoc-testnet",
+                                    policy_sha256=C._sha256_file(
+                                        C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", eh, "--approve"],
+                 "--hash", eh[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a})
         check("over-cap royalty denied even with --approve",
               p.returncode != 0 and ("DENIED" in p.stdout
@@ -470,9 +490,12 @@ def main():
         evil_list["Amount"] = {"currency": "USD", "issuer": addr_b,
                                "value": "5"}
         eh2, epath2 = C.save_proposal(evil_list, "testnet", addr_a,
-                                      "nft-list")
+                                    "nft-list",
+                                    profile="adhoc-testnet",
+                                    policy_sha256=C._sha256_file(
+                                        C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", eh2, "--approve"],
+                 "--hash", eh2[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a})
         check("IOU-denominated listing denied even with --approve",
               p.returncode != 0 and ("DENIED" in p.stdout
@@ -533,9 +556,12 @@ def main():
         evil = {"TransactionType": "AccountSet", "Account": addr_a,
                 "Fee": "12", "Sequence": 1, "LastLedgerSequence": 999}
         # C is already imported and pointed at the isolated dir above
-        eh, epath = C.save_proposal(evil, "testnet", addr_a, "evil")
+        eh, epath = C.save_proposal(evil, "testnet", addr_a, "evil",
+                                    profile="adhoc-testnet",
+                                    policy_sha256=C._sha256_file(
+                                        C.POLICY_PATH))
         p = run([sys.executable, str(SKILL_BIN / "xrpl-sign"),
-                 "--hash", eh, "--approve"],
+                 "--hash", eh[:16], "--approve"],
                 home, extra_env={"XRPL_SEED": seed_a})
         check("AccountSet denied even with --approve",
               p.returncode != 0 and ("DENIED" in p.stdout

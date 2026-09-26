@@ -3,7 +3,7 @@
 Trade the XRP Ledger from the terminal — any token pair, with a hard safety
 boundary between proposing a trade and signing it.
 
-## Architecture: propose → approve → sign (v0.5)
+## Architecture: propose → approve → sign (v0.7)
 
 Two programs. The agent only ever runs the first.
 
@@ -13,22 +13,72 @@ Two programs. The agent only ever runs the first.
    a **hash-bound proposal envelope**. It **never sees the seed** and **never
    submits**.
 2. **`xrpl-sign` — the policy-gated signer.** The only program that touches the
-   seed (from the `XRPL_SEED` env var — never from a config file). It verifies
-   the proposal envelope, enforces `~/.xrpl/policy.json`, derives the summary
-   from the transaction itself, and signs **only** when a human passes
-   `--approve` for that exact hash.
+   seed. On mainnet it reads the seed from a **named signing profile**
+   (`~/.xrpl/profiles.json`, owner-only `0600`) that binds account + network +
+   credential reference + policy digest + spend-state selection; the seed
+   itself lives in the operator's vault (password manager) and is injected
+   for the single signing operation. `xrpl-sign` verifies the proposal
+   envelope, enforces the profile's policy, derives the summary from the
+   transaction itself, and signs **only** when a human passes
+   `--profile <name> --approve` for that exact hash.
+
+### Signing profiles (v0.7)
+
+A profile names the complete signing context so a proposal can't drift
+across accounts, networks, policies, or wallets:
+
+```json
+{
+  "schema_version": 1,
+  "profiles": {
+    "main": {
+      "account": "r9e34ga9YxYHYoCe7UtWWpuLjp4iKs3gkB",
+      "network": "mainnet",
+      "credential_env": "XRPL_SEED",
+      "policy_path": "/home/user/.xrpl/policy.json",
+      "policy_sha256": "2d3aa5d2b830a43c…",
+      "spend_state": "default"
+    }
+  }
+}
+```
+
+- `xrpl-trade` records `profile` + `policy_sha256` in every mainnet proposal.
+- `xrpl-sign --profile <name>` rejects proposals bound to another profile,
+  a changed policy (digest mismatch → rebuild the proposal), or a different
+  account/network — *before* touching the credential.
+- One profile = one spend-state file, so the main wallet and the giveaway
+  wallet can never share a budget.
+- Manage with `xrpl-sign init-profiles` / `xrpl-sign sync-profile <name>`.
+
+### Vault-only mainnet (v0.7)
+
+Mainnet never keeps a seed on disk and never prints one to a terminal:
+
+- `xrpl-trade wallet create --network mainnet` and `wallet backup --network
+  mainnet` are refused (creation/backup of mainnet keys happens in the
+  vault, outside this tool).
+- The signer refuses to run on mainnet if legacy seeds remain in
+  `~/.xrpl/config.json` or `~/.xrpl/giveaway.json` — migrate them first
+  (`wallet forget-seed` removes a disk seed only after you type the address
+  to confirm the vault backup).
+- Testnet keeps the convenient local flow (`wallet create` prints the seed
+  once; the faucet no longer does).
 
 ### The envelope (what the hash binds)
 
-A proposal is `format: xrpl-proposal/3` and the approval hash covers:
+A proposal is `format: xrpl-proposal/4` and the approval hash covers:
 
-- `network`, `account`, `action`, `created_at`, `policy_version`
+- `profile`, `policy_sha256`, `network`, `account`, `action`, `created_at`,
+  `policy_version`
 - the **canonical XRPL binary** of the complete transaction
   (`xrpl.core.binarycodec.encode`)
 
 The signer re-verifies all of it and rejects anything tampered with —
-including the envelope file itself. Old-format proposals are rejected;
-rebuild them with the current `xrpl-trade`.
+including the envelope file itself. A proposal whose policy digest no
+longer matches the profile's policy is rejected (rebuild it after reviewing
+the policy change). Old-format proposals are rejected; rebuild them with the
+current `xrpl-trade`.
 
 ### What the signer enforces
 
@@ -55,8 +105,16 @@ rebuild them with the current `xrpl-trade`.
   limit are **blocked** (fail closed).
 - **Ambiguity-safe reservations**: a reserved spend stays reserved (never
   double-spent, never released early) until the validated ledger result
-  proves what happened; proven non-inclusion releases it, validated success
-  confirms it.
+  proves what happened. Unresolved liabilities are retained regardless of
+  age — they never expire out of the rolling window. Proven non-inclusion
+  (the node's complete history covers the full
+  `[submit_ledger, LastLedgerSequence]` range) releases it; validated
+  success confirms it; a validated *failure* releases the trade amount but
+  retains the consumed fee as a confirmed XRP spend.
+- **Strict accounting state**: spend state with negative, non-finite, or
+  inconsistent entries fails closed (the signer refuses rather than silently
+  resetting limits); `xrpl-sign recover-state` reconciles a damaged file
+  without forgiving obligations.
 - **Offer safety**: `Expiration` required and bounded by
   `max_offer_lifetime_seconds`; limit price within `max_deviation_bps` of a
   depth-weighted book reference (up to 10 levels per side) that requires
@@ -76,7 +134,11 @@ rebuild them with the current `xrpl-trade`.
   and `LastLedgerSequence` → persist to the audit log → submit → wait for the
   validated result. A crash anywhere still leaves a reconciliation trail.
 - **Seed-address match**: the seed's derived address must equal the
-  proposal's account, or signing is refused.
+  transaction account's enabled master key or its validated on-ledger
+  `RegularKey`, or signing is refused. Disabled master keys are rejected.
+- **Offer liquidity on funded amounts**: the book reference uses
+  `taker_gets_funded`/`taker_pays_funded` (not nominal offer sizes), with
+  both sides read at one explicit validated ledger.
 
 Every signed transaction is appended to `~/.xrpl/audit.log`
 (hash, result, network — never secrets).
@@ -110,13 +172,14 @@ xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
 # → NOTHING is submitted.
 
 # A human reviews the exact hash, then:
-xrpl-sign --hash a2c72140d080ca0f --approve
-# → envelope verify → policy checks → sign → persist → submit_and_wait
-# → validated ledger result → audit log
+xrpl-sign --profile main --hash a2c72140d080ca0f --approve
+# → profile + envelope verify → policy checks → sign → persist →
+#   submit_and_wait → validated ledger result → audit log
 ```
 
 Without `--approve`, `xrpl-sign` only checks policy and prints the
-transaction-derived summary — it never signs.
+transaction-derived summary — it never signs. On mainnet `--profile`
+is mandatory and must match the profile the proposal was built for.
 
 ## Policy (`xrpl-sign init-policy` creates `~/.xrpl/policy.json`, v4)
 
@@ -526,31 +589,24 @@ The signer reads the seed **only** from `XRPL_SEED`, provided by your
 secret manager or the Muse vault after human approval. Fund a testnet
 wallet: `xrpl-trade faucet --network testnet`.
 
-## Wallets (v0.6.1): local generation, never displayed
+## Wallets (v0.7): vault-only mainnet, local testnet
 
-`setup` offers to generate a brand new wallet (default: no — silence is
-never consent). The ceremony:
+Mainnet keys are created and backed up in your vault (password manager),
+outside this tool — the CLI refuses to create or display mainnet seeds:
 
-```bash
-xrpl-trade wallet create        # fresh ed25519 wallet; seed → ~/.xrpl/config.json
-                                # (0600, atomic). Prints ONLY the address.
-xrpl-trade wallet backup        # ONE-TIME seed display — write it on paper, offline
-```
+- `wallet create --network mainnet` → refused (use the vault).
+- `wallet backup --network mainnet` → refused (the vault is the backup).
+- The signer refuses mainnet while legacy seeds remain on disk
+  (`wallet forget-seed` removes one only after you type the address to
+  confirm the vault backup exists).
 
-- The seed never appears in stdout, stderr, logs, proposals, or chat.
-  Only the classic address is ever printed. The audit log records
-  `wallet_create` / `wallet_backup` events without the seed.
-- `create` refuses to overwrite an existing seed without `--force`.
-- `backup` warns that a seed shown through a chat assistant lives in the
-  transcript — for maximum safety, run it in your own terminal.
-- A fresh wallet is NOT funded: send ≥1 XRP to activate on mainnet
-  (base reserve), or use the testnet faucet.
-- `faucet` follows the same rule: the testnet seed goes to a dedicated
-  `~/.xrpl/faucet-<address>.json` (0600) — it is never printed.
-
-Three profiles, safest last: Xaman generation (seed never touches this
-machine) → vault signer (`XRPL_SEED` injected at approval time, never
-stored here) → local signer (`wallet create`, seed on this machine 0600).
+Testnet keeps the convenient local flow: `wallet create` generates a fresh
+ed25519 wallet (seed to `~/.xrpl/config.json`, 0600, atomic) and prints
+only the address; the faucet writes its seed to a dedicated file, never to
+the terminal. `setup` offers generation (default: no — silence is never
+consent); `create` refuses to overwrite without `--force`. The audit log
+records `wallet_create` / `wallet_backup` / `wallet_forget_seed` events
+without seed material.
 If a seed ever touches chat or a log, treat the wallet as burned and
 generate a new one — exposure can't be undone.
 

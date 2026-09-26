@@ -1,11 +1,8 @@
-# NFT artwork + IPFS pinning (v0.6)
+# NFT artwork + IPFS pinning (v0.5)
 
-Minting is a deliberate **two-step** flow. `xrpl-trade nft-stage`
-validates the artwork locally and writes a reviewable stage record with
-**zero network calls**; `xrpl-trade nft-pin-and-propose` is the approved
-action that pins and proposes. Pinning is an external write — it happens
-*inside* the approved action, never before it. This page explains the
-hosting model, the pipeline, and the operator's obligations.
+`xrpl-trade nft-mint` pins artwork to IPFS through Pinata, then mints an
+`NFTokenMint` whose `URI` points at the pinned metadata. This page explains
+the hosting model, the pinning pipeline, and the operator's obligations.
 
 ## Bring your own Pinata account
 
@@ -15,20 +12,13 @@ metadata are pinned under their own account. The skill's publisher does not
 host, pay for, or see anyone else's files.
 
 The JWT never belongs in the repository, in a proposal, in chat output, or
-in the audit log. Treat it like a seed: it is **injected for the single
-pin operation only**, never exported into a shell (an `export` leaves it
-in shell history and the process environment for everything after it).
+in the audit log. Treat it like a seed: the vault injects it into the
+environment at pin time, and only the pinner's environment holds it.
 
 ```bash
-# 1. stage offline — no network, no JWT needed:
-xrpl-trade nft-stage --file ~/.xrpl/media/art.png --name "Neon Drift" \
+export PINATA_JWT="eyJhbGciOi..."
+xrpl-trade nft-mint --file art.png --name "Neon Drift" \
     --description "Series 1, piece 3" --royalty-bps 1000
-# → validates + hashes the file, writes a stage record. Review it.
-
-# 2. the human approves pinning + proposal as ONE action; the JWT lives
-#    only for this command:
-PINATA_JWT="$(vault read -field=jwt secret/pinata)" \
-    xrpl-trade nft-pin-and-propose --stage <stage-id>
 ```
 
 On Pinata's free tier, both pins (artwork + metadata JSON) count against the
@@ -39,23 +29,22 @@ an account they already own.
 
 `bin/xrpl_pin.py` does exactly three things:
 
-1. **Validate the source.** `read_validated_source(path)` enforces: the
-   file lives inside the approved media directory (`~/.xrpl/media` or
-   `XRPL_NFT_MEDIA_DIR`; symlink escapes refused), opens it `O_NOFOLLOW`,
-   requires a regular non-empty file under 10 MiB, sniffs the MIME from
-   magic bytes (PNG/JPEG/GIF/WebP only), and SHA-256 hashes it while
-   reading. Anything else is refused before a single byte leaves the
-   machine.
-2. **Pin the artwork** (`pinFileToIPFS`) → image CID.
-3. **Pin the metadata JSON** (`pinJSONToIPFS`) in the XLS-24d shape
-   (`name`, `description`, `image: ipfs://<image-cid>`) → metadata CID.
+1. **Pin the artwork.** `pin_artwork(path)` uploads the file bytes and
+   returns the image CID (`pinFileToIPFS`).
+2. **Build metadata** in the XLS-24d shape:
+   ```json
+   {
+     "name": "Neon Drift",
+     "description": "Series 1, piece 3",
+     "image": "ipfs://<image-cid>"
+   }
+   ```
+3. **Pin the metadata JSON** (`pinJSONToIPFS`) and return its CID.
 
-`xrpl-trade nft-pin-and-propose` re-validates the file against the **staged
-SHA-256** first (a file swapped after staging is refused — no TOCTOU),
-prints exactly what will leave the machine (file, hash, size, metadata),
-then pins and hex-encodes `ipfs://<metadata-cid>` into the proposal's
-`URI` field (policy caps it at `nft.max_uri_bytes`). The pinner only ever
-sees the validated file and the exact reviewed metadata.
+`xrpl-trade nft-mint` then hex-encodes `ipfs://<metadata-cid>` and writes it
+into the proposal's `URI` field (policy caps it at 256 bytes, see below).
+Pinning happens **before** the proposal is built, so a failed pin can never
+produce a mint pointing at nothing.
 
 ## CIDs are portable
 
@@ -67,11 +56,8 @@ on-ledger.
 
 ## Operator obligations
 
-- **Keep the JWT out of git — and out of shells.** `xrpl_pin.py` reads
-  `PINATA_JWT` from the environment only; there is no config-file path
-  and no flag for it. Inject it for the single `nft-pin-and-propose`
-  invocation (`PINATA_JWT="$(vault …)" xrpl-trade nft-pin-and-propose …`);
-  never `export` it, never paste it into chat, never commit it.
+- **Keep the JWT out of git.** `xrpl_pin.py` reads `PINATA_JWT` from the
+  environment only; there is no config-file path and no flag for it.
 - **Keep pins alive.** NFTs reference content by CID, but content only
   resolves while *someone* pins it. If the operator deletes the Pinata
   account, the NFT's `URI` keeps working on-ledger but wallets and

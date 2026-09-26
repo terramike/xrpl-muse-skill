@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""xrpl_pin v0.5: Pinata IPFS pinning for the XRPL NFT skill.
+"""xrpl_pin: Pinata IPFS pinning for the XRPL NFT skill.
 
 Bring-your-own-key design: the ONLY credential is the PINATA_JWT
 environment variable. This module never stores keys, never logs them,
 and the repository ships no credentials — every skill operator pins
 with their OWN Pinata account, so each operator hosts their own media.
 See references/nft-pinata.md for setup.
+
+P1-4 hardening:
+- Artwork may only come from the protected NFT media directory
+  (~/.xrpl/media by default, overridable via the "media_dir" key in
+  ~/.xrpl/config.json — never via an environment variable, which an
+  agent could set). Symlink escapes and path traversal are refused.
+- read_validated_source() reads the file ONCE (O_NOFOLLOW) and returns
+  its bytes; pin_data() uploads those SAME bytes. The pin step never
+  reopens the file between hashing and uploading (no TOCTOU).
 
 No xrpl-py dependency here (stdlib only) so the pinner stays tiny.
 """
@@ -30,16 +39,38 @@ NFT_MAX_BYTES = 10 * 1024 * 1024
 # HTML, no executables — the pinner is not a general file host.
 ALLOWED_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
-MEDIA_DIR_ENV = "XRPL_NFT_MEDIA_DIR"
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".xrpl", "config.json")
+DEFAULT_MEDIA_DIR = os.path.join(os.path.expanduser("~"), ".xrpl", "media")
 
 
-def default_media_dir():
-    return os.path.join(os.path.expanduser("~"), ".xrpl", "media")
+def protected_media_dir():
+    """The permitted artwork directory, from protected configuration.
 
-
-def media_dir():
-    """Approved artwork directory: env override or ~/.xrpl/media."""
-    return os.environ.get(MEDIA_DIR_ENV) or default_media_dir()
+    Resolution: the "media_dir" key in ~/.xrpl/config.json (operator-owned,
+    mode 0600) when set, else ~/.xrpl/media. There is deliberately NO
+    environment-variable override — env vars are agent-settable, and the
+    media directory is a security boundary (P1-4). A configured value must
+    be an absolute path to an existing directory.
+    """
+    configured = None
+    try:
+        with open(CONFIG_PATH) as f:
+            configured = (json.load(f) or {}).get("media_dir")
+    except (OSError, ValueError):
+        configured = None
+    if configured:
+        if not os.path.isabs(configured):
+            sys.exit(
+                f"refusing: media_dir in {CONFIG_PATH} must be an absolute "
+                f"path, got {configured!r}")
+        real = os.path.realpath(configured)
+        if not os.path.isdir(real):
+            sys.exit(
+                f"refusing: configured NFT media directory does not exist: "
+                f"{real}\nCreate it and put the artwork inside, or fix "
+                f"\"media_dir\" in {CONFIG_PATH}.")
+        return real
+    return os.path.realpath(DEFAULT_MEDIA_DIR)
 
 
 def _sniff_mime(head: bytes):
@@ -58,18 +89,27 @@ def _sniff_mime(head: bytes):
 def read_validated_source(path, media_dir=None):
     """Read a pin source after strict validation. Zero network calls.
 
-    Returns (data, info) where info = {path, bytes, mime, sha256}.
+    The file is opened ONCE (O_NOFOLLOW) and its bytes are returned, so a
+    caller can hash and then upload those exact bytes without reopening
+    the file (no TOCTOU window).
+
+    Returns (data, info) where info = {path, bytes, mime, sha256,
+    media_dir}. media_dir defaults to the protected media directory;
+    production callers must pass protected_media_dir() (or leave the
+    default) — the permitted directory lives in protected config, never
+    in a stage record or an environment variable.
+
     Refuses (SystemExit): missing/non-regular files, paths resolving
-    outside the NFT media directory (symlink escape), symlinks at open
-    time (O_NOFOLLOW), empty or oversized files, and MIME types outside
-    ALLOWED_MIME (sniffed from magic bytes, never the extension).
+    outside the media directory (symlink escape / traversal), symlinks at
+    open time (O_NOFOLLOW), empty or oversized files, and MIME types
+    outside ALLOWED_MIME (sniffed from magic bytes, never the extension).
     """
-    mdir = os.path.realpath(media_dir or default_media_dir())
+    mdir = os.path.realpath(media_dir or protected_media_dir())
     if not os.path.isdir(mdir):
         sys.exit(
             f"NFT media directory not found: {mdir}\n"
-            f"Create it, put the artwork inside, and re-run — or set "
-            f"{MEDIA_DIR_ENV} to choose another directory.")
+            f"Create it and put the artwork inside, or set \"media_dir\" in "
+            f"{CONFIG_PATH}.")
     try:
         real = os.path.realpath(path)
     except (TypeError, ValueError):
@@ -160,18 +200,33 @@ def _post(url, body: bytes, content_type: str, filename: str = None) -> dict:
         sys.exit(f"Pinata unreachable: {e.reason}")
 
 
-def pin_file(path: str, media_dir=None) -> str:
-    """Pin a local file to IPFS. Returns the CID (no ipfs:// prefix).
+def pin_data(data: bytes, filename: str) -> str:
+    """Pin bytes already read+validated to IPFS. Returns the CID.
 
-    The source is strictly validated (media directory, O_NOFOLLOW, size,
-    MIME) before any byte leaves the machine."""
-    data, info = read_validated_source(path, media_dir=media_dir)
+    Takes the exact bytes (e.g. from read_validated_source) — the file is
+    NOT reopened, so the uploaded bytes are provably the hashed bytes.
+    This is the TOCTOU-safe upload path; prefer it over pin_file whenever
+    the bytes were already read for hashing.
+    """
+    if not data:
+        sys.exit(f"refusing to pin empty data: {filename}")
     resp = _post(PINATA_PIN_FILE, data, "application/octet-stream",
-                 filename=os.path.basename(info["path"]))
+                 filename=os.path.basename(filename))
     cid = resp.get("IpfsHash")
     if not cid:
         sys.exit(f"Pinata returned no IpfsHash: {resp!r}"[:200])
     return cid
+
+
+def pin_file(path: str, media_dir=None) -> str:
+    """Pin a local file to IPFS. Returns the CID (no ipfs:// prefix).
+
+    The source is strictly validated (protected media directory,
+    O_NOFOLLOW, size, MIME) and the validated bytes are uploaded without
+    reopening the file.
+    """
+    data, info = read_validated_source(path, media_dir=media_dir)
+    return pin_data(data, info["path"])
 
 
 def pin_json(obj: dict, name: str = "metadata.json") -> str:

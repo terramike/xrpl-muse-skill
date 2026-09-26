@@ -108,10 +108,8 @@ with tempfile.TemporaryDirectory() as td:
                                            "max_bid_xrp"})
     check("NFT types in default allowlist",
           "NFTokenMint" in C.DEFAULT_ALLOWED_TX_TYPES
-          and "NFTokenCreateOffer" in C.DEFAULT_ALLOWED_TX_TYPES)
-    check("buy side is opt-in: NFTokenAcceptOffer NOT in defaults",
-          "NFTokenAcceptOffer" not in C.DEFAULT_ALLOWED_TX_TYPES
-          and "NFTokenAcceptOffer" in C.REQUIRED_FIELDS)  # still supported
+          and "NFTokenCreateOffer" in C.DEFAULT_ALLOWED_TX_TYPES
+          and "NFTokenAcceptOffer" in C.DEFAULT_ALLOWED_TX_TYPES)
 
     # --- 2. strict schemas ---
     no_uri = mint_tx()
@@ -303,10 +301,13 @@ with tempfile.TemporaryDirectory() as td:
     d, _ = tr.try_reserve_count(C.NFT_MINT_ASSET, 1, 10)
     check("released slot is reusable", not d)
 
-    # old entries age out of the rolling window
+    # old CONFIRMED entries age out of the rolling window.
+    # (Pending reservations never age out — P1-3: unresolved liabilities
+    # persist until proven otherwise.)
     st = json.loads(C.STATE_PATH.read_text())
     for e in st["entries"]:
         e["ts"] = int(time.time()) - 90000  # 25h old
+        e["status"] = "confirmed"
     C.STATE_PATH.write_text(json.dumps(st))
     check("25h-old mints no longer count",
           C.check_mint_rate(base_policy, tr) == [])
@@ -362,6 +363,9 @@ with tempfile.TemporaryDirectory() as td:
     C.POLICY_PATH.write_text(json.dumps(base_policy))  # restore
 
     # --- 12. Pinata helper: bring-your-own-key, mocked transport ---
+    # P1-4: pin sources must live inside the permitted media directory.
+    # The test media dir is passed explicitly (production callers resolve
+    # the protected dir from config).
     calls = []
 
     def fake_post(url, body, content_type, filename=None):
@@ -375,29 +379,38 @@ with tempfile.TemporaryDirectory() as td:
     check("metadata has XLS-24d shape",
           meta == {"name": "Cool Art", "description": "A test piece",
                    "image": "ipfs://bafyimg"})
-    with tempfile.TemporaryDirectory() as td:
-        art = os.path.join(td, "art.png")
-        with open(art, "wb") as tf:
-            tf.write(b"\x89PNG\r\n\x1a\nfakepng")
-        img_cid, meta_cid = P.pin_artwork(art, "Cool Art", "A test piece",
-                                          media_dir=td)
+    tmedia = tempfile.mkdtemp(prefix="xrpl-test-media-")
+    with tempfile.NamedTemporaryFile(suffix=".png", dir=tmedia,
+                                     delete=False) as tf:
+        tf.write(b"\x89PNG\r\n\x1a\nfakepng")
+        tf.flush()
+        art_path = tf.name
+        img_cid, meta_cid = P.pin_artwork(art_path, "Cool Art", "A test piece",
+                                          media_dir=tmedia)
     check("pin_artwork returns both CIDs",
           img_cid == "bafytestcid123" and meta_cid == "bafytestcid123")
     check("art pinned as file, metadata as JSON",
           calls[0][0].endswith("pinFileToIPFS")
           and calls[1][0].endswith("pinJSONToIPFS"))
+    # P1-4: a source outside the permitted media dir is refused even with
+    # a valid key and valid PNG bytes.
+    with tempfile.NamedTemporaryFile(suffix=".png") as outside:
+        outside.write(b"\x89PNG\r\n\x1a\nfakepng")
+        outside.flush()
+        try:
+            P.pin_file(outside.name, media_dir=tmedia)
+            check("pin outside media dir is refused", False)
+        except SystemExit as e:
+            check("pin outside media dir is refused",
+                  "outside the NFT media directory" in str(e))
     del os.environ["PINATA_JWT"]
     P._post = real_post  # real transport: must fail on the missing key
-    with tempfile.TemporaryDirectory() as td2:
-        art2 = os.path.join(td2, "art.png")
-        with open(art2, "wb") as tf2:
-            tf2.write(b"\x89PNG\r\n\x1a\nfakepng")
-        try:
-            P.pin_file(art2, media_dir=td2)
-            check("missing PINATA_JWT fails cleanly", False)
-        except SystemExit as e:
-            check("missing PINATA_JWT fails cleanly",
-                  "PINATA_JWT" in str(e))
+    try:
+        P.pin_file(art_path, media_dir=tmedia)
+        check("missing PINATA_JWT fails cleanly", False)
+    except SystemExit as e:
+        check("missing PINATA_JWT fails cleanly",
+              "PINATA_JWT" in str(e))
     # (module is reloaded fresh on every test run; no restore needed)
 
     # --- 13. derived ceremony text for the new types ---
@@ -431,7 +444,7 @@ with tempfile.TemporaryDirectory() as td:
           od["Flags"] == 1 and od["Amount"] == "2500000")
 
     # --- 15. nft-buy / nft-bid (stub ledger, no network) ---
-    from xrpl.models.requests import AccountNFTs, Ledger, LedgerEntry
+    from xrpl.models.requests import AccountNFTs, LedgerEntry
 
     OFFER_IDX = "AB" * 32
     TOKEN = "CD" * 32
@@ -451,35 +464,18 @@ with tempfile.TemporaryDirectory() as td:
             return self._ok
 
     class StubClient:
-        """Ledger double: one offer entry + the seller's NFT page.
-
-        Models the v0.6.0 pinned-ledger flow: the report first reads the
-        validated ledger index, then pins the offer and inventory reads to
-        that same index. Every data response carries validated=True."""
-        VALIDATED_INDEX = 90041
-
-        def __init__(self, offer, nfts, validated=True):
+        """Ledger double: one offer entry + the seller's NFT page."""
+        def __init__(self, offer, nfts):
             self.offer = offer
             self.nfts = nfts
-            self.validated = validated
-            self.seen_ledger_indexes = []
 
         def request(self, req):
-            if isinstance(req, Ledger):
-                return StubResp(True, {"ledger_index": self.VALIDATED_INDEX,
-                                       "validated": True})
             if isinstance(req, LedgerEntry):
-                self.seen_ledger_indexes.append(req.ledger_index)
                 if self.offer is None:
                     return StubResp(False, {"error": "entryNotFound"})
-                return StubResp(True, {"node": self.offer,
-                                       "ledger_index": self.VALIDATED_INDEX,
-                                       "validated": self.validated})
+                return StubResp(True, {"node": self.offer})
             if isinstance(req, AccountNFTs):
-                self.seen_ledger_indexes.append(req.ledger_index)
-                return StubResp(True, {"account_nfts": self.nfts,
-                                       "ledger_index": self.VALIDATED_INDEX,
-                                       "validated": self.validated})
+                return StubResp(True, {"account_nfts": self.nfts})
             raise AssertionError("unexpected request type")
 
     seller_nfts = [{"NFTokenID": TOKEN, "URI": GOOD_URI,
@@ -493,31 +489,24 @@ with tempfile.TemporaryDirectory() as td:
                 "NFTokenSellOffer": idx, "Fee": "12", "Sequence": 1,
                 "LastLedgerSequence": 999}
 
-    # buy side is opt-in: shape tests use an explicit allowlist that
-    # includes the type, mirroring an operator who opted in.
-    ACCEPT_TYPES = C.DEFAULT_ALLOWED_TX_TYPES + ["NFTokenAcceptOffer"]
-
     # schema: direct mode only
     no_idx = accept_tx()
     del no_idx["NFTokenSellOffer"]
     check("NFTokenAcceptOffer without sell offer flagged",
           any("NFTokenSellOffer" in p for p in C.validate_tx_shape(
-              no_idx, ACCEPT_TYPES)))
+              no_idx, C.DEFAULT_ALLOWED_TX_TYPES)))
     smuggle_buy = accept_tx()
     smuggle_buy["NFTokenBuyOffer"] = "EF" * 32
     check("NFTokenAcceptOffer+NFTokenBuyOffer rejected",
           any("NFTokenBuyOffer" in p for p in C.validate_tx_shape(
-              smuggle_buy, ACCEPT_TYPES)))
+              smuggle_buy, C.DEFAULT_ALLOWED_TX_TYPES)))
     smuggle_broker = accept_tx()
     smuggle_broker["NFTokenBrokerFee"] = "100"
     check("NFTokenAcceptOffer+NFTokenBrokerFee rejected",
           any("NFTokenBrokerFee" in p for p in C.validate_tx_shape(
-              smuggle_broker, ACCEPT_TYPES)))
+              smuggle_broker, C.DEFAULT_ALLOWED_TX_TYPES)))
     check("NFTokenAcceptOffer direct-mode shape clean",
-          not C.validate_tx_shape(accept_tx(), ACCEPT_TYPES))
-    check("NFTokenAcceptOffer refused when not opted in",
-          any("NFTokenAcceptOffer" in p for p in C.validate_tx_shape(
-              accept_tx(), C.DEFAULT_ALLOWED_TX_TYPES)))
+          not C.validate_tx_shape(accept_tx(), C.DEFAULT_ALLOWED_TX_TYPES))
 
     # offer verification
     d, amt = C.check_nft_accept_offer(accept_tx("xyz"), good_client, pol_on)
@@ -629,6 +618,139 @@ with tempfile.TemporaryDirectory() as td:
     check("bid ceremony marks it a BUY offer", "BUY" in blines)
     alines = "\n".join(C.describe_tx(accept_tx(), "nft-buy"))
     check("accept ceremony shows the offer index", OFFER_IDX in alines)
+
+    # --- 16. P1-4: stage digest binds content; pin uploads the hashed bytes ---
+    # No network: the pinner's transport is faked, propose() is stubbed.
+    import hashlib as _hl
+    tmedia = Path(tempfile.mkdtemp(prefix="xrpl-p14-media-"))
+    C.STAGE_DIR = tmp / "stage"
+    T.xrpl_pin = P  # the test-loaded pinner module
+    real_pmd = P.protected_media_dir
+    P.protected_media_dir = lambda: str(tmedia)
+    real_propose = T.propose
+    proposed = {}
+
+    def fake_propose(tx, client, cfg, action, summary_lines):
+        proposed["summary"] = "\n".join(summary_lines)
+        proposed["action"] = action
+        return "deadbeef" * 8
+
+    T.propose = fake_propose
+    real_pin_data = P.pin_data
+    real_pin_json = P.pin_json
+    pinned = {}
+
+    def fake_pin_data(data, filename):
+        pinned["bytes"] = bytes(data)  # capture exactly what is uploaded
+        pinned["filename"] = filename
+        return "bafyimgcid"
+
+    def fake_pin_json(obj, name="metadata.json"):
+        pinned["meta"] = dict(obj)
+        return "bafymetacid"
+
+    P.pin_data = fake_pin_data
+    P.pin_json = fake_pin_json
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    art = tmedia / "art.png"
+    art.write_bytes(PNG)
+    real_art = os.path.realpath(str(art))
+    real_media = os.path.realpath(str(tmedia))
+    ncfg = {"address": ACCT, "network": "testnet"}
+
+    def expect_exit(fn, *a, **k):
+        try:
+            fn(*a, **k)
+        except SystemExit as e:
+            return str(e)
+        return None
+
+    rec = T.stage_artwork(str(art), "Cool Art", "A test piece", 1000, 0,
+                          account=ACCT, network="testnet")
+    dg = rec.get("stage_digest")
+    check("stage record carries a 64-hex stage digest",
+          isinstance(dg, str) and len(dg) == 64
+          and all(c in "0123456789abcdef" for c in dg))
+    expect = T._compute_stage_digest(
+        _hl.sha256(PNG).hexdigest(), "Cool Art", "A test piece", 1000, 0,
+        T.NFT_MINT_FLAGS, ACCT, "testnet", real_art, real_media)
+    check("stage digest matches independent recomputation", dg == expect)
+    sid = rec["stage_id"]
+    stage_file = C.STAGE_DIR / f"{sid}.json"
+
+    # happy path: pin uploads the EXACT staged bytes, ceremony shows digest
+    h = T.pin_and_propose_stage(sid, ncfg, None)
+    check("pin succeeds on an unmodified stage", h == "deadbeef" * 8)
+    check("pin uploads the exact bytes that were hashed",
+          pinned.get("bytes") == PNG)
+    check("approval ceremony carries the full stage digest",
+          dg in proposed.get("summary", ""))
+
+    # tamper 1: edited metadata in the stage record
+    rec2 = dict(rec)
+    rec2["royalty_bps"] = 5000
+    stage_file.write_text(json.dumps(rec2))
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    check("pin refuses edited stage metadata before Pinata",
+          msg is not None and "stage digest does not match" in msg
+          and "NOT contacted" in msg)
+
+    # tamper 2: swapped artwork file (still a valid PNG, different bytes)
+    stage_file.write_text(json.dumps(rec))  # restore
+    art.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\xff" * 100)
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    check("pin refuses a swapped artwork file",
+          msg is not None and "changed since staging" in msg)
+    art.write_bytes(PNG)  # restore
+
+    # tamper 3: changed source path in the stage record (identical bytes,
+    # so the file-hash check passes and the DIGEST must catch the path)
+    other = tmedia / "other.png"
+    other.write_bytes(PNG)
+    rec3 = dict(rec)
+    rec3["source_path"] = os.path.realpath(str(other))
+    stage_file.write_text(json.dumps(rec3))
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    check("pin refuses a changed source path",
+          msg is not None and "stage digest does not match" in msg)
+
+    # tamper 4: a different minter account at pin time
+    stage_file.write_text(json.dumps(rec))  # restore
+    msg = expect_exit(T.pin_and_propose_stage, sid,
+                      {"address": DEST, "network": "testnet"}, None)
+    check("pin refuses a different minter account",
+          msg is not None and "stage digest does not match" in msg)
+
+    # tamper 5: stage record points outside the protected media dir
+    outside = Path(tempfile.mkdtemp(prefix="xrpl-p14-out-"))
+    oart = outside / "evil.png"
+    oart.write_bytes(PNG)
+    rec5 = dict(rec)
+    rec5["source_path"] = str(oart)
+    stage_file.write_text(json.dumps(rec5))
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    check("pin refuses artwork outside the protected media dir",
+          msg is not None and "outside the NFT media directory" in msg)
+
+    # staging itself refuses files outside the protected media dir
+    msg = expect_exit(T.stage_artwork, str(oart), "Evil", "", 1000, 0,
+                      ACCT, "testnet")
+    check("stage refuses files outside the protected media dir",
+          msg is not None and "outside the NFT media directory" in msg)
+
+    # old (pre-digest) stage records are rejected
+    rec6 = dict(rec)
+    rec6["format"] = "nft-stage/1"
+    stage_file.write_text(json.dumps(rec6))
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    check("pre-digest stage records are rejected",
+          msg is not None and "unsupported format" in msg)
+
+    # restore the pinner module
+    P.protected_media_dir = real_pmd
+    T.propose = real_propose
+    P.pin_data = real_pin_data
+    P.pin_json = real_pin_json
 
 n_fail = sum(1 for _, ok in PASS if not ok)
 print(f"\n{len(PASS) - n_fail}/{len(PASS)} passed")

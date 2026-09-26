@@ -237,22 +237,11 @@ def get_nft_auctions(limit=12):
 # ---------- display ----------
 
 def _text(v):
-    """Coerce an API string field to terminal-safe display text.
-
-    The old version only truncated; a malicious title/description could
-    inject ANSI/OSC sequences or bidi controls and redraw the terminal.
-    The xrpl_common import is lazy (with a path fallback) so this module
-    stays importable on its own."""
-    try:
-        from xrpl_common import safe_terminal_text
-    except ImportError:
-        import os
-        import sys as _sys
-        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from xrpl_common import safe_terminal_text
+    """Coerce an API string field to safe display text."""
     if v is None:
         return ""
-    return safe_terminal_text(v, 300)
+    s = str(v)
+    return s if len(s) <= 300 else s[:297] + "..."
 
 
 def _price(item):

@@ -241,7 +241,10 @@ with tempfile.TemporaryDirectory() as td:
           invariants_raise("nft-send", bid_tx()) is not None)
 
     # --- 4. tampering / expiry ---
-    h, path = C.save_proposal(transfer_tx(), "testnet", ACCT, "nft-send")
+    _pdigest = C._sha256_file(C.POLICY_PATH)
+    h, path = C.save_proposal(transfer_tx(), "testnet", ACCT, "nft-send",
+                              profile="adhoc-testnet",
+                              policy_sha256=_pdigest)
     prop = json.loads(path.read_text())
     prop["tx"]["Destination"] = OTHER  # tamper: redirect the gift
     try:
