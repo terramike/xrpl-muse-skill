@@ -39,38 +39,32 @@ NFT_MAX_BYTES = 10 * 1024 * 1024
 # HTML, no executables — the pinner is not a general file host.
 ALLOWED_MIME = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".xrpl", "config.json")
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".xrpl", "pin-policy.json")
 DEFAULT_MEDIA_DIR = os.path.join(os.path.expanduser("~"), ".xrpl", "media")
 
 
 def protected_media_dir():
-    """The permitted artwork directory, from protected configuration.
-
-    Resolution: the "media_dir" key in ~/.xrpl/config.json (operator-owned,
-    mode 0600) when set, else ~/.xrpl/media. There is deliberately NO
-    environment-variable override — env vars are agent-settable, and the
-    media directory is a security boundary (P1-4). A configured value must
-    be an absolute path to an existing directory.
-    """
-    configured = None
+    """Read explicit upload policy; deployment must isolate it from the agent."""
+    if os.name != "posix":
+        sys.exit("Protected uploads require the POSIX Muse signing deployment")
     try:
-        with open(CONFIG_PATH) as f:
-            configured = (json.load(f) or {}).get("media_dir")
-    except (OSError, ValueError):
-        configured = None
-    if configured:
-        if not os.path.isabs(configured):
-            sys.exit(
-                f"refusing: media_dir in {CONFIG_PATH} must be an absolute "
-                f"path, got {configured!r}")
-        real = os.path.realpath(configured)
-        if not os.path.isdir(real):
-            sys.exit(
-                f"refusing: configured NFT media directory does not exist: "
-                f"{real}\nCreate it and put the artwork inside, or fix "
-                f"\"media_dir\" in {CONFIG_PATH}.")
-        return real
-    return os.path.realpath(DEFAULT_MEDIA_DIR)
+        st = os.lstat(CONFIG_PATH)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            sys.exit("Pin policy must be a signer-owned regular 0600 file")
+        parent = os.stat(os.path.dirname(CONFIG_PATH))
+        if parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
+            sys.exit("Pin policy directory must not be writable by other users")
+        with open(CONFIG_PATH) as source:
+            policy = json.load(source)
+        if not isinstance(policy, dict) or set(policy) != {"media_dir"}:
+            sys.exit("Pin policy must contain only media_dir")
+        path = policy["media_dir"]
+        if not isinstance(path, str) or not os.path.isabs(path) or not os.path.isdir(path):
+            sys.exit("Pin media_dir must be an existing absolute directory")
+        return os.path.realpath(path)
+    except (OSError, ValueError) as ex:
+        sys.exit("Protected pin policy unavailable; configure pin-policy.json through the operator: " + str(ex))
+
 
 
 def _sniff_mime(head: bytes):

@@ -146,6 +146,8 @@ with tempfile.TemporaryDirectory() as td:
 
         def request(self, req):
             from xrpl.models.requests import BookOffers, AccountInfo, Ledger
+            if isinstance(req, ServerInfo):
+                return FakeResp({"info": {"complete_ledgers": "1-2000"}})
             if isinstance(req, Ledger):
                 # P1-5: the signer pins one validated ledger first.
                 return FakeResp({"ledger_index": 100, "validated": True})
@@ -176,12 +178,12 @@ with tempfile.TemporaryDirectory() as td:
             self.raise_ledger = raise_ledger
 
         def request(self, req):
-            from xrpl.models.requests import Ledger, Tx
+            from xrpl.models.requests import Ledger, Tx, ServerInfo
             if isinstance(req, Ledger):
                 if self.raise_ledger:
                     raise RuntimeError("node down")
                 # P1-3: complete_ledgers proves non-inclusion over a range.
-                return FakeResp({"ledger_index": self.ledger_index,
+                return FakeResp({"validated": True, "ledger_index": self.ledger_index,
                                  "complete_ledgers": "0-2000"})
             if isinstance(req, Tx):
                 if self.raise_tx:
@@ -190,7 +192,7 @@ with tempfile.TemporaryDirectory() as td:
                     return FakeResp({"error": "txnNotFound"}, ok=False)
                 # P1-3: only a VALIDATED result settles the reservation.
                 return FakeResp(
-                    {"validated": True,
+                    {"validated": True, "Fee": "12",
                      "meta": {"TransactionResult": self.tx_result}})
             raise AssertionError(f"unexpected request {req!r}")
 
@@ -379,6 +381,7 @@ with tempfile.TemporaryDirectory() as td:
                 "created_at": int(time.time()),
                 "policy_version": C.POLICY_VERSION,
                 "profile": "adhoc-testnet",
+                "profile_sha256": C.proposal_profile_fingerprint("adhoc-testnet"),
                 "policy_sha256": "00" * 32,
                 "tx": nan_pay, "tx_binary": "00"}
     core = {k: evil_env[k] for k in C.ENVELOPE_HASH_KEYS}
@@ -566,7 +569,7 @@ with tempfile.TemporaryDirectory() as td:
     check("recent spend still counts toward the rolling cap",
           any("rolling-24h" in d
               for d in tracker.check({"XRP": Decimal("20")}, cpol)))
-    C.STATE_PATH.unlink()
+    C.STATE_PATH.write_text(json.dumps({"entries": []}))
 
     # --- 22. concurrent reservation still atomic ---
     tracker = C.SpentTracker()
@@ -586,7 +589,7 @@ with tempfile.TemporaryDirectory() as td:
     total = sum(Decimal(e["amount"]) for e in st["entries"])
     check("concurrent reserves never exceed daily cap",
           total <= 25 and ok_n == 2 and total == 20)
-    C.STATE_PATH.unlink()
+    C.STATE_PATH.write_text(json.dumps({"entries": []}))
 
     # --- 23. ambiguous submission: reservation HELD, swept later ---
     tracker = C.SpentTracker()
@@ -640,7 +643,7 @@ with tempfile.TemporaryDirectory() as td:
           tracker.check({"XRP": Decimal("1")}, cpol) == [] and
           any("rolling-24h" in d
               for d in tracker.check({"XRP": Decimal("95")}, cpol)))
-    C.STATE_PATH.unlink()
+    C.STATE_PATH.write_text(json.dumps({"entries": []}))
 
     # --- 24. protected signer state ---
     for p in (C.POLICY_PATH, C.APPROVED_PATH, C.AUDIT_PATH):

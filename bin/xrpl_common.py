@@ -97,19 +97,19 @@ NETWORKS = {
 RIPPLE_EPOCH = 946684800  # unix seconds of 2000-01-01T00:00:00Z
 REQUIRE_DEST_TAG_FLAG = 0x00020000  # lsfRequireDestTag
 
-__version__ = "0.7.0"
+__version__ = "0.8.0-dev"
 POLICY_VERSION = 4
 # Envelope v4 (P1-1 approval binding): adds the bound signing profile name
 # and the sha256 of the exact policy file the human reviewed against.
 # v3 and older proposals are REJECTED — regenerate them.
-ENVELOPE_FORMAT = "xrpl-proposal/4"
+ENVELOPE_FORMAT = "xrpl-proposal/5"
 # Fields covered by the proposal hash. Everything safety-critical lives here.
 # Notably: network, creation time, policy version, the bound profile, the
 # policy digest, and the canonical binary transaction. Summaries are NOT
 # stored and NOT trusted — the signer derives them from the transaction.
 ENVELOPE_HASH_KEYS = ("format", "network", "account", "action",
                       "created_at", "policy_version", "profile",
-                      "policy_sha256", "tx_binary")
+                      "policy_sha256", "profile_sha256", "tx_binary")
 # Rolling spend window, seconds.
 ROLLING_WINDOW = 86400
 # Max allowed clock skew for proposal created_at (seconds in the future).
@@ -254,7 +254,7 @@ def ripple_time_from_now(seconds: int) -> int:
 
 
 def save_proposal(tx_dict, network, account, action, profile=None,
-                policy_sha256=None):
+                policy_sha256=None, profile_sha256=None):
     """Build a hash-bound proposal envelope and save it. Returns (hash, path).
 
     The hash covers the envelope core (format, network, account, action,
@@ -271,6 +271,7 @@ def save_proposal(tx_dict, network, account, action, profile=None,
         "created_at": int(time.time()),
         "policy_version": POLICY_VERSION,
         "profile": profile,
+        "profile_sha256": profile_sha256 or proposal_profile_fingerprint(profile),
         "policy_sha256": policy_sha256,
         "tx": tx_dict,
         "tx_binary": tx_binary(tx_dict),
@@ -406,6 +407,8 @@ def verify_envelope_invariants(prop: dict, tx: dict):
 
 
 def load_proposal(prefix: str):
+    if not re.fullmatch(r"[0-9a-f]{1,64}", prefix or ""):
+        sys.exit("Proposal hash must be 1..64 lowercase hexadecimal characters")
     matches = list(PROPOSALS_DIR.glob(f"{prefix}*.json")) if PROPOSALS_DIR.exists() else []
     if not matches:
         sys.exit(f"No proposal matching {prefix!r}. See `xrpl-sign --list`.")
@@ -413,6 +416,24 @@ def load_proposal(prefix: str):
         sys.exit(f"Ambiguous prefix {prefix!r}: {[m.stem[:12] for m in matches]}")
     return json.loads(matches[0].read_text()), matches[0]
 
+
+def require_full_hash_for_approve(cli_hash, proposal: dict):
+    """Fail closed unless the CLI --hash names the proposal EXACTLY.
+
+    Prefixes stay read-only: reviewing a proposal with a short prefix is
+    fine, but --approve (the human's signing decision) must carry the
+    complete 64-char proposal hash they reviewed. A prefix could match a
+    different file than the one on screen (or be re-pointed at one), so
+    signing on a prefix is refused. Raises SystemExit with the exact
+    re-runnable commands.
+    """
+    full = proposal.get("proposal_hash")
+    if cli_hash != full:
+        sys.exit(
+            "Refusing to sign: --approve requires the FULL 64-character "
+            f"proposal hash, not a prefix ({cli_hash!r}).\n"
+            f"  review:  xrpl-sign --hash {full}\n"
+            f"  approve: xrpl-sign --hash {full} --approve")
 
 # ---------- signing profiles (P1-1) ----------
 #
@@ -438,10 +459,23 @@ def load_profiles():
     if not isinstance(raw, dict) or raw.get("schema_version") != PROFILES_SCHEMA_VERSION:
         sys.exit(f"profiles: {PROFILES_PATH} has wrong schema_version "
                  f"(want {PROFILES_SCHEMA_VERSION})")
+    if set(raw) != {"schema_version", "profiles"}:
+        sys.exit("profiles: unknown or missing document fields")
     profiles = raw.get("profiles", {})
     if not isinstance(profiles, dict):
         sys.exit(f"profiles: {PROFILES_PATH} 'profiles' must be an object")
     for name, pf in profiles.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name) or name == "adhoc-testnet":
+            sys.exit("profiles: invalid or reserved profile name")
+        fields = {"network", "account", "credential", "policy_path", "policy_sha256", "state"}
+        if not isinstance(pf, dict) or set(pf) != fields:
+            sys.exit("profiles: unknown or missing profile fields")
+        if not isinstance(pf["policy_path"], str) or not Path(pf["policy_path"]).is_absolute():
+            sys.exit("profiles: policy_path must be absolute")
+        if not isinstance(pf["policy_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", pf["policy_sha256"]):
+            sys.exit("profiles: invalid policy digest")
+        if not isinstance(pf["network"], str):
+            sys.exit("profiles: invalid network")
         for key in ("network", "account", "credential", "policy_path", "state"):
             if key not in pf:
                 sys.exit(f"profiles: profile {name!r} missing {key!r}")
@@ -450,6 +484,15 @@ def load_profiles():
         if not is_valid_classic_address(pf["account"]):
             sys.exit(f"profiles: profile {name!r} has invalid account")
         cred = pf["credential"]
+        if not isinstance(cred, dict):
+            sys.exit("profiles: credential must be an object")
+        expected = {"kind", "env_var"} if cred.get("kind") == "env" else {"kind", "path"}
+        if set(cred) != expected:
+            sys.exit("profiles: invalid credential fields")
+        if cred.get("kind") == "env" and not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", str(cred.get("env_var", ""))):
+            sys.exit("profiles: invalid credential reference")
+        if pf["network"] == "mainnet" and cred.get("kind") != "env":
+            sys.exit("profiles: mainnet credentials must be vault-injected")
         if cred.get("kind") not in (CRED_KIND_ENV, CRED_KIND_FILE):
             sys.exit(f"profiles: profile {name!r} has unknown credential kind")
         if cred["kind"] == CRED_KIND_ENV and not cred.get("env_var"):
@@ -470,6 +513,32 @@ def get_profile(name):
     return profiles[name]
 
 
+def proposal_profile_fingerprint(name):
+    if name == "adhoc-testnet":
+        return canonical_hash({"mode": "adhoc-testnet"})
+    if name:
+        return canonical_hash(get_profile(name))
+    return None
+
+
+def tracker_for_profile(profile, network, account):
+    """Stable account/network namespace, unaffected by profile renaming or state edits.
+
+    Existing legacy accounting is never silently abandoned. Recovery must first
+    move/reconstruct it into this namespace under operator review.
+    """
+    key = canonical_hash({"network": network, "account": account})
+    state = XRPL_DIR / "accounts" / key / "state.json"
+    for legacy in (STATE_PATH, GIVEAWAY_STATE_PATH):
+        if legacy.exists():
+            old_tracker = SpentTracker(legacy, legacy.with_suffix(".lock"))
+            with old_tracker._locked():
+                entries = old_tracker._load()["entries"]
+            if entries:
+                raise StateCorruptError("Legacy accounting requires reviewed migration before profile signing: " + str(legacy))
+    return SpentTracker(state, state.with_suffix(".lock"))
+
+
 def profile_policy_digest(profile) -> str:
     """sha256 of the profile's policy file (tamper-evident binding)."""
     pp = Path(os.path.expanduser(profile["policy_path"]))
@@ -482,6 +551,8 @@ def check_profile_protected(profile):
     """The profile's policy file must be owner-only, like all signer state."""
     pp = Path(os.path.expanduser(profile["policy_path"]))
     st = os.stat(pp)
+    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+        sys.exit("Profile policy is not owned by the signer")
     if st.st_mode & 0o077:
         sys.exit(f"refusing: policy file {pp} is not owner-only "
                  f"(mode {oct(st.st_mode & 0o777)})")
@@ -498,6 +569,8 @@ def verify_profile_binding(profile_name, profile, prop):
         raise ProposalError(
             f"proposal is bound to profile {prop.get('profile')!r}, not "
             f"{profile_name!r} — refusing (cross-profile use)")
+    if prop.get("profile_sha256") != canonical_hash(profile):
+        raise ProposalError("Signing profile changed since approval; rebuild proposal")
     if prop.get("account") != profile["account"]:
         raise ProposalError(
             f"proposal account {prop.get('account')} != profile account "
@@ -635,37 +708,29 @@ LSF_DISABLE_MASTER = 0x00100000
 
 
 def check_ledger_key_authorization(client, account, derived_address):
-    """Return a denial reason or None. Refuses master seeds for accounts
-    whose master key is disabled on-ledger."""
-    if derived_address != account:
-        return None  # regular key or foreign seed; ledger decides
+    """Verify master/RegularKey authorization at a validated ledger."""
+    from xrpl.models.requests import AccountInfo
     try:
-        from xrpl.models.requests import AccountInfo
         r = client.request(AccountInfo(account=account, ledger_index="validated"))
+        if not r.is_successful() or r.result.get("validated") is not True:
+            return "Could not verify validated signing authority"
+        data = r.result["account_data"]
+        if derived_address == account and not int(data.get("Flags", 0)) & LSF_DISABLE_MASTER:
+            return None
+        if derived_address == data.get("RegularKey"):
+            return None
+        return "Seed is not an enabled master key or authorized RegularKey"
     except Exception:
-        return ("could not verify master-key status (node error) — fail closed")
-    if not r.is_successful():
-        return (f"could not verify master-key status "
-                f"({r.result.get('error')}) — fail closed")
-    flags = int(r.result["account_data"].get("Flags", 0))
-    if flags & LSF_DISABLE_MASTER:
-        return (f"account {account} has its master key DISABLED on-ledger; "
-                f"the provided seed derives to the account itself (a master "
-                f"seed) and can never sign — refusing")
-    return None
+        return "Could not verify validated signing authority"
+
 
 
 # ---------- safe terminal output ----------
 
-def safe_terminal_text(s, max_len=120) -> str:
-    """Single-line, control-character-stripped text for terminal display."""
-    if s is None:
-        return ""
-    t = str(s).replace("\n", " ").replace("\r", " ").replace("\t", " ")
-    t = "".join(ch for ch in t if ch.isprintable() or ch == " ")
-    if len(t) > max_len:
-        t = t[:max_len] + "…"
-    return t
+def safe_terminal_text(s, limit=None):
+    from xrpl_display import safe_terminal_text as sanitize
+    return sanitize(s, limit)
+
 
 
 # ---------- derived summaries (never trust stored text) ----------
@@ -1090,70 +1155,107 @@ def check_mint_rate(policy: dict, tracker) -> list:
     return tracker.check_count(NFT_MINT_ASSET, 1, cap)
 
 
-def fetch_nft_offer_entry(client, offer_index: str):
+def _require_validated_ledger(result, what):
+    """Fail closed unless a ledger-data response came from a validated
+    ledger. Peer servers default to their mutable current ledger; XRPL
+    documentation recommends pinning reads to a validated one."""
+    if not isinstance(result, dict) or result.get("validated") is not True:
+        return (f"{what}: node returned data from an unvalidated ledger — "
+                "refusing")
+    return None
+
+
+def fetch_nft_offer_entry(client, offer_index: str, ledger_index="validated"):
     """Fetch an NFTokenOffer ledger entry by its index. Returns
     (entry_dict, problem). problem is None on success. Fail closed:
-    any lookup failure is a problem, never an assumption."""
+    any lookup failure is a problem, never an assumption.
+
+    Reads are pinned to a validated ledger (default: the latest validated
+    one); callers verifying several facts pin them all to ONE validated
+    ledger index so the facts can't come from different ledger states."""
     from xrpl.models.requests import LedgerEntry
     if not (isinstance(offer_index, str) and len(offer_index) == 64
             and all(c in "0123456789abcdefABCDEF" for c in offer_index)):
         return None, ("offer index must be 64 hex characters — refusing")
     try:
-        r = client.request(LedgerEntry(index=offer_index.upper()))
+        r = client.request(LedgerEntry(index=offer_index.upper(),
+                                       ledger_index=ledger_index))
     except Exception as e:  # noqa: BLE001
         return None, (f"could not read the offer from the ledger: {e} — "
                        f"refusing")
     if not r.is_successful():
         return None, (f"offer not on ledger (entryNotFound or node error) — "
                        f"refusing")
-    node = (r.result or {}).get("node")
+    res = r.result or {}
+    problem = _require_validated_ledger(res, "offer lookup")
+    if problem or (isinstance(ledger_index, int) and res.get("ledger_index") != ledger_index):
+        return None, problem or "Offer ledger does not match pinned ledger"
+    node = res.get("node")
     if not isinstance(node, dict):
         return None, "ledger returned a malformed offer entry — refusing"
     return node, None
 
 
-def fetch_nft_meta(client, owner: str, nftoken_id: str):
-    """On-ledger NFT metadata (URI text, taxon) for one token. Returns
-    (uri_text, taxon, problem). A missing token is a problem — this is
-    the counterfeit check: the seller must actually own the token on
-    the ledger right now."""
+def fetch_nft_meta(client, owner: str, nftoken_id: str,
+                   ledger_index="validated"):
+    """On-ledger NFT metadata (URI text, taxon, issuer) for one token.
+    Returns (uri_text, taxon, issuer, problem). A missing token is a
+    problem — this is the counterfeit check: the seller must actually
+    own the token on the ledger right now.
+
+    The issuer (minter) is distinct from the seller (current owner):
+    anyone can mint the same artwork, so the human judges the issuer,
+    never the seller.
+
+    Reads are pinned to a validated ledger; see fetch_nft_offer_entry."""
     from xrpl.models.requests import AccountNFTs
     marker = None
     while True:
         try:
             r = client.request(AccountNFTs(account=owner, limit=400,
+                                           ledger_index=ledger_index,
                                            marker=marker))
         except Exception as e:  # noqa: BLE001
-            return None, None, (f"could not read the seller's NFTs: {e} — "
-                                f"refusing")
+            return None, None, None, (f"could not read the seller's NFTs: "
+                                      f"{e} — refusing")
         if not r.is_successful():
-            return None, None, ("could not read the seller's NFTs "
-                                "(node error) — refusing")
-        for n in (r.result or {}).get("account_nfts", []):
+            return None, None, None, ("could not read the seller's NFTs "
+                                      "(node error) — refusing")
+        res = r.result or {}
+        problem = _require_validated_ledger(res, "NFT inventory lookup")
+        if problem or (isinstance(ledger_index, int) and res.get("ledger_index") != ledger_index):
+            return None, None, None, problem or "Inventory ledger does not match pinned ledger"
+        for n in res.get("account_nfts", []):
             if n.get("NFTokenID") == nftoken_id:
                 uri_hex = n.get("URI", "")
                 try:
                     uri_txt = bytes.fromhex(uri_hex).decode("utf-8", "replace")
                 except (ValueError, TypeError):
                     uri_txt = "<uri is not valid hex>"
-                return uri_txt, n.get("NFTokenTaxon"), None
-        marker = (r.result or {}).get("marker")
+                return (uri_txt, n.get("NFTokenTaxon"), n.get("Issuer"),
+                        None)
+        marker = res.get("marker")
         if not marker:
             break
-    return None, None, ("token not found in the seller's inventory — the "
-                       "seller may no longer own it — refusing")
+    return None, None, None, ("token not found in the seller's inventory — "
+                             "the seller may no longer own it — refusing")
 
 
 def nft_sell_offer_report(client, offer_index: str):
     """Full verification of an NFT sell offer from the ledger.
 
     Returns (report_lines, denials, xrp_amount_or_None). The report is
-    the anti-counterfeit ceremony: seller, token id, price, on-ledger
-    URI and taxon — facts for the human to judge, never an authenticity
-    claim."""
+    the anti-counterfeit ceremony: seller (current owner), issuer
+    (minter), token id, price, on-ledger URI and taxon — facts for the
+    human to judge, never an authenticity claim."""
     from xrpl.utils import drops_to_xrp
     lines = []
-    entry, problem = fetch_nft_offer_entry(client, offer_index)
+    # Pin the offer-entry and ownership checks to ONE validated ledger, so
+    # the report can't mix facts from different ledger states.
+    ledger_index, problem = get_validated_ledger(client)
+    if problem:
+        return [], [problem], None
+    entry, problem = fetch_nft_offer_entry(client, offer_index, ledger_index)
     if problem:
         return [], [problem], None
     if entry.get("LedgerEntryType") != "NFTokenOffer":
@@ -1171,18 +1273,20 @@ def nft_sell_offer_report(client, offer_index: str):
         price = Decimal(drops_to_xrp(amount))
     except Exception:  # noqa: BLE001
         return [], ["sell offer amount is not valid drops — refusing"], None
+    if not price.is_finite() or price < 0:
+        return [], ["Invalid NFT offer amount"], None
     seller = entry.get("Owner", "?")
     nid = entry.get("NFTokenID", "?")
-    uri_txt, taxon, meta_problem = fetch_nft_meta(client, seller, nid)
+    uri_txt, taxon, issuer, meta_problem = fetch_nft_meta(
+        client, seller, nid, ledger_index)
     lines.append(f"offer:    {offer_index.upper()}")
-    lines.append(f"seller:   {seller}")
+    lines.append(f"seller:   {seller} (current owner)")
+    lines.append(f"issuer:   {issuer or '?'} (minter)")
     lines.append(f"token:    {nid}")
     lines.append(f"price:    {price} XRP")
     if meta_problem:
         return lines, [meta_problem], None
-    if len(uri_txt) > 120:
-        uri_txt = uri_txt[:117] + "..."
-    lines.append(f"uri:      {uri_txt}")
+    lines.append(f"uri:      {safe_terminal_text(uri_txt, 120)}")
     lines.append(f"taxon:    {taxon}")
     expiry = entry.get("Expiration")
     if expiry is not None:
@@ -1838,6 +1942,16 @@ def check_gift_cap(amount: Decimal, ccy: str, max_gift_xrp: Decimal):
     return None
 
 
+def require_local_network(network):
+    if network not in ("testnet", "devnet"):
+        sys.exit("Mainnet is vault-only: explicit testnet/devnet identity required for local credentials")
+
+
+def local_wallet_path(network):
+    require_local_network(network)
+    return XRPL_DIR / ("local-wallet-" + network + ".json")
+
+
 def read_giveaway_seed():
     """Return the donation-wallet seed from giveaway.json, or None.
 
@@ -1852,20 +1966,18 @@ def read_giveaway_seed():
     return seed if isinstance(seed, str) and seed.strip() else None
 
 
-def write_giveaway_seed(seed):
+def write_giveaway_seed(seed, network=None):
+    require_local_network(network)
     """Atomically store the seed in giveaway.json (owner-only 0600).
 
     Called ONLY by the interactive `giveaway setup` (getpass, never
     echoed). Never prints the seed."""
-    ensure_giveaway_config()
-    raw = json.loads(GIVEAWAY_PATH.read_text())
-    if not isinstance(raw, dict):
-        raw = {}
-    raw["seed"] = seed
-    tmp = GIVEAWAY_PATH.with_name(GIVEAWAY_PATH.name + ".tmp")
-    tmp.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, GIVEAWAY_PATH)
+    from xrpl.wallet import Wallet
+    address = Wallet.from_seed(seed).classic_address
+    atomic_private_json(XRPL_DIR / ("local-giveaway-" + network + ".json"),
+                        {"format": "xrpl-local-test-wallet/1", "network": network,
+                         "address": address, "seed": seed})
+
 
 
 def default_giveaway_policy(max_gift_xrp, network):
@@ -1965,14 +2077,13 @@ def add_destination_allowlist_entry(address, destination_tag):
 
 
 def decode_nft_uri(uri_hex, limit=90):
-    """Hex-decode an NFToken URI for display. Never raises."""
+    """Hex-decode an NFToken URI for display. Never raises. Output is
+    terminal-sanitized (see safe_terminal_text)."""
     try:
         txt = bytes.fromhex(uri_hex or "").decode("utf-8", "replace")
     except (ValueError, TypeError):
         return "<uri is not valid hex>"
-    if len(txt) > limit:
-        txt = txt[:limit - 1] + "…"
-    return txt
+    return safe_terminal_text(txt, limit)
 
 
 def get_validated_ledger(client):
@@ -2232,6 +2343,222 @@ DEFAULT_POLICY = {
 }
 
 
+class PolicyError(ValueError):
+    """The policy file violates the strict schema. The signer and the
+    trade CLI refuse to run against it — a malformed policy must never
+    silently degrade into permissive defaults."""
+
+
+# Sanity bounds for the strict policy schema. These are not trading
+# opinions; they catch typos and smuggled absurdity (a "max fee" of
+# ten billion drops is never what the operator meant).
+_POLICY_MAX_MONEY = Decimal("1000000000000000")  # 1e15, any denomination
+_POLICY_MAX_SECONDS = 10 * 365 * 86400           # 10 years
+_POLICY_MAX_FEE_DROPS = 1_000_000
+_POLICY_MAX_MINTS_PER_DAY = 1_000_000
+_POLICY_MAX_URI_BYTES = 4096
+_NFT_MINT_FLAG_BITS = {1, 2, 4, 8}  # burnable, only-xrp, trustline, transferable
+_NFT_KNOWN_KEYS = {"max_transfer_fee", "max_mints_per_day",
+                   "allowed_mint_flags", "max_uri_bytes",
+                   "allow_buy_offers", "max_bid_xrp"}
+# Giveaway-variant keys (see default_giveaway_policy): known, optional,
+# strictly boolean. Anything else unknown is refused.
+_POLICY_OPTIONAL_KEYS = {"giveaway", "allow_any_payment_destination"}
+_POLICY_REQUIRED_KEYS = (set(DEFAULT_POLICY) - _POLICY_OPTIONAL_KEYS)
+
+
+def _policy_int(v):
+    """A real JSON integer (bool is not an integer here)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _policy_decimal(v):
+    """Decimal from a strict money value: str or int, never float (which
+    would smuggle binary rounding into limit comparisons) or bool."""
+    if isinstance(v, bool) or isinstance(v, float):
+        return None
+    try:
+        d = Decimal(str(v))
+        return d if d.is_finite() else None
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def validate_policy(pol):
+    """Strict schema validation for a MERGED policy (defaults already
+    applied by load_policy). Returns pol unchanged on success.
+
+    Raises PolicyError listing EVERY violation in one fail-closed error:
+    unknown keys, wrong types, out-of-range values, bad addresses,
+    unsupported networks or transaction types, and inconsistent NFT
+    controls. Unknown keys are refused outright — a half-written
+    value-policy field (e.g. a lone `allowed_nft_issuers`) must never be
+    silently ignored."""
+    from xrpl.core.addresscodec import is_valid_classic_address
+
+    problems = []
+    if not isinstance(pol, dict):
+        raise PolicyError(
+            "policy schema violation: policy must be a JSON object")
+
+    for key in pol:
+        if key not in _POLICY_REQUIRED_KEYS | _POLICY_OPTIONAL_KEYS:
+            problems.append(f"unknown policy key {key!r}")
+    for key in _POLICY_REQUIRED_KEYS:
+        if key not in pol:
+            problems.append(f"missing required policy key {key!r}")
+
+    def _bad(cond, msg):
+        if cond:
+            problems.append(msg)
+
+    if "policy_version" in pol:
+        _bad(not _policy_int(pol["policy_version"])
+             or pol["policy_version"] != POLICY_VERSION,
+             f"policy_version must be {POLICY_VERSION}, "
+             f"got {pol['policy_version']!r}")
+
+    if "network_lock" in pol:
+        _bad(not isinstance(pol["network_lock"], str)
+             or pol["network_lock"] not in NETWORKS,
+             f"network_lock must be one of {sorted(NETWORKS)}, "
+             f"got {pol['network_lock']!r}")
+
+    if "max_fee_drops" in pol:
+        v = pol["max_fee_drops"]
+        _bad(not _policy_int(v) or not 0 < v <= _POLICY_MAX_FEE_DROPS,
+             f"max_fee_drops must be an integer 1..{_POLICY_MAX_FEE_DROPS}, "
+             f"got {v!r}")
+
+    if "spend_limits" in pol:
+        lim = pol["spend_limits"]
+        if not isinstance(lim, dict):
+            problems.append("spend_limits must be an object of asset "
+                            f"limits, got {lim!r}")
+        else:
+            for asset, entry in lim.items():
+                where = f"spend_limits[{asset!r}]"
+                _bad(not isinstance(asset, str) or not asset,
+                     f"{where}: asset code must be a non-empty string")
+                if not isinstance(entry, dict):
+                    problems.append(f"{where} must be an object")
+                    continue
+                for k in entry:
+                    if k not in ("per_tx", "per_day"):
+                        problems.append(f"{where}: unknown key {k!r}")
+                for k in ("per_tx", "per_day"):
+                    d = _policy_decimal(entry.get(k))
+                    _bad(d is None or d < 0 or d > _POLICY_MAX_MONEY,
+                         f"{where}.{k} must be a non-negative decimal, "
+                         f"got {entry.get(k)!r}")
+
+    if "destination_allowlist" in pol:
+        allow = pol["destination_allowlist"]
+        if not isinstance(allow, list):
+            problems.append("destination_allowlist must be a list, "
+                            f"got {allow!r}")
+        else:
+            for i, entry in enumerate(allow):
+                where = f"destination_allowlist[{i}]"
+                if not isinstance(entry, dict):
+                    problems.append(f"{where} must be an object")
+                    continue
+                for k in entry:
+                    if k not in ("address", "destination_tag"):
+                        problems.append(f"{where}: unknown key {k!r}")
+                addr = entry.get("address")
+                _bad(not isinstance(addr, str)
+                     or not is_valid_classic_address(addr),
+                     f"{where}.address is not a valid classic address: "
+                     f"{addr!r}")
+                tag = entry.get("destination_tag")
+                _bad(tag is not None
+                     and (not _policy_int(tag) or not 0 <= tag < 2 ** 32),
+                     f"{where}.destination_tag must be null or an integer "
+                     f"0..{2 ** 32 - 1}, got {tag!r}")
+
+    for key in ("max_deviation_bps", "max_spread_bps"):
+        if key in pol:
+            v = pol[key]
+            _bad(not _policy_int(v) or not 0 <= v <= 10_000,
+                 f"{key} must be an integer 0..10000, got {v!r}")
+
+    if "min_book_depth" in pol:
+        d = _policy_decimal(pol["min_book_depth"])
+        _bad(d is None or d < 0 or d > _POLICY_MAX_MONEY,
+             "min_book_depth must be a non-negative decimal, "
+             f"got {pol['min_book_depth']!r}")
+
+    for key in ("max_offer_lifetime_seconds", "proposal_ttl_seconds"):
+        if key in pol:
+            v = pol[key]
+            _bad(not _policy_int(v) or not 0 < v <= _POLICY_MAX_SECONDS,
+                 f"{key} must be a positive integer of seconds, got {v!r}")
+
+    if "allowed_tx_types" in pol:
+        types = pol["allowed_tx_types"]
+        supported = set(REQUIRED_FIELDS)
+        if not isinstance(types, list):
+            problems.append("allowed_tx_types must be a list, "
+                            f"got {types!r}")
+        else:
+            for t in types:
+                _bad(not isinstance(t, str) or t not in supported,
+                     f"allowed_tx_types has unsupported transaction type "
+                     f"{t!r} (supported: {sorted(supported)})")
+
+    if "nft" in pol:
+        nft = pol["nft"]
+        if not isinstance(nft, dict):
+            problems.append(f"nft must be an object, got {nft!r}")
+        else:
+            for k in nft:
+                if k not in _NFT_KNOWN_KEYS:
+                    problems.append(f"nft: unknown key {k!r}")
+            v = nft.get("max_transfer_fee")
+            _bad(not _policy_int(v) or not 0 <= v <= 50_000,
+                 f"nft.max_transfer_fee must be an integer 0..50000, "
+                 f"got {v!r}")
+            v = nft.get("max_mints_per_day")
+            _bad(not _policy_int(v) or not 0 <= v <= _POLICY_MAX_MINTS_PER_DAY,
+                 "nft.max_mints_per_day must be a non-negative integer, "
+                 f"got {v!r}")
+            flags = nft.get("allowed_mint_flags")
+            if not isinstance(flags, list) or any(
+                    not _policy_int(f) or f not in _NFT_MINT_FLAG_BITS
+                    for f in flags):
+                problems.append(
+                    "nft.allowed_mint_flags must be a list of flag bits "
+                    f"{sorted(_NFT_MINT_FLAG_BITS)}, got {flags!r}")
+            v = nft.get("max_uri_bytes")
+            _bad(not _policy_int(v) or not 0 < v <= _POLICY_MAX_URI_BYTES,
+                 "nft.max_uri_bytes must be a positive integer "
+                 f"<= {_POLICY_MAX_URI_BYTES}, got {v!r}")
+            _bad(not isinstance(nft.get("allow_buy_offers"), bool),
+                 "nft.allow_buy_offers must be true/false, "
+                 f"got {nft.get('allow_buy_offers')!r}")
+            d = _policy_decimal(nft.get("max_bid_xrp"))
+            _bad(d is None or d < 0 or d > _POLICY_MAX_MONEY,
+                 "nft.max_bid_xrp must be a non-negative decimal, "
+                 f"got {nft.get('max_bid_xrp')!r}")
+            # NOTE: no allow_buy_offers/allowed_tx_types consistency rule
+            # here on purpose: allow_buy_offers also gates *bids*
+            # (NFTokenCreateOffer, in the defaults), so an operator who
+            # allows bids but not accepts is coherent. The parked
+            # value-policy fields are enforced by unknown-key rejection
+            # above — a lone allowed_nft_issuers can never slip through.
+
+    for key in _POLICY_OPTIONAL_KEYS:
+        if key in pol:
+            _bad(not isinstance(pol[key], bool),
+                 f"{key} must be true/false, got {pol[key]!r}")
+
+    if problems:
+        raise PolicyError("policy schema violation:\n  "
+                          + "\n  ".join(problems))
+    return pol
+
+
 def load_policy(path=None):
     p = Path(path) if path else POLICY_PATH
     if not p.exists():
@@ -2240,12 +2567,17 @@ def load_policy(path=None):
         pol = json.loads(p.read_text())
     except json.JSONDecodeError:
         sys.exit(f"Policy file is not valid JSON: {p}")
+    if not isinstance(pol, dict):
+        sys.exit("Policy must be a JSON object")
     if pol.get("policy_version") != POLICY_VERSION:
         sys.exit(f"Policy is v{pol.get('policy_version')}, signer requires "
                  f"v{POLICY_VERSION} — run `xrpl-sign migrate-policy`.")
     merged = dict(DEFAULT_POLICY)
     merged.update(pol)
-    return merged
+    try:
+        return validate_policy(merged)
+    except PolicyError as e:
+        sys.exit(str(e))
 
 
 def check_protected_files(extra=()):
@@ -2270,7 +2602,8 @@ def check_protected_files(extra=()):
     # `extra` covers giveaway-mode files: the giveaway policy and
     # giveaway.json (which may hold the donation-wallet seed).
     for p in (POLICY_PATH, PROFILES_PATH, APPROVED_PATH, FAVORITES_PATH,
-              STATE_PATH, STATE_LOCK_PATH, AUDIT_PATH, *extra):
+              STATE_PATH, STATE_LOCK_PATH, GIVEAWAY_STATE_PATH,
+              GIVEAWAY_STATE_LOCK_PATH, AUDIT_PATH, *extra):
         if not p.exists():
             continue
         st = p.stat()
@@ -2286,6 +2619,33 @@ def check_protected_files(extra=()):
 
 
 # ---------- concurrency-safe spend tracker ----------
+
+def atomic_private_json(path, data):
+    import tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".xrpl-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            os.chmod(name, 0o600)
+            json.dump(data, out, allow_nan=False)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(name, path)
+        if os.name == "posix":
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+class StateCorruptError(Exception):
+    """Accounting is unavailable; never infer an empty budget."""
+
 
 class SpentTracker:
     """True rolling-24h per-asset spend tracker with an exclusive file lock.
@@ -2322,82 +2682,71 @@ class SpentTracker:
             finally:
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
-    class StateError(Exception):
+    class StateError(StateCorruptError):
         """Spend state is corrupt or unreadable — fail closed, recover."""
 
     @staticmethod
     def _validate_entry(e):
-        """P2-6: reject negative/nonfinite amounts and inconsistent records.
-
-        Returns the entry if valid; raises StateError otherwise. Invalid
-        accounting must never silently offset genuine spending.
-        """
         if not isinstance(e, dict):
-            raise SpentTracker.StateError(f"entry is not an object: {e!r}")
-        for key in ("rid", "ts", "asset", "amount", "status"):
-            if key not in e:
-                raise SpentTracker.StateError(
-                    f"entry missing {key!r}: {e!r}")
-        if e["status"] not in ("pending", "confirmed"):
-            raise SpentTracker.StateError(
-                f"entry has unknown status {e['status']!r}: {e!r}")
-        try:
-            amt = Decimal(str(e["amount"]))
-        except Exception:
-            raise SpentTracker.StateError(
-                f"entry amount unparsable: {e!r}")
-        if not amt.is_finite():
-            raise SpentTracker.StateError(
-                f"entry amount is non-finite: {e!r}")
-        if amt < 0:
-            raise SpentTracker.StateError(
-                f"entry amount is negative: {e!r}")
-        try:
-            int(e["ts"])
-        except Exception:
-            raise SpentTracker.StateError(
-                f"entry ts unparsable: {e!r}")
+            raise SpentTracker.StateError("State entry must be an object")
+        for field in ("rid", "asset"):
+            if not isinstance(e.get(field), str) or not e[field]:
+                raise SpentTracker.StateError("Invalid state " + field)
+        if type(e.get("ts")) is not int or not 0 <= e["ts"] <= int(time.time()) + MAX_FUTURE_SKEW:
+            raise SpentTracker.StateError("Invalid state timestamp")
+        amount = _policy_decimal(e.get("amount"))
+        if amount is None or amount < 0:
+            raise SpentTracker.StateError("State amount must be finite and nonnegative")
+        if e["asset"] == NFT_MINT_ASSET and amount != amount.to_integral_value():
+            raise SpentTracker.StateError("Mint count must be integral")
+        if e.get("status") not in ("pending", "confirmed"):
+            raise SpentTracker.StateError("Unknown reservation status")
+        h = e.get("tx_hash")
+        if h is not None and (not isinstance(h, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", h)):
+            raise SpentTracker.StateError("Invalid transaction hash")
+        for field in ("last_ledger", "submit_ledger"):
+            v = e.get(field)
+            if v is not None and (type(v) is not int or not 0 < v < 2**32):
+                raise SpentTracker.StateError("Invalid " + field)
+        if e.get("submit_ledger") and (not e.get("last_ledger") or e["submit_ledger"] > e["last_ledger"]):
+            raise SpentTracker.StateError("Inconsistent submission range")
+        if e["status"] == "pending" and h and not e.get("last_ledger"):
+            raise SpentTracker.StateError("Bound reservation missing expiry ledger")
+        if not h and (e.get("last_ledger") or e.get("submit_ledger")):
+            raise SpentTracker.StateError("Unbound reservation has ledger identity")
         return e
 
     def _load(self):
-        # P2-6: a missing file is a fresh start; a CORRUPT file must NOT
-        # silently reset limits — that would let spending exceed caps.
         try:
             raw = self.state_path.read_text()
         except FileNotFoundError:
+            if self.state_path.with_suffix(".initialized").exists():
+                raise self.StateError("Initialized state is missing; restore a reviewed backup. Do NOT delete state to reset limits")
             return {"entries": []}
         except OSError as ex:
-            raise SpentTracker.StateError(
-                f"cannot read spend state {self.state_path}: {ex}")
+            raise self.StateError("Cannot read spend state; restore a reviewed backup") from ex
         try:
             st = json.loads(raw)
-        except json.JSONDecodeError as ex:
-            raise SpentTracker.StateError(
-                f"spend state {self.state_path} is corrupt ({ex}); "
-                f"limits are NOT reset — run `xrpl-sign recover-state` "
-                f"to reconcile from the ledger")
-        if isinstance(st.get("entries"), list):
-            return {"entries": [self._validate_entry(e)
-                                for e in st["entries"]]}
-        if isinstance(st.get("totals"), dict):
-            # migrate the v0.3 single-bucket format
-            w0 = int(st.get("window_start", 0))
-            return {"entries": [
-                {"rid": "migrated", "ts": w0, "asset": a,
-                 "amount": str(v), "status": "confirmed",
-                 "tx_hash": None, "last_ledger": None,
-                 "submit_ledger": None}
-                for a, v in st["totals"].items()]}
-        raise SpentTracker.StateError(
-            f"spend state {self.state_path} has unknown shape — refusing "
-            f"to reset limits; run `xrpl-sign recover-state`")
+            if not isinstance(st, dict):
+                raise ValueError("State must be an object")
+            if isinstance(st.get("entries"), list):
+                entries = st["entries"]
+            elif isinstance(st.get("totals"), dict):
+                entries = [{"rid": "migrated", "ts": st.get("window_start"),
+                            "asset": a, "amount": v, "status": "confirmed",
+                            "tx_hash": None, "last_ledger": None, "submit_ledger": None}
+                           for a, v in st["totals"].items()]
+            else:
+                raise ValueError("Unknown state structure")
+            return {"entries": [self._validate_entry(e) for e in entries]}
+        except (ValueError, TypeError, self.StateError) as ex:
+            raise self.StateError("Corrupt spend state. Restore a reviewed backup or reconstruct ALL liabilities using audit.log and validated ledger records. Do NOT delete state or omit unresolved obligations. " + str(ex)) from ex
 
     def _save(self, st):
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st))
-        os.chmod(tmp, 0o600)
-        tmp.replace(self.state_path)
+        for entry in st["entries"]:
+            self._validate_entry(entry)
+        atomic_private_json(self.state_path.with_suffix(".initialized"), {"initialized": True})
+        atomic_private_json(self.state_path, st)
 
     @staticmethod
     def _prune(entries, now):
@@ -2563,6 +2912,7 @@ class SpentTracker:
             for e in st["entries"]:
                 if e.get("tx_hash") == tx_hash and e.get("status") == "pending":
                     e["status"] = "confirmed"
+                    e["ts"] = int(time.time())
             self._save(st)
 
     def release_tx(self, tx_hash, fee_drops=None):
@@ -2605,6 +2955,8 @@ class SpentTracker:
             return False
         try:
             lo, hi = int(lo), int(hi)
+            if not 0 < lo <= hi:
+                return False
             for part in str(complete_ledgers).split(","):
                 part = part.strip()
                 if "-" in part:
@@ -2618,83 +2970,57 @@ class SpentTracker:
         return False
 
     def sweep_pending(self, client):
-        """Resolve ambiguous pending reservations against the ledger (P1-3).
-
-        For each bound pending entry whose LastLedgerSequence has passed
-        the validated ledger:
-        - tx found, validated, tesSUCCESS -> confirmed.
-        - tx found, validated, FAILED -> trade entries released, but the
-          consumed FEE is retained as a confirmed XRP spend.
-        - tx NOT found -> released ONLY on proven non-inclusion: the
-          node's complete_ledgers must cover [submit_ledger, last_ledger].
-          Anything less (tooBusy, timeouts, pruned history, unvalidated
-          data) keeps the entry pending. Never release on a guess.
-        """
-        from xrpl.models.requests import Ledger, Tx
+        """Release only on validated outcome or explicit, history-proven absence."""
+        from xrpl.models.requests import Ledger, Tx, ServerInfo
         from xrpl.utils import drops_to_xrp
         with self._locked():
-            now = int(time.time())
-            entries = self._prune(self._load()["entries"], now)
-            bound = [e for e in entries
-                     if e.get("status") == "pending" and e.get("tx_hash")
-                     and e.get("last_ledger")]
-            if not bound:
+            entries = self._prune(self._load()["entries"], int(time.time()))
+            groups = {}
+            for e in entries:
+                if e["status"] == "pending" and e.get("tx_hash"):
+                    groups.setdefault(e["tx_hash"], []).append(e)
+            if not groups:
                 self._save({"entries": entries})
                 return
             try:
-                led = client.request(
-                    Ledger(ledger_index="validated")).result
-                cur = int(led["ledger_index"])
-                complete = led.get("complete_ledgers", "")
-            except Exception:  # noqa: BLE001
-                self._save({"entries": entries})
-                return  # cannot tell — keep everything pending
-            keep = []
-            for e in entries:
-                if not (e.get("status") == "pending" and e.get("tx_hash")
-                        and e.get("last_ledger")
-                        and int(e["last_ledger"]) < int(cur)):
-                    keep.append(e)
-                    continue
+                lr = client.request(Ledger(ledger_index="validated"))
+                if not lr.is_successful() or lr.result.get("validated") is not True:
+                    return
+                cur = lr.result["ledger_index"]
+                sr = client.request(ServerInfo())
+                complete = sr.result.get("info", {}).get("complete_ledgers", "") if sr.is_successful() else ""
+            except Exception:
+                return
+            replacements = {}
+            for h, group in groups.items():
                 try:
-                    r = client.request(Tx(transaction=e["tx_hash"]))
-                except Exception:  # noqa: BLE001
-                    keep.append(e)  # uncertain — keep pending
-                    continue
-                if not r.is_successful():
-                    # Not found (or node trouble): release ONLY on proven
-                    # non-inclusion over the full submission range.
-                    if self._history_covers(
-                            complete, e.get("submit_ledger"),
-                            e.get("last_ledger")):
-                        continue  # proven never-included -> release
-                    keep.append(e)  # cannot prove it — keep pending
-                    continue
-                if not r.result.get("validated"):
-                    keep.append(e)  # unvalidated data — keep pending
-                    continue
-                res = (r.result.get("meta", {}) or {}
-                       ).get("TransactionResult")
-                if res == "tesSUCCESS":
-                    e["status"] = "confirmed"
-                    keep.append(e)
-                else:
-                    # Validated failure: the fee was still consumed.
-                    # Drop the trade entries, retain the fee as confirmed.
-                    try:
-                        fee_xrp = Decimal(drops_to_xrp(
-                            str(r.result.get("Fee", "0"))))
-                    except Exception:  # noqa: BLE001
-                        fee_xrp = Decimal(0)
-                    if fee_xrp > 0:
-                        e["asset"] = "XRP"
-                        e["amount"] = str(fee_xrp)
-                        e["status"] = "confirmed"
-                        e["note"] = ("fee consumed by validated failed tx "
-                                     f"({res})")
-                        keep.append(e)
-                    # else: nothing was consumed -> drop the entry
-            self._save({"entries": keep})
+                    r = client.request(Tx(transaction=h))
+                    if not r.is_successful():
+                        proven = (r.result.get("error") == "txnNotFound" and all(
+                            e.get("last_ledger") and e["last_ledger"] < cur and
+                            self._history_covers(complete, e.get("submit_ledger"), e["last_ledger"])
+                            for e in group))
+                        if proven:
+                            replacements[h] = []
+                        continue
+                    if r.result.get("validated") is not True:
+                        continue
+                    result = r.result.get("meta", {}).get("TransactionResult")
+                    if result == "tesSUCCESS":
+                        replacements[h] = [dict(e, status="confirmed", ts=int(time.time())) for e in group]
+                    elif isinstance(result, str) and result.startswith("tec"):
+                        txdata = r.result.get("tx_json", r.result)
+                        fee = int(txdata["Fee"])
+                        if fee < 0:
+                            continue
+                        replacements[h] = [dict(group[0], asset="XRP", amount=str(drops_to_xrp(str(fee))),
+                            status="confirmed", ts=int(time.time()), note="fee: " + result)] if fee else []
+                except Exception:
+                    continue  # malformed or incomplete evidence cannot free budget
+            kept = [e for e in entries if not (e["status"] == "pending" and e.get("tx_hash") in replacements)]
+            for group in replacements.values():
+                kept.extend(group)
+            self._save({"entries": kept})
 
 def audit(action, proposal_hash, tx_hash, network, account, result, note="",
           spends=None):

@@ -1,9 +1,11 @@
 """Offline unit tests for P1-5 book_reference changes (mocked client, no network)."""
 import sys, types
+from pathlib import Path
+BIN = Path(__file__).resolve().parents[1] / "bin"
 from decimal import Decimal
 
-sys.path.insert(0, "/home/hatch/workspace/skills/xrpl/bin")
-src = open("/home/hatch/workspace/skills/xrpl/bin/xrpl-sign").read()
+sys.path.insert(0, str(BIN))
+src = open(str(BIN / "xrpl-sign")).read()
 mod = types.ModuleType("xrpl_sign")
 mod.__file__ = "xrpl-sign"
 exec(compile(src, "xrpl-sign", "exec"), mod.__dict__)

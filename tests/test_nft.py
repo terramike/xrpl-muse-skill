@@ -236,11 +236,11 @@ with tempfile.TemporaryDirectory() as td:
           not any("deviat" in d for d in nft_denials(list_tx(), "nft-list")[0]))
 
     # --- 8. envelope invariants for the new actions ---
-    h, path = C.save_proposal(mint_tx(), "testnet", ACCT, "nft-mint")
+    h, path = C.save_proposal(mint_tx(), "testnet", ACCT, "nft-mint", profile="adhoc-testnet", policy_sha256=C._sha256_file(C.POLICY_PATH))
     prop = json.loads(path.read_text())
     check("nft-mint envelope verifies",
           invariants_raise(prop, prop["tx"]) is None)
-    h2, path2 = C.save_proposal(list_tx(), "testnet", ACCT, "nft-list")
+    h2, path2 = C.save_proposal(list_tx(), "testnet", ACCT, "nft-list", profile="adhoc-testnet", policy_sha256=C._sha256_file(C.POLICY_PATH))
     prop2 = json.loads(path2.read_text())
     check("nft-list envelope verifies",
           invariants_raise(prop2, prop2["tx"]) is None)
@@ -317,16 +317,16 @@ with tempfile.TemporaryDirectory() as td:
                          lock_path=tmp / "state2.lock")
     d, r1 = tr2.try_reserve_count(C.NFT_MINT_ASSET, 1, 10)
     check("lifecycle reservation ok", not d and bool(r1))
-    tr2.bind_reservation(r1, "FAKEHASH1", 999)
-    tr2.confirm("FAKEHASH1")  # validated tesSUCCESS
+    tr2.bind_reservation(r1, "A" * 64, 999)
+    tr2.confirm("A" * 64)  # validated tesSUCCESS
     d, _ = tr2.try_reserve_count(C.NFT_MINT_ASSET, 10, 10)
     check("confirmed mint still counts toward the cap", bool(d))
-    tr2.release_tx("FAKEHASH1")  # validated failure
+    tr2.release_tx("A" * 64)  # validated failure
     d, _ = tr2.try_reserve_count(C.NFT_MINT_ASSET, 1, 10)
     check("validated-failure mint releases its slot", not d)
     # ambiguous (bound but unresolved) stays pending and counts
     d, r2 = tr2.try_reserve_count(C.NFT_MINT_ASSET, 1, 10)
-    tr2.bind_reservation(r2, "FAKEHASH2", 999)
+    tr2.bind_reservation(r2, "B" * 64, 999)
     d, _ = tr2.try_reserve_count(C.NFT_MINT_ASSET, 10, 10)
     check("unresolved in-flight mint still counts",
           any("in the last 24h" in x and "would exceed cap" in x
@@ -679,7 +679,7 @@ with tempfile.TemporaryDirectory() as td:
     stage_file = C.STAGE_DIR / f"{sid}.json"
 
     # happy path: pin uploads the EXACT staged bytes, ceremony shows digest
-    h = T.pin_and_propose_stage(sid, ncfg, None)
+    h = T.pin_and_propose_stage(sid, ncfg, None, approved_digest=dg)
     check("pin succeeds on an unmodified stage", h == "deadbeef" * 8)
     check("pin uploads the exact bytes that were hashed",
           pinned.get("bytes") == PNG)
@@ -690,7 +690,7 @@ with tempfile.TemporaryDirectory() as td:
     rec2 = dict(rec)
     rec2["royalty_bps"] = 5000
     stage_file.write_text(json.dumps(rec2))
-    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None, approved_digest=dg)
     check("pin refuses edited stage metadata before Pinata",
           msg is not None and "stage digest does not match" in msg
           and "NOT contacted" in msg)
@@ -698,7 +698,7 @@ with tempfile.TemporaryDirectory() as td:
     # tamper 2: swapped artwork file (still a valid PNG, different bytes)
     stage_file.write_text(json.dumps(rec))  # restore
     art.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\xff" * 100)
-    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None, approved_digest=dg)
     check("pin refuses a swapped artwork file",
           msg is not None and "changed since staging" in msg)
     art.write_bytes(PNG)  # restore
@@ -710,14 +710,14 @@ with tempfile.TemporaryDirectory() as td:
     rec3 = dict(rec)
     rec3["source_path"] = os.path.realpath(str(other))
     stage_file.write_text(json.dumps(rec3))
-    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None, approved_digest=dg)
     check("pin refuses a changed source path",
           msg is not None and "stage digest does not match" in msg)
 
     # tamper 4: a different minter account at pin time
     stage_file.write_text(json.dumps(rec))  # restore
     msg = expect_exit(T.pin_and_propose_stage, sid,
-                      {"address": DEST, "network": "testnet"}, None)
+                      {"address": DEST, "network": "testnet"}, None, approved_digest=dg)
     check("pin refuses a different minter account",
           msg is not None and "stage digest does not match" in msg)
 
@@ -728,7 +728,7 @@ with tempfile.TemporaryDirectory() as td:
     rec5 = dict(rec)
     rec5["source_path"] = str(oart)
     stage_file.write_text(json.dumps(rec5))
-    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None, approved_digest=dg)
     check("pin refuses artwork outside the protected media dir",
           msg is not None and "outside the NFT media directory" in msg)
 
@@ -742,7 +742,7 @@ with tempfile.TemporaryDirectory() as td:
     rec6 = dict(rec)
     rec6["format"] = "nft-stage/1"
     stage_file.write_text(json.dumps(rec6))
-    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None)
+    msg = expect_exit(T.pin_and_propose_stage, sid, ncfg, None, approved_digest=dg)
     check("pre-digest stage records are rejected",
           msg is not None and "unsupported format" in msg)
 

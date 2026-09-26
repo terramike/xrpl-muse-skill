@@ -43,6 +43,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import os
 import sys
 import time
@@ -237,7 +238,7 @@ def propose(tx, client, cfg, action, summary_lines):
     print("PROPOSAL — review carefully. Nothing has been submitted.")
     print("=" * 60)
     for ln in lines:
-        print("  " + ln)
+        print("  " + C.safe_terminal_text(ln))
     print("=" * 60)
     print(f"proposal hash: {h}")
     print(f"\nA HUMAN must review the hash above, then run:")
@@ -647,6 +648,8 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
 def load_stage_record(stage_id):
     """Load and sanity-check a stage record. Refuses missing/ambiguous/
     corrupt records - a bad stage never reaches the pin step."""
+    if not re.fullmatch(r"[0-9a-f]{16}", stage_id or ""):
+        sys.exit("Exact 16-character stage ID required")
     matches = (list(C.STAGE_DIR.glob(f"{stage_id}*.json"))
                if C.STAGE_DIR.exists() else [])
     if not matches:
@@ -684,7 +687,7 @@ def load_stage_record(stage_id):
     return rec
 
 
-def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
+def pin_and_propose_stage(stage_id, cfg, client, pinner=None, approved_digest=None):
     """Pin the staged artwork + metadata, then propose the NFTokenMint.
 
     The approval-gated step: the human reviewed the stage record and ran
@@ -703,7 +706,11 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
     if xrpl_pin is None:
         sys.exit("xrpl_pin module missing - cannot pin.")
     pinner = pinner or xrpl_pin
+    if not isinstance(approved_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", approved_digest):
+        sys.exit("Pinning requires --approve-stage with the full independently reviewed digest")
     rec = load_stage_record(stage_id)
+    if not hmac.compare_digest(approved_digest, rec["stage_digest"]):
+        sys.exit("Stage differs from approved digest; no upload performed")
     # The permitted media directory comes from protected configuration —
     # the stage record's media_dir field is informational only and is
     # NOT trusted here.
@@ -738,7 +745,7 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
     name = rec["name"]
     print("pinning to IPFS via Pinata (external write):")
     print(f"  stage digest: {rec['stage_digest']}")
-    print(f"    ^ the human approval below covers THIS digest. If it does")
+    print(f"    ^ the upload approval covers THIS digest. If it does")
     print(f"      not match the digest shown at staging time, STOP.")
     print(f"  file:      {C.safe_terminal_text(info['path'])}")
     print(f"  sha256:    {file_sha256}")
@@ -789,7 +796,7 @@ def cmd_nft_stage(args, cfg, client):
                         account=acct, network=network)
     print("STAGED - nothing has left this machine (zero network calls).")
     print(f"  stage id: {rec['stage_id']}")
-    print(f"  stage digest: {rec['stage_digest'][:16]}... "
+    print(f"  stage digest: {rec['stage_digest']}... "
           f"(full digest is bound into the pin approval)")
     print(f"  file:     {C.safe_terminal_text(rec['source_path'])}")
     print(f"  sha256:   {rec['sha256']}")
@@ -808,7 +815,7 @@ def cmd_nft_stage(args, cfg, client):
 
 def cmd_nft_pin_and_propose(args, cfg, client):
     """Step 2: pin the staged artwork + metadata, propose the mint."""
-    pin_and_propose_stage(args.stage, cfg, client)
+    pin_and_propose_stage(args.stage, cfg, client, approved_digest=args.approve_stage)
 
 
 def cmd_nft_list(args, cfg, client):
@@ -937,7 +944,7 @@ def cmd_nft_buy(args, cfg, client):
     print("does NOT authenticate art.")
     print("=" * 60)
     for ln in lines:
-        print("  " + ln)
+        print("  " + C.safe_terminal_text(ln))
     print("=" * 60)
     if denials:
         for d in denials:
@@ -1421,37 +1428,25 @@ def cmd_nft_new(args, cfg, client):
 # at all) the safest. See "Wallets" in SKILL.md.
 
 def generate_wallet_into_config(network, force=False):
-    """Generate a fresh ed25519 wallet; store seed 0600, return address.
-
-    Prints nothing. Refuses to overwrite an already-stored seed unless
-    force is set.
-    """
+    """Create only explicitly identified local test wallets; config stays public."""
     from xrpl.wallet import Wallet
-    cfg = {}
-    if C.CONFIG_PATH.exists():
-        cfg = json.loads(C.CONFIG_PATH.read_text())
-    if cfg.get("seed") and not force:
-        sys.exit("a wallet seed is already stored in ~/.xrpl/config.json — "
-                 "refusing to overwrite. Use `xrpl-trade wallet create --force` "
-                 "to replace it (treat the old wallet as burned if its seed "
-                 "was ever exposed).")
-    wallet = Wallet.create()  # ed25519 in this xrpl-py
-    # Belt and braces: the seed must derive the address we report.
-    if Wallet.from_seed(wallet.seed).classic_address != wallet.classic_address:
-        sys.exit("internal error: generated seed does not derive its address")
+    C.require_local_network(network)
+    cfg = json.loads(C.CONFIG_PATH.read_text()) if C.CONFIG_PATH.exists() else {}
+    if cfg.get("seed"):
+        sys.exit("Legacy seed must be migrated before provisioning; it will not be overwritten")
+    path = C.local_wallet_path(network)
+    if path.exists() and not force:
+        sys.exit("Local test wallet exists; --force is required to replace it")
+    wallet = Wallet.create()
     address = wallet.classic_address
-    seed = wallet.seed
-    del wallet
-    cfg.update({"seed": seed, "address": address, "network": network})
-    del seed
-    C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
-    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, C.CONFIG_PATH)
+    C.atomic_private_json(path, {"format": "xrpl-local-test-wallet/1", "network": network,
+                                "address": address, "seed": wallet.seed})
+    cfg.update({"address": address, "network": network})
+    C.atomic_private_json(C.CONFIG_PATH, cfg)
     C.audit("wallet_create", None, None, network, address, "stored",
-            note="seed stored 0600, never displayed")
+            note="separate local test credential; config contains no seed")
     return address
+
 
 
 def cmd_wallet(args, cfg):
@@ -1481,7 +1476,7 @@ def cmd_wallet(args, cfg):
         print("New TESTNET wallet generated locally (ed25519).")
         print(f"  address: {address}")
         print(f"  network: {network}")
-        print("  seed: stored in ~/.xrpl/config.json (0600) — never displayed,")
+        print("  seed: stored in a separate local-wallet-<network>.json (0600) — never displayed,")
         print("        never logged, never leaves this machine via this tool.")
         print("        (Local seed storage is TESTNET-ONLY. Mainnet wallets")
         print("         use the vault flow: `wallet create --network mainnet`.)")
@@ -1499,11 +1494,14 @@ def cmd_wallet(args, cfg):
             sys.exit("refusing: mainnet wallets are vault-only — the seed "
                      "lives in your password manager, not in local files. "
                      "There is nothing to back up from disk.")
-        seed = (cfg or {}).get("seed")
-        address = (cfg or {}).get("address")
-        if not seed:
-            sys.exit("no seed stored in ~/.xrpl/config.json — nothing to back "
-                     "up (create one with `xrpl-trade wallet create`)")
+        C.require_local_network(network)
+        if (cfg or {}).get("seed") or (cfg or {}).get("network") != network:
+            sys.exit("Refusing credential reclassification or legacy seed display; migrate through vault")
+        stored = json.loads(C.local_wallet_path(network).read_text())
+        if (stored.get("format") != "xrpl-local-test-wallet/1" or stored.get("network") != network
+                or stored.get("address") != (cfg or {}).get("address")):
+            sys.exit("Local test credential identity mismatch")
+        seed, address = stored["seed"], stored["address"]
         print("=" * 64)
         print("ONE-TIME BACKUP — write this down NOW, on paper, offline.")
         print("Anyone holding this seed controls the wallet. Never paste it")
@@ -1563,6 +1561,7 @@ def cmd_setup(_args):
         sys.exit("unknown network")
     C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
     if ans in ("y", "yes"):
+        C.require_local_network(net)
         address = generate_wallet_into_config(net)
         print(f"\nWallet {address} generated and stored (seed never displayed).")
         print("Back it up once, right now:  xrpl-trade wallet backup")
@@ -1951,6 +1950,10 @@ def cmd_giveaway_setup(args, gw):
     else:
         print(f"  policy exists: {C.GIVEAWAY_POLICY_PATH} (edit it directly)")
 
+    if network == "mainnet":
+        print("Mainnet giveaway credentials are vault-only; local seed entry is disabled.")
+        return
+    C.require_local_network(network)
     print(f"\nSeed storage. Preferred: the vault injects {C.GIVEAWAY_SEED_ENV}")
     print("at signing time after human approval (nothing stored on disk).")
     print("Fallback: store it here — owner-only 0600, read only by xrpl-sign.")
@@ -1972,7 +1975,7 @@ def cmd_giveaway_setup(args, gw):
     if derived != wallet:
         sys.exit(f"that seed derives {derived}, not the donation wallet "
                  f"{wallet} — nothing was stored")
-    C.write_giveaway_seed(seed)
+    C.write_giveaway_seed(seed, network=network)
     print(f"seed stored in {C.GIVEAWAY_PATH} (0600). It will never be printed.")
 
 
@@ -2095,6 +2098,7 @@ def main():
                             "PROPOSE the mint")
     p.add_argument("--stage", required=True,
                    help="stage id printed by nft-stage")
+    p.add_argument("--approve-stage", required=True, help="full reviewed stage SHA-256, bound to this approved upload")
     p = sub.add_parser("nft-list", help="PROPOSE listing an owned NFT for "
                                        "sale (XRP only, sell offer)")
     p.add_argument("--token-id", required=True,
