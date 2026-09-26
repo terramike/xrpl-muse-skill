@@ -1216,7 +1216,7 @@ C.GIVEAWAY_POLICY_PATH.unlink(missing_ok=True)
 _os.environ.pop("XRPL_SEED", None)
 _os.environ.pop(C.GIVEAWAY_SEED_ENV, None)
 try:
-    S.load_seed()
+    S.load_seed(("env", "XRPL_SEED"), "testnet", "rTestAccount")
     _seed_hint_ok = False
 except SystemExit as e:
     _seed_hint_ok = ("vault injects it after" in str(e)
