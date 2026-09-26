@@ -246,7 +246,7 @@ def run_bind(prop=None, tx=None, policy=None, fail_seed=None,
     def _ls(env):
         raise SystemExit(f"No seed. {env} is not set")
     restore = patch_sign_env(
-        load_seed=_ls if fail_seed else (lambda env: "s" * 29),
+        load_seed=_ls if fail_seed else (lambda *args: "s" * 29),
         wallet_cls=wallet_cls, sign_fn=sign_fn)
     try:
         return S._reserve_sign_bind(prop or PROP, tx or TX, policy or POL,
@@ -372,7 +372,7 @@ except KeyboardInterrupt:
 # success path: reservation binds, is NOT released
 fresh_state()
 tracker = C.SpentTracker()
-restore = patch_sign_env(load_seed=lambda env: "s" * 29,
+restore = patch_sign_env(load_seed=lambda *args: "s" * 29,
                          wallet_cls=FakeWallet,
                          sign_fn=lambda t, w: FakeSigned())
 try:
@@ -412,7 +412,7 @@ except C.StateCorruptError:
 # daily-limit denial (no reservation made): clean message, nothing pending
 BIG = {"XRP": Decimal("1000")}
 fresh_state()
-restore = patch_sign_env(load_seed=lambda env: "s" * 29)
+restore = patch_sign_env(load_seed=lambda *args: "s" * 29)
 try:
     S._reserve_sign_bind(PROP, TX, POL, C.SpentTracker(), BIG, "XRPL_SEED",
                        FakeClient())

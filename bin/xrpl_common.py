@@ -56,6 +56,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import time
 from decimal import Decimal, InvalidOperation
