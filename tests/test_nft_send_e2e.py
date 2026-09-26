@@ -64,6 +64,22 @@ def rpc(method, params):
                       timeout=30.0).json()
 
 
+def wait_validated_account(address, timeout=90):
+    """Faucet responses can precede account activation on validated ledgers."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            result = rpc("account_info", {"account": address,
+                                           "ledger_index": "validated"})
+            if (result.get("result", {}).get("validated") is True
+                    and isinstance(result.get("result", {}).get("account_data"), dict)):
+                return True
+        except Exception:  # noqa: BLE001 - transient testnet readiness
+            pass
+        time.sleep(3)
+    return False
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="xrpl-nftsend-e2e-") as td:
         home = Path(td)
@@ -76,6 +92,10 @@ def main():
         check("two faucet wallets created",
               addr_a.startswith("r") and addr_b.startswith("r")
               and addr_a != addr_b)
+        check("both faucet wallets are visible in a validated ledger",
+              wait_validated_account(addr_a) and wait_validated_account(addr_b))
+        if not CHECKS[-1][1]:
+            return 1
 
         (xrpl / "config.json").write_text(json.dumps(
             {"network": "testnet", "address": addr_a}))
