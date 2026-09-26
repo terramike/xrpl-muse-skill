@@ -759,10 +759,15 @@ def cmd_sign(args):
         tracker.release_reservation(mrid)
         sys.exit("Seed invalid.")
     if wallet.classic_address != tx["Account"]:
-        tracker.release_reservation(rid)
-        tracker.release_reservation(mrid)
-        sys.exit(f"Seed derives {wallet.classic_address}, but proposal is for "
-                 f"{tx['Account']} — refusing (wallet mismatch).")
+        # P1-1b: a seed deriving to the account's on-ledger RegularKey is a
+        # legitimate signer (verified against the validated ledger); anything
+        # else is refused here, before signing.
+        denial = C.check_signer_authorization(
+            client, tx["Account"], wallet.classic_address)
+        if denial:
+            tracker.release_reservation(rid)
+            tracker.release_reservation(mrid)
+            sys.exit(denial)
     # P1-1: honor disabled master keys. A seed deriving to the account
     # itself is the master seed; if the ledger disabled it, refuse here
     # with a clear reason instead of submitting a doomed transaction.

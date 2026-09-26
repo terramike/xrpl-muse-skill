@@ -705,6 +705,43 @@ def write_autopilot_state(account, network, seed):
 LSF_DISABLE_MASTER = 0x00100000
 
 
+def validated_regular_key(client, account):
+    """Return the account's on-ledger RegularKey address (or None if unset).
+
+    Returns the string "ERROR" if the ledger could not be queried — callers
+    must fail closed on that, never treat it as "no regular key".
+    """
+    try:
+        from xrpl.models.requests import AccountInfo
+        r = client.request(AccountInfo(account=account, ledger_index="validated"))
+    except Exception:
+        return "ERROR"
+    if not r.is_successful():
+        return "ERROR"
+    return r.result["account_data"].get("RegularKey")
+
+
+def check_signer_authorization(client, account, derived_address):
+    """Return a denial reason, or None if the seed may sign for the account.
+
+    Accepts a seed deriving to the account itself (the master seed — the
+    disabled-master check in check_ledger_key_authorization still applies)
+    or to the account's on-ledger RegularKey (verified against the validated
+    ledger here). Refuses anything else. Fails closed if the ledger can't be
+    read — never submit a doomed transaction just to let the ledger refuse
+    it (the fee would still be taken).
+    """
+    if derived_address == account:
+        return None
+    regkey = validated_regular_key(client, account)
+    if regkey == "ERROR":
+        return "could not verify RegularKey status (node error) — fail closed"
+    if regkey is None or derived_address != regkey:
+        return (f"Seed derives {derived_address}, but proposal is for {account} "
+                f"(on-ledger RegularKey: {regkey or 'none'}) — refusing.")
+    return None
+
+
 def check_ledger_key_authorization(client, account, derived_address):
     """Return a denial reason or None. Refuses master seeds for accounts
     whose master key is disabled on-ledger."""
