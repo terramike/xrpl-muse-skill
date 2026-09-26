@@ -65,6 +65,40 @@ Mainnet never keeps a seed on disk and never prints one to a terminal:
 - Testnet keeps the convenient local flow (`wallet create` prints the seed
   once; the faucet no longer does).
 
+### Autopilot — at your own risk (opt-in local mainnet signing)
+
+Two signing modes, clearly labeled:
+
+- **Vault (default).** The key stays outside the agent's environment; the
+  vault injects it for one signing operation after genuine human approval.
+  External wallets (Xaman via its payload API, or a WalletConnect wallet
+  like Joey/Bifrost once the bridge lands) keep the key in a separate
+  wallet entirely — the user approves there.
+- **Autopilot (explicit opt-in).** `xrpl-trade autopilot enable` stores the
+  wallet's seed in `~/.xrpl/autopilot.json` (owner-only 0600) after the
+  operator types `ENABLE AUTOPILOT` under a plain-language risk disclosure.
+  The signer then uses the local seed — but **only** for the exact account
+  it was enabled for, and **everything else is unchanged**: the proposal
+  envelope, the policy checks (spend caps, pairs, tx types, fee caps,
+  expiries), the audit log, and the human Submit/Cancel on the proposal
+  hash in chat.
+
+What Autopilot does and does not protect against — say this plainly:
+
+- It bounds the agent's *mistakes*: policy + proposal + human confirmation
+  still gate every transaction.
+- It does **not** defend against the agent's *compromise*: this is a
+  same-user install, so any process running as this user can read the seed
+  file. A prompt-injected agent or a rooted machine exposes the seed.
+- So: use a dedicated limited-funds wallet for Autopilot (not the vault),
+  keep spend caps tight, and run `xrpl-trade autopilot disable` (which
+  deletes the seed from disk after you type the address to confirm) the
+  moment you stop needing it.
+
+Never paste a seed into chat to enable this. The seed is entered at a
+hidden terminal prompt, is never printed, logged, or echoed, and the audit
+log records only `seed_source=autopilot` — never the seed.
+
 ### The envelope (what the hash binds)
 
 A proposal is `format: xrpl-proposal/4` and the approval hash covers:
@@ -128,7 +162,7 @@ current `xrpl-trade`.
 - **Network lock**: default `testnet`. Mainnet proposals **hard-fail** until
   you explicitly opt in.
 - **Protected files**: the signer refuses to run if the policy, allowlist,
-  state, lock, or audit files are not owner-only `0600`. This catches
+  state, lock, audit, or autopilot files are not owner-only `0600`. This catches
   accidental exposure — it does not replace the privileged boundary below.
 - **Crash-safe submission**: sign → bind the reservation to the signed hash
   and `LastLedgerSequence` → persist to the audit log → submit → wait for the
@@ -599,6 +633,13 @@ outside this tool — the CLI refuses to create or display mainnet seeds:
 - The signer refuses mainnet while legacy seeds remain on disk
   (`wallet forget-seed` removes one only after you type the address to
   confirm the vault backup exists).
+
+**Exception — Autopilot (explicit opt-in only):** `xrpl-trade autopilot
+enable` deliberately stores one wallet's seed on disk (owner-only 0600)
+after the operator types `ENABLE AUTOPILOT` under a plain-language risk
+disclosure. See "Autopilot — at your own risk" above. This is the
+documented weaker deployment mode for a dedicated limited-funds wallet —
+never the main vault wallet.
 
 Testnet keeps the convenient local flow: `wallet create` generates a fresh
 ed25519 wallet (seed to `~/.xrpl/config.json`, 0600, atomic) and prints

@@ -88,6 +88,15 @@ PROFILES_SCHEMA_VERSION = 1
 # TESTNET ONLY, refused on mainnet.
 CRED_KIND_ENV = "env"
 CRED_KIND_FILE = "file"
+# Autopilot (at-your-own-risk): the operator explicitly opts a single
+# account into local mainnet signing (`xrpl-trade autopilot enable`). The
+# seed lives in AUTOPILOT_PATH (owner-only 0600) and the signer may use it
+# ONLY for the account named here. This is the documented
+# "autonomous-experimental" deployment profile: it bounds the agent's
+# mistakes with policy, but a same-user agent compromise is NOT defended
+# against — the disclosure says so in plain words.
+AUTOPILOT_PATH = XRPL_DIR / "autopilot.json"
+AUTOPILOT_SCHEMA_VERSION = 1
 
 NETWORKS = {
     "mainnet": ["https://s1.ripple.com:51234", "https://s2.ripple.com:51234"],
@@ -625,6 +634,68 @@ def block_mainnet_on_legacy_seeds():
               "it from disk (after confirming the vault backup). Until then,",
               "mainnet signing stays blocked; testnet is unaffected."]
     sys.exit("\n".join(lines))
+
+
+# ---------- autopilot (at-your-own-risk local mainnet signing) ----------
+
+def autopilot_state():
+    """Return the autopilot state dict, or None if absent/invalid.
+
+    Never raises on a corrupt file — a broken autopilot.json is treated
+    as disabled (fail closed), never as enabled.
+    """
+    try:
+        data = json.loads(AUTOPILOT_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema_version") != AUTOPILOT_SCHEMA_VERSION:
+        return None
+    return data
+
+
+def autopilot_enabled_for(account):
+    """True only if autopilot was explicitly enabled for this account."""
+    st = autopilot_state()
+    return bool(st and st.get("enabled") and st.get("account") == account)
+
+
+def read_autopilot_seed(account):
+    """Return the autopilot seed for account, else None (fail closed).
+
+    Disabled, missing, account-mismatched, wrongly-permissioned, or
+    non-seed-looking state all yield None — the caller exits with
+    guidance instead of signing.
+    """
+    try:
+        if os.stat(AUTOPILOT_PATH).st_mode & 0o077:
+            return None
+    except OSError:
+        return None
+    st = autopilot_state()
+    if not (st and st.get("enabled") and st.get("account") == account):
+        return None
+    seed = st.get("seed")
+    return seed if _looks_like_seed(seed) else None
+
+
+def write_autopilot_state(account, network, seed):
+    """Atomically write autopilot.json, owner-only 0600. No seed in logs."""
+    data = {
+        "schema_version": AUTOPILOT_SCHEMA_VERSION,
+        "enabled": True,
+        "account": account,
+        "network": network,
+        "seed": seed,
+        "enabled_at": int(time.time()),
+        "risk_acknowledged": True,
+    }
+    XRPL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = AUTOPILOT_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AUTOPILOT_PATH)
 
 
 # Disabled-master-key honor (P1-1): a seed that derives to the account
@@ -2270,7 +2341,8 @@ def check_protected_files(extra=()):
     # `extra` covers giveaway-mode files: the giveaway policy and
     # giveaway.json (which may hold the donation-wallet seed).
     for p in (POLICY_PATH, PROFILES_PATH, APPROVED_PATH, FAVORITES_PATH,
-              STATE_PATH, STATE_LOCK_PATH, AUDIT_PATH, *extra):
+              STATE_PATH, STATE_LOCK_PATH, AUDIT_PATH, AUTOPILOT_PATH,
+              *extra):
         if not p.exists():
             continue
         st = p.stat()
