@@ -156,9 +156,9 @@ manager or agent vault after human approval. Testnet funds:
 
 ## Security
 
-Mainnet is gated on verification of the actual Muse vault and human approval
+Testnet-safe by default. Mainnet is gated on verification of the actual Muse vault and human approval
 flow. `xrpl-trade doctor` reports local checks and leaves those runtime
-properties explicitly unverified. Current deployment profiles include Muse vault signer, Xaman-human, and Autonomous-experimental; only Muse is in scope here, and the others do not establish vault-only protection. NFT policy checks do **not protect market value** or verify real world artwork ownership.
+properties explicitly unverified. Current deployment profiles include Muse vault signer, Xaman-human, and Autonomous-experimental; only Muse is in scope here, and the others do not establish vault-only protection. NFT policy checks does **not** protect market value or verify real world artwork ownership.
 
 ## Security
 

@@ -153,7 +153,7 @@ class SecurityTests(unittest.TestCase):
         C.CONFIG_PATH.write_text(json.dumps({'address':A,'network':'mainnet'}))
         pf={'network':'mainnet','account':A,'credential':{'kind':'env','env_var':'XRPL_SEED'},
             'policy_path':str(C.POLICY_PATH),'policy_sha256':C._sha256_file(C.POLICY_PATH),'state':'default'}
-        C.PROFILES_PATH.write_text(json.dumps({'schema_version':1,'profiles':{'main':pf}}))
+        C.atomic_private_json(C.PROFILES_PATH,{'schema_version':1,'profiles':{'main':pf}})
         digest=C._sha256_file(C.STATE_PATH)
         with self.assertRaises(SystemExit):
             S.cmd_migrate_state(NS(profile='main',legacy_state='default',state_sha256=digest,approve_migration='0'*64))

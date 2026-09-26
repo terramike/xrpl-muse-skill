@@ -16,8 +16,7 @@ in the audit log. Treat it like a seed: the vault injects it into the
 environment at pin time, and only the pinner's environment holds it.
 
 Run `nft-pin-and-propose` only through the approved Muse operation that
-injects `PINATA_JWT` into this process for that one invocation. Do not type,
-export, or paste the token into a shell, chat, or command transcript. The
+injects `PINATA_JWT` into this process for that one invocation. Do not type or paste the token into a shell, chat, or command transcript; it is never exported into a shell. The
 repository cannot verify that Muse is enforcing this boundary; deployment
 verification is required before using real Pinata credentials.
 
@@ -46,8 +45,8 @@ an account they already own.
 into the proposal's `URI` field (policy caps it at 256 bytes, see below).
 Pinning happens only after the operator independently reviews and supplies
 the full stage digest. The command refuses before reading the Pinata token or
-contacting Pinata if that digest does not match. Pinning is an external write and cannot be undone; it happens only during the
-approved action, never before it. A later proposal failure can leave unreferenced pins.
+contacting Pinata if that digest does not match. Pinning is an external write and cannot be undone; it happens as
+the approved action, never before it. A later proposal failure can leave unreferenced pins.
 
 ## CIDs are portable
 

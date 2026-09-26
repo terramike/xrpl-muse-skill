@@ -864,9 +864,13 @@ def provisional_spend_check(spends):
         print("  note: policy version mismatch — spend limits enforced by "
               "xrpl-sign")
         return
-    # Best-effort: merge over defaults. The signer validates the schema
-    # strictly and will refuse a violating policy — say so now, cleanly.
-    pol = {**C.DEFAULT_POLICY, **pol}
+    # The proposer also refuses a malformed active policy. The signer
+    # repeats this validation before any credential access.
+    try:
+        pol = C.load_policy(pol_path)
+    except SystemExit as exc:
+        print("  policy schema violation; signer will refuse: " + C.safe_terminal_text(str(exc)))
+        return
     try:
         denials = C.SpentTracker().check(spends, pol)
     except C.StateCorruptError as e:
