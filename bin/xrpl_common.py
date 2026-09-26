@@ -680,7 +680,7 @@ def read_autopilot_seed(account):
     return seed if _looks_like_seed(seed) else None
 
 
-def write_autopilot_state(account, network, seed):
+def write_autopilot_state(account, network, seed, seed_backed_up=False):
     """Atomically write autopilot.json, owner-only 0600. No seed in logs."""
     data = {
         "schema_version": AUTOPILOT_SCHEMA_VERSION,
@@ -690,6 +690,7 @@ def write_autopilot_state(account, network, seed):
         "seed": seed,
         "enabled_at": int(time.time()),
         "risk_acknowledged": True,
+        "seed_backed_up": bool(seed_backed_up),
     }
     XRPL_DIR.mkdir(parents=True, exist_ok=True)
     tmp = AUTOPILOT_PATH.with_suffix(".tmp")
