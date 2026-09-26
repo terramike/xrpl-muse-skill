@@ -147,6 +147,22 @@ class SecurityTests(unittest.TestCase):
         two=C.tracker_for_profile('renamed','mainnet',A)
         self.assertEqual(one.state_path,two.state_path)
         self.assertNotEqual(one.state_path,C.tracker_for_profile('main','testnet',A).state_path)
+    def test_testnet_file_credential_binds_network_and_account(self):
+        from xrpl.wallet import Wallet
+        wallet=Wallet.create()
+        path=self.root/'test-wallet.json'
+        C.atomic_private_json(path,{'format':'xrpl-local-test-wallet/1','network':'testnet','address':wallet.classic_address,'seed':wallet.seed})
+        self.assertEqual(S.load_seed(('file',str(path)),'testnet',wallet.classic_address),wallet.seed)
+        with self.assertRaises(SystemExit): S.load_seed(('file',str(path)),'devnet',wallet.classic_address)
+        with self.assertRaises(SystemExit): S.load_seed(('file',str(path)),'testnet',A)
+        raw=self.root/'raw-seed.txt'
+        raw.write_text(wallet.seed)
+        with self.assertRaises(SystemExit): S.load_seed(('file',str(raw)),'testnet',wallet.classic_address)
+        profile={'policy_path':str(C.POLICY_PATH),'network':'testnet','credential':{'kind':'file','path':str(path)}}
+        C.check_profile_protected(profile)
+        path.chmod(0o644)
+        with self.assertRaises(SystemExit): C.check_profile_protected(profile)
+
     def test_legacy_state_requires_explicit_reviewed_migration(self):
         self.reserve()
         with self.assertRaises(C.StateCorruptError): C.tracker_for_profile('main','mainnet',A)

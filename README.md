@@ -173,18 +173,16 @@ used for trading.
 
 ## Tests
 
-Run the Linux release gate with `python tests/run_tests.py`; live testnet
-suites require the explicit `--testnet` option.
-
+The Linux CI workflow runs the deterministic suite on every change. To run it
+locally on Linux:
 
 ```bash
-python3 tests/test_v04.py          # 78 adversarial logic tests, no network
-python3 tests/test_nft.py          # 104 NFT adversarial tests, no network
-python3 tests/test_favorites.py    # 67 favorites + nft-new tests, no network
-python3 tests/test_e2e_testnet.py  # 52 end-to-end checks on testnet,
-                                   # fully isolated in a temporary HOME —
-                                   # never touches the operator's real ~/.xrpl
+python tests/run_tests.py
 ```
+
+The isolated end-to-end testnet suites use faucet wallets only and never use
+production credentials. Run them explicitly with `python tests/run_tests.py
+--testnet` or choose the testnet option in manual GitHub Actions dispatch.
 
 ## License
 

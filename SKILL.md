@@ -171,7 +171,7 @@ xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
 # → prints the full proposal + hash, e.g. a2c72140d080ca0f…
 # → NOTHING is submitted.
 
-# A human reviews the exact hash, then:
+# Muse receives this exact full digest only after genuine human review:
 xrpl-sign --profile main --hash <full-64-character-hash> --approve
 # → profile + envelope verify → policy checks → sign → persist →
 #   submit_and_wait → validated ledger result → audit log
@@ -439,24 +439,18 @@ xrpl-trade giveaway gift --to rWinner… --token-id <64-hex>   # 0-XRP NFT trans
   (`~/.xrpl/giveaway_policy.json` — only `Payment` +
   `NFTokenCreateOffer`, network-locked, XRP spend capped at
   `max_gift_xrp`, arbitrary winner destinations since the human approved
-  the exact one). It then offers to store the donation wallet's seed:
-  the preferred path is the `XRPL_GIVEAWAY_SEED` environment variable
-  (injected from the secure vault for the exact approved moment); the
-  fallback is a hidden prompt that stores it in `~/.xrpl/giveaway.json`
-  (`0600`). Either way the seed is never printed, logged, or echoed —
-  the CLI verifies it derives the configured donation address before
-  storing anything. The local fallback is deliberate and explicit, and
-  `xrpl-sign`'s `check_protected_files` covers `giveaway.json` and the
-  giveaway policy in giveaway mode — the signer refuses to run if either
-  is not owner-only.
+  the exact one). Mainnet giveaway credentials must come from Muse's
+  secure vault after genuine approval. Setup refuses local seed storage on
+  mainnet. Testnet-only seed files are network-tagged and are not read by
+  the signer. The seed is never printed, logged, or echoed.
 - `announce [--winner r…] [--prize "5 XRP"]` prints a draft winner
   announcement from the last draw (winner, prize, ledger index/hash,
   method, digest, entrant count, pot address, next Friday 7:37 AM). It
   posts nothing — the draft is for review.
 - The proposal prints its giveaway signing command:
-  `xrpl-sign --hash <hash> --approve --seed-env XRPL_GIVEAWAY_SEED
-  --policy ~/.xrpl/giveaway_policy.json` (the `--approve` flag is never
-  the approval — the human's explicit go-ahead for that exact hash is).
+  `xrpl-sign --profile <profile> --hash <full-64-character-hash> --approve`
+  (the CLI flag alone is not human approval; Muse must gate the call and
+  credential injection on a real confirmation).
 
 The Friday flow: cron runs `giveaway draw` → Mike picks the prize →
 `giveaway gift` builds the proposal → he approves that exact hash → the
@@ -643,6 +637,18 @@ lands, continue with the normal ceremony above.
   (propose → approve → sign → persist → validated), fully isolated in a
   temporary HOME — never touches the operator's real `~/.xrpl`
 
+
+## Accounting migration
+
+When moving legacy `state.json` or `giveaway_state.json` into named profiles,
+first inspect the source state and identify every transaction liability. Then
+run `xrpl-sign migrate-state --profile <name> --legacy-state default` (or
+`giveaway`) with `--state-sha256 <full-source-digest>` and
+`--approve-migration <same-full-digest>`. The command locks source and target,
+validates and copies every record, retains the legacy file, and writes a
+receipt bound to the source digest and account/network namespace. It refuses a
+profile whose identity does not match the legacy wallet. Do not hand-edit or
+delete legacy state to bypass this migration.
 
 ## Local doctor
 

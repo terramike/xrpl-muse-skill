@@ -48,11 +48,11 @@ Muse vault injects it after genuine human confirmation; it must never be a
 raw exported variable in a shared shell. The derived address must match the
 proposal's account, or signing is refused.
 
-Giveaway mode: `xrpl-sign --hash <h> --approve --seed-env XRPL_GIVEAWAY_SEED
+Giveaway mode: `xrpl-sign --hash <full-64-character-hash> --approve --seed-env XRPL_GIVEAWAY_SEED
 --policy ~/.xrpl/giveaway_policy.json` signs donation-wallet gifts under a
 separate narrow policy (Payment + NFTokenCreateOffer only, per-gift XRP
 cap, separate spend accounting). The vault injects XRPL_GIVEAWAY_SEED the
-same way; `xrpl-trade giveaway setup` is the deliberate local fallback.
+same way. Local testnet seed files are never a signer fallback.
 
 Submission is crash-safe: the transaction is signed, the reservation is
 bound to the signed hash + LastLedgerSequence, and both are persisted to
@@ -509,13 +509,13 @@ def check_policy(prop, tx, policy, client, tracker):
 
 # ---------- signing ----------
 
-def load_seed(seed_src=("env", "XRPL_SEED")):
+def load_seed(seed_src=("env", "XRPL_SEED"), network=None, account=None):
     """Seed ONLY from the profile-bound source (P1-1).
 
     ("env", VAR): one-time injection — the vault sets VAR after genuine
     human approval. Never a raw exported variable in a shared shell.
-    ("file", PATH): seed read from a local file — TESTNET ONLY; mainnet
-    profiles may not use this kind (enforced in resolve_signing_context).
+    ("file", PATH): a typed, owner-only local test-wallet record bound to
+    its network and address. Raw seed files are rejected.
 
     Local giveaway fallback is disabled on every network.
     """
@@ -526,10 +526,20 @@ def load_seed(seed_src=("env", "XRPL_SEED")):
         if not seed and ref == C.GIVEAWAY_SEED_ENV:
             sys.exit("Giveaway vault credential missing; local fallback is disabled")
     elif kind == "file":
+        from xrpl.wallet import Wallet
+        C.require_local_network(network)
         try:
-            seed = open(os.path.expanduser(ref)).read().strip()
-        except OSError:
-            seed = None
+            record = json.loads(Path(os.path.expanduser(ref)).read_text())
+            if (not isinstance(record, dict)
+                    or set(record) != {"format", "network", "address", "seed"}
+                    or record.get("format") != "xrpl-local-test-wallet/1"
+                    or record.get("network") != network
+                    or record.get("address") != account
+                    or Wallet.from_seed(record.get("seed", "")).classic_address != account):
+                sys.exit("Local test credential identity does not match this proposal")
+            seed = record["seed"]
+        except Exception as exc:  # noqa: BLE001 - malformed local record fails closed
+            sys.exit("Local test credential is unreadable or invalid: " + str(exc))
     if not seed:
         sys.exit(f"No seed from {kind}:{ref} — the vault injects it after "
                  f"genuine human approval. It is never exported by hand or "
@@ -655,7 +665,7 @@ def _reserve_sign_bind(prop, tx, policy, tracker, spends, seed_env, client):
                             "atomic mint reserve: " + msg, spends)
                     sys.exit(f"Mint-quota reservation failed: {msg}")
 
-            seed = load_seed(seed_env)
+            seed = load_seed(seed_env, prop["network"], tx["Account"])
             try:
                 wallet = Wallet.from_seed(seed)
             except Exception:

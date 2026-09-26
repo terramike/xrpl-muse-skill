@@ -162,9 +162,11 @@ check("P1-1 envelope hash binds profile",
 
 # Testnet adhoc: no profile required.
 tprop = make_mainnet_proposal(network="testnet", profile=None, pdigest=None)
-check("P1-1 testnet proposal has no profile binding",
-      tprop.get("profile") in (None, "") and
-      tprop.get("format") == C.ENVELOPE_FORMAT)
+check("P1-1 testnet proposal binds the adhoc identity and policy",
+      tprop.get("profile") == "adhoc-testnet"
+      and tprop.get("profile_sha256") == C.proposal_profile_fingerprint("adhoc-testnet")
+      and tprop.get("policy_sha256") == C._sha256_file(C.POLICY_PATH)
+      and tprop.get("format") == C.ENVELOPE_FORMAT)
 
 # ---------------------------------------------------------------- P1-2
 

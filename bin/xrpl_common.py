@@ -262,6 +262,20 @@ def save_proposal(tx_dict, network, account, action, profile=None,
     No summary or price metadata is
     stored — the signer derives everything from the transaction.
     """
+    # Every proposal needs an explicit signing identity. Named mainnet
+    # profiles are mandatory; unprofiled testnet/devnet helpers bind the
+    # isolated adhoc identity and the currently selected local policy.
+    if profile is None:
+        if network == "mainnet":
+            raise ProposalError("mainnet proposal requires a named signing profile")
+        if network not in ("testnet", "devnet"):
+            raise ProposalError("unprofiled proposals are testnet/devnet only")
+        profile = "adhoc-testnet"
+    if policy_sha256 is None:
+        pp = GIVEAWAY_POLICY_PATH if action == GIFT_ACTION else POLICY_PATH
+        if not pp.exists():
+            raise ProposalError(f"proposal policy file is missing: {pp}")
+        policy_sha256 = _sha256_file(pp)
     PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
     envelope = {
         "format": ENVELOPE_FORMAT,
@@ -563,14 +577,28 @@ def profile_policy_digest(profile) -> str:
 
 
 def check_profile_protected(profile):
-    """The profile's policy file must be owner-only, like all signer state."""
+    """Policy and any local test credential must be owner-only."""
     pp = Path(os.path.expanduser(profile["policy_path"]))
-    st = os.stat(pp)
-    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
-        sys.exit("Profile policy is not owned by the signer")
-    if st.st_mode & 0o077:
-        sys.exit(f"refusing: policy file {pp} is not owner-only "
-                 f"(mode {oct(st.st_mode & 0o777)})")
+    paths = [(pp, "Profile policy")]
+    cred = profile.get("credential", {})
+    if cred.get("kind") == CRED_KIND_FILE:
+        cp = Path(os.path.expanduser(cred["path"]))
+        if profile["network"] == "mainnet":
+            sys.exit("mainnet credentials must be vault-injected")
+        require_local_network(profile["network"])
+        paths.append((cp, "Local test credential"))
+    for path, label in paths:
+        try:
+            st = path.lstat()
+        except OSError as exc:
+            sys.exit(f"{label} unavailable: {path}: {exc}")
+        if not stat.S_ISREG(st.st_mode):
+            sys.exit(f"{label} must be a regular, non-symlink file")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            sys.exit(f"{label} is not owned by the signer")
+        if st.st_mode & 0o077:
+            sys.exit(f"refusing: {label.lower()} {path} is not owner-only "
+                     f"(mode {oct(st.st_mode & 0o777)})")
 
 
 def verify_profile_binding(profile_name, profile, prop):
@@ -1615,9 +1643,8 @@ OPT_IN_DROPS = "1"  # exactly 1 drop = 0.000001 XRP
 
 # P2: the gift path. The donation wallet's seed is read ONLY from the
 # XRPL_GIVEAWAY_SEED environment variable (vault-injected in production,
-# exactly like XRPL_SEED) — with one deliberate fallback: `giveaway setup`
-# may store it in giveaway.json (owner-only 0600), which ONLY the signer
-# ever reads. It never touches chat, logs, or proposals.
+# exactly like XRPL_SEED). Local testnet credentials live in a separate,
+# network-tagged file and are never read by the signing credential path.
 GIVEAWAY_SEED_ENV = "XRPL_GIVEAWAY_SEED"
 GIVEAWAY_POLICY_PATH = XRPL_DIR / "giveaway_policy.json"
 GIVEAWAY_STATE_PATH = XRPL_DIR / "giveaway_state.json"
@@ -1893,7 +1920,8 @@ def wait_for_ledger_hash(client, target_index, timeout=600, poll=5):
 #   xrpl-sign --hash <h> --approve \
 #       --seed-env XRPL_GIVEAWAY_SEED --policy ~/.xrpl/giveaway_policy.json
 # The vault injects XRPL_GIVEAWAY_SEED after human approval (same pattern
-# as XRPL_SEED); `giveaway setup` is the deliberate local-storage fallback.
+# as XRPL_SEED); local giveaway seed storage is testnet-only and is not a
+# signing fallback.
 
 def check_payment_destination(tx, policy):
     """Denial reasons for a Payment's destination (pure — no network).
@@ -1968,17 +1996,8 @@ def local_wallet_path(network):
 
 
 def read_giveaway_seed():
-    """Return the donation-wallet seed from giveaway.json, or None.
-
-    ONLY the signer calls this (as a fallback when XRPL_GIVEAWAY_SEED is
-    unset). The value is never printed, logged, or put in a proposal.
-    """
-    try:
-        raw = json.loads(GIVEAWAY_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    seed = raw.get("seed") if isinstance(raw, dict) else None
-    return seed if isinstance(seed, str) and seed.strip() else None
+    """Legacy disk-seed fallback is intentionally disabled on all networks."""
+    return None
 
 
 def write_giveaway_seed(seed, network=None):

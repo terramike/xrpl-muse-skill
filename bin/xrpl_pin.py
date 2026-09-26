@@ -163,7 +163,7 @@ def _jwt():
     if not jwt:
         sys.exit(
             "PINATA_JWT is not set. Create a (free) Pinata account, "
-            "mint an API key with pinning scope, and export PINATA_JWT — "
+            "mint an API key with pinning scope and configure Muse vault injection — "
             "see references/nft-pinata.md. The key is never stored or logged.")
     return jwt
 

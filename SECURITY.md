@@ -123,12 +123,10 @@ The giveaway code (new after the v0.5.1 audit) gets the same treatment:
 - Giveaway proposals sign through the same full-hash `--approve` gate,
   under the narrow giveaway policy (which passes the strict schema —
   `giveaway` and `allow_any_payment_destination` are known, typed keys).
-- Seed handling: vault injection of `XRPL_GIVEAWAY_SEED` at signing time
-  is the preferred path. Local storage in `giveaway.json` is a deliberate
-  fallback — getpass entry (never echoed), verified to derive the
-  donation wallet before anything is stored, atomic `0600` write — and
-  `check_protected_files` covers it plus the giveaway policy in giveaway
-  mode. The seed never appears in output, logs, proposals, or chat.
+- Mainnet giveaway seed handling: Muse vault injection of
+  `XRPL_GIVEAWAY_SEED` at signing time after genuine approval. The signer
+  has no local disk fallback. Testnet-only seed provisioning writes a
+  separate network-tagged file that the signer does not read.
 
 ## The platform boundary — read before mainnet
 
@@ -201,6 +199,8 @@ testnet-only.
 ## Current release blockers and deployment verification
 
 This branch fixes the repository-side findings described above, but does not prove the Muse deployment. Mainnet must remain blocked until an operator verifies, in the actual Muse installation, that a real human confirmation gates one-time vault injection and that the signer, Python dependencies, profile/policy files, and state cannot be rewritten by the proposing agent. Local `doctor` explicitly cannot verify those runtime facts. Testnet CI also cannot establish them.
+
+`migrate-state` locks, strictly validates, and copies legacy liabilities into the stable profile namespace after full source digest review; it preserves the source and records an identity-bound migration receipt. Profiles cannot proceed while un-migrated live legacy obligations remain.
 
 `recover-state` never resets corrupt state to empty. It takes a lock, saves the original bytes, requires the original digest and independent full digest of a reviewed replacement, validates every reconstructed entry, and rejects omission of any valid current liability. Invalid source entries require operator reconstruction from audit and validated ledger data. Legacy `totals` use the same validator. Profile-specific recovery uses its account/network state namespace.
 
