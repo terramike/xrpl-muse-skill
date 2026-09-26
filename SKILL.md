@@ -77,11 +77,16 @@ Two signing modes, clearly labeled:
 - **Autopilot (explicit opt-in).** `xrpl-trade autopilot enable` stores the
   wallet's seed in `~/.xrpl/autopilot.json` (owner-only 0600) after the
   operator types `ENABLE AUTOPILOT` under a plain-language risk disclosure.
-  The signer then uses the local seed — but **only** for the exact account
-  it was enabled for, and **everything else is unchanged**: the proposal
-  envelope, the policy checks (spend caps, pairs, tx types, fee caps,
-  expiries), the audit log, and the human Submit/Cancel on the proposal
-  hash in chat.
+  Seed sourcing, in order: (1) if `~/.xrpl/config.json` holds a seed for the
+  account (e.g. from `xrpl-trade wallet create`), it is adopted directly —
+  no pasting; (2) otherwise the operator may generate a fresh dedicated
+  autopilot wallet on the spot, with a one-time backup ceremony (the seed
+  is displayed exactly once; the operator types `I HAVE WRITTEN IT DOWN`
+  to confirm); (3) otherwise paste at a hidden prompt. The signer then
+  uses the local seed — but **only** for the exact account it was enabled
+  for, and **everything else is unchanged**: the proposal envelope, the
+  policy checks (spend caps, pairs, tx types, fee caps, expiries), the
+  audit log, and the human Submit/Cancel on the proposal hash in chat.
 
 What Autopilot does and does not protect against — say this plainly:
 
@@ -584,7 +589,8 @@ Local wallet management (local-only, explicit opt-in — see "Wallets"):
 
 - `wallet create [--force]` — generate a fresh wallet; seed stored 0600,
   never displayed
-- `wallet backup` — ONE-TIME seed display for write-down
+- `wallet backup` — ONE-TIME seed display for write-down; requires typing
+  `I HAVE WRITTEN IT DOWN`, records `seed_backed_up` in config.json
 
 Writing (always propose → human `--approve` → sign):
 

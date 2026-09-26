@@ -1454,6 +1454,28 @@ def generate_wallet_into_config(network, force=False):
     return address
 
 
+def backup_ceremony(seed, address):
+    """One-time seed display for write-down backup.
+
+    Prints the seed exactly once with hard warnings, then requires the
+    operator to type I HAVE WRITTEN IT DOWN. Returns True on confirmation.
+    The seed itself is never logged, never returned, never stored here —
+    the caller records the confirmation flag wherever fits.
+    """
+    print("=" * 64)
+    print("ONE-TIME BACKUP — write this down NOW: on paper, or in your")
+    print("password manager, offline. This is the ONLY time this seed will")
+    print("be displayed. Anyone holding it controls the wallet. Never paste")
+    print("it into chat, email, screenshots, or any app. If it ever touches")
+    print("chat or a log, treat the wallet as BURNED and generate a new one.")
+    print("=" * 64)
+    print(f"  address: {address}")
+    print(f"  seed:    {seed}")
+    print("=" * 64)
+    ans = input("Type I HAVE WRITTEN IT DOWN to confirm your backup: ").strip()
+    return ans == "I HAVE WRITTEN IT DOWN"
+
+
 def cmd_wallet(args, cfg):
     """Wallet management: vault-flow create for mainnet, local for testnet."""
     if args.wallet_cmd == "create":
@@ -1504,20 +1526,21 @@ def cmd_wallet(args, cfg):
         if not seed:
             sys.exit("no seed stored in ~/.xrpl/config.json — nothing to back "
                      "up (create one with `xrpl-trade wallet create`)")
-        print("=" * 64)
-        print("ONE-TIME BACKUP — write this down NOW, on paper, offline.")
-        print("Anyone holding this seed controls the wallet. Never paste it")
-        print("into chat, email, screenshots, or any app. If it ever touches")
-        print("chat or a log, treat the wallet as BURNED and generate a new one.")
-        print("=" * 64)
-        print(f"  address: {address}")
-        print(f"  seed:    {seed}")
-        print("=" * 64)
+        if not backup_ceremony(seed, address):
+            sys.exit("backup NOT confirmed — the seed was displayed once and "
+                     "will not be shown again by this command. Run `xrpl-trade "
+                     "wallet backup` again when you are ready to write it down.")
+        cfg["seed_backed_up"] = True
+        tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, C.CONFIG_PATH)
+        print("Backup confirmed and recorded.")
         print("Note: if you ran this through a chat assistant, this transcript")
-        print("now contains the seed — for maximum safety, run this command in")
-        print("your own terminal instead.")
-        C.audit("wallet_backup", None, None, network, address, "displayed",
-                note="seed shown once for write-down; seed never in the log")
+        print("now contains the seed — for maximum safety, run backup in your")
+        print("own terminal instead.")
+        C.audit("wallet_backup", None, None, network, address, "confirmed",
+                note="one-time display + operator confirmation; seed never in the log")
     elif args.wallet_cmd == "forget-seed":
         # P1-2 migration: remove a legacy seed from a local file AFTER the
         # operator confirms it is vault-backed. Never silent, never forced.
@@ -1620,37 +1643,116 @@ def cmd_autopilot(args, cfg):
                     ).strip()
         if ans != "ENABLE AUTOPILOT":
             sys.exit("not enabled — nothing was stored.")
-        address = args.address or (cfg or {}).get("address")
-        if not address or not C.is_valid_classic_address(address):
-            sys.exit("no valid account address — pass --address r... or set "
-                     "it in ~/.xrpl/config.json first.")
         network = (cfg or {}).get("network", "mainnet")
         if network not in C.NETWORKS:
             sys.exit(f"unknown network {network!r}")
-        import getpass
-        try:
-            seed = getpass.getpass(
-                "Paste the wallet seed (hidden; stored 0600, never "
-                "displayed): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            sys.exit("\ncancelled — nothing was stored.")
-        if not seed:
-            sys.exit("empty — nothing was stored.")
-        if not C._looks_like_seed(seed):
-            sys.exit("that does not look like an XRPL seed — nothing was "
-                     "stored.")
-        client = get_client(network)
-        ok, kind = autopilot_seed_controls_account(seed, address, client)
-        if not ok:
-            sys.exit(
-                "that seed does not control the account — nothing was stored.\n"
-                f"  account: {address}\n"
-                "  The seed must derive to the account address (master key) "
-                "or its on-ledger RegularKey.")
-        C.write_autopilot_state(address, network, seed)
+        address = args.address or (cfg or {}).get("address")
+
+        seed = None
+        kind = None
+        backed_up = False
+
+        # 1. Adopt the locally-created seed when it matches the account.
+        #    (Fixes the dead end: `wallet create` never displays the seed,
+        #    so there is nothing to paste for `autopilot enable`.)
+        local_seed = (cfg or {}).get("seed")
+        local_addr = (cfg or {}).get("address")
+        if local_seed and local_addr and (not address or local_addr == address):
+            from xrpl.wallet import Wallet as _W
+            try:
+                derives = _W.from_seed(local_seed).classic_address == local_addr
+            except Exception:
+                derives = False
+            if derives:
+                adopt = input(
+                    f"Found the locally-created seed for {local_addr} in "
+                    f"~/.xrpl/config.json. Adopt it directly (no pasting)? "
+                    f"(Y/n): ").strip().lower()
+                if adopt in ("", "y", "yes"):
+                    seed, address, kind = local_seed, local_addr, "master"
+                    backed_up = bool((cfg or {}).get("seed_backed_up"))
+
+        # 2. No adoptable seed: generate a fresh dedicated wallet, or paste
+        #    your own. Generation is inside the autopilot opt-in (the
+        #    at-your-own-risk exception to vault-only mainnet).
+        if seed is None:
+            if address and C.is_valid_classic_address(address):
+                choice = input(
+                    f"No local seed for {address}. [G]enerate a fresh dedicated "
+                    f"autopilot wallet, or [P]aste your own seed? (g/p): "
+                ).strip().lower()
+            else:
+                choice = input(
+                    "No account address set. [G]enerate a fresh dedicated "
+                    "autopilot wallet, or [A]bort? (g/A): ").strip().lower()
+                if choice not in ("g", "generate"):
+                    sys.exit("aborted — pass --address r... or set it in "
+                             "~/.xrpl/config.json first.")
+            if choice in ("g", "generate"):
+                from xrpl.wallet import Wallet as _W
+                w = _W.create()  # ed25519 in this xrpl-py
+                if _W.from_seed(w.seed).classic_address != w.classic_address:
+                    sys.exit("internal error: generated seed does not derive "
+                             "its address")
+                print(f"\nGenerated a fresh dedicated autopilot wallet "
+                      f"({network}).")
+                print("Keep the funds in it LIMITED — it is a hot wallet on "
+                      "this machine.")
+                if not backup_ceremony(w.seed, w.classic_address):
+                    sys.exit("backup NOT confirmed — nothing was stored. Run "
+                             "`xrpl-trade autopilot enable` again when you are "
+                             "ready to write it down.")
+                seed, address, kind, backed_up = \
+                    w.seed, w.classic_address, "master", True
+                del w
+            else:
+                if not address or not C.is_valid_classic_address(address):
+                    sys.exit("no valid account address — pass --address r... "
+                             "or set it in ~/.xrpl/config.json first.")
+                import getpass
+                try:
+                    seed = getpass.getpass(
+                        "Paste the wallet seed (hidden; stored 0600, never "
+                        "displayed): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    sys.exit("\ncancelled — nothing was stored.")
+                if not seed:
+                    sys.exit("empty — nothing was stored.")
+                if not C._looks_like_seed(seed):
+                    sys.exit("that does not look like an XRPL seed — nothing was "
+                             "stored.")
+                client = get_client(network)
+                ok, kind = autopilot_seed_controls_account(seed, address, client)
+                if not ok:
+                    sys.exit(
+                        "that seed does not control the account — nothing was stored.\n"
+                        f"  account: {address}\n"
+                        "  The seed must derive to the account address (master key) "
+                        "or its on-ledger RegularKey.")
+                # Bring-your-own seed: the operator holds the backup.
+                backed_up = False
+
+        # 3. Adopted a local seed with no recorded backup? Offer the ceremony.
+        if (seed is not None and not backed_up and local_seed
+                and seed == local_seed and cfg is not None):
+            again = input(
+                "No backup recorded for this seed. Back it up now (strongly "
+                "recommended)? (Y/n): ").strip().lower()
+            if again in ("", "y", "yes") and backup_ceremony(seed, address):
+                backed_up = True
+                cfg["seed_backed_up"] = True
+                tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
+                tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, C.CONFIG_PATH)
+                print("Backup confirmed and recorded.")
+
+        C.write_autopilot_state(address, network, seed,
+                                seed_backed_up=backed_up)
         C.audit("autopilot_enable", None, None, network, address, "enabled",
                 note="operator typed ENABLE AUTOPILOT after the at-your-own-"
-                     "risk disclosure; seed stored 0600, never in the log")
+                     "risk disclosure; seed stored 0600, never in the log; "
+                     f"source={kind}; backed_up={backed_up}")
         print(f"\nautopilot ENABLED for {address} ({kind} key, {network}).")
         print("The signer will use the local seed for this account; every")
         print("signing still needs a proposal and still enforces the policy.")

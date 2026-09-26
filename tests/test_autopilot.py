@@ -256,6 +256,87 @@ check("master seed accepted without ledger call", ok and kind == "master")
 ok, kind = T.autopilot_seed_controls_account("garbage", ADDR, FakeClient())
 check("garbage seed rejected by verifier", not ok)
 
+# 16. backup_ceremony: exact confirmation required, seed displayed once
+buf = io.StringIO()
+with mock.patch.object(builtins, "input",
+                       return_value="I HAVE WRITTEN IT DOWN"), \
+     contextlib.redirect_stdout(buf):
+    confirmed = T.backup_ceremony(SEED, ADDR)
+out = buf.getvalue()
+check("backup ceremony confirms on exact phrase", confirmed is True)
+check("backup ceremony displays the seed once", SEED in out)
+check("backup ceremony warns about chat/logs", "BURNED" in out)
+
+buf = io.StringIO()
+with mock.patch.object(builtins, "input", return_value="yeah sure"), \
+     contextlib.redirect_stdout(buf):
+    confirmed = T.backup_ceremony(SEED, ADDR)
+check("backup ceremony rejects wrong confirmation", confirmed is False)
+
+
+def run_enable_inputs(inputs, cfg, getpass_ret="should-not-be-called"):
+    """Enable with a scripted input() sequence; getpass fails loudly."""
+    buf = io.StringIO()
+    args = ns(autopilot_cmd="enable", address=None)
+    def _getpass(prompt=""):
+        raise AssertionError("getpass must not be called on this path")
+    it = iter(inputs)
+    with mock.patch.object(T, "get_client", return_value=FakeClient()), \
+         mock.patch.object(builtins, "input", side_effect=lambda *a: next(it)), \
+         mock.patch.object(getpass, "getpass", side_effect=_getpass), \
+         contextlib.redirect_stdout(buf):
+        try:
+            T.cmd_autopilot(args, cfg)
+            return "ok", buf.getvalue()
+        except SystemExit as e:
+            return f"exit:{e.code}", buf.getvalue()
+        except StopIteration:
+            return "exit:ran-out-of-inputs", buf.getvalue()
+
+
+CFG_WITH_SEED = {"address": ADDR, "network": "testnet", "seed": SEED}
+
+# 17. adopt: local seed adopted directly, no paste
+cleanup()
+rc, out = run_enable_inputs(["ENABLE AUTOPILOT", "y", "n"], dict(CFG_WITH_SEED))
+st = C.autopilot_state()
+check("adopt path enables without pasting", rc == "ok" and st is not None)
+check("adopt path stores the local seed",
+      st and st.get("seed") == SEED and st.get("account") == ADDR)
+check("adopt path records backed_up=False when never backed up",
+      st and st.get("seed_backed_up") is False)
+check("adopt path never displays the seed", SEED not in out)
+
+# 18. adopt declined -> falls through to generate/paste; abort cleanly
+cleanup()
+rc, out = run_enable_inputs(
+    ["ENABLE AUTOPILOT", "n", "g", "not yet"], dict(CFG_WITH_SEED))
+check("declined adopt + declined backup stores nothing",
+      rc.startswith("exit:") and not C.AUTOPILOT_PATH.exists())
+
+# 19. generate: fresh wallet, backup ceremony, backed_up=True
+cleanup()
+rc, out = run_enable_inputs(
+    ["ENABLE AUTOPILOT", "g", "I HAVE WRITTEN IT DOWN"],
+    {"network": "testnet"})
+st = C.autopilot_state()
+check("generate path enables", rc == "ok" and st is not None)
+check("generate path records backed_up=True",
+      st and st.get("seed_backed_up") is True)
+check("generate path stores a fresh seed (not the fixture)",
+      st and st.get("seed") and st.get("seed") != SEED)
+check("generate path seed derives its account",
+      st and Wallet.from_seed(st["seed"]).classic_address == st["account"])
+check("generate path displays the seed for backup",
+      st and st["seed"] in out)
+
+# 20. generate without backup confirmation stores nothing
+cleanup()
+rc, out = run_enable_inputs(
+    ["ENABLE AUTOPILOT", "g", "not yet"], {"network": "testnet"})
+check("generate without backup confirmation stores nothing",
+      rc.startswith("exit:") and not C.AUTOPILOT_PATH.exists())
+
 fails = [n for n, ok_ in PASS if not ok_]
 print(f"\n{len(PASS) - len(fails)}/{len(PASS)} passed")
 sys.exit(1 if fails else 0)
