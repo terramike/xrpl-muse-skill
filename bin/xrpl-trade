@@ -1551,6 +1551,145 @@ def cmd_wallet(args, cfg):
         sys.exit(f"unknown wallet subcommand {args.wallet_cmd!r}")
 
 
+AUTOPILOT_DISCLOSURE = """\
+================================================================
+AUTOPILOT MODE — AT YOUR OWN RISK
+================================================================
+You are about to store this wallet's seed on this machine
+(~/.xrpl/autopilot.json, owner-only 0600) so the signer can sign
+without fetching the seed from your vault each time.
+
+What this DOES protect you from (the agent's mistakes):
+  - Every signing still needs a hash-bound proposal from xrpl-trade.
+  - The signer still enforces your policy file: per-transaction and
+    rolling-24h spend caps, approved pairs/tokens, tx-type allowlist,
+    price-deviation and book-quality bounds, fee caps, expirations.
+  - In chat, nothing signs until you tap Submit on the proposal.
+
+What this DOES NOT protect you from:
+  - A compromised agent or machine. This is a same-user install: any
+    process running as this user can read the seed file. If the agent
+    is prompt-injected or the machine is rooted, the seed is exposed.
+  - In short: the agent's mistakes are bounded; the agent's
+    compromise is not defended against.
+
+Reduce the blast radius:
+  - Use a dedicated limited-funds wallet for autopilot, not your vault.
+  - Keep spend caps tight in ~/.xrpl/policy.json.
+  - Run `xrpl-trade autopilot disable` the moment you stop needing it.
+
+The seed is stored 0600, never printed, never logged, never echoed.
+================================================================
+"""
+
+
+def autopilot_seed_controls_account(seed, account, client):
+    """True if the seed derives to the account address or its on-ledger
+    RegularKey. Returns (ok, kind) where kind is 'master', 'regular', or
+    None. Fail-closed: any ledger lookup failure yields (False, None)."""
+    from xrpl.wallet import Wallet
+    try:
+        derived = Wallet.from_seed(seed).classic_address
+    except Exception:
+        return False, None
+    if derived == account:
+        return True, "master"
+    try:
+        from xrpl.models.requests import AccountInfo
+        resp = client.request(AccountInfo(account=account,
+                                          ledger_index="validated"))
+        if resp.is_successful():
+            rk = resp.result["account_data"].get("RegularKey")
+            if rk and derived == rk:
+                return True, "regular"
+    except Exception:
+        pass
+    return False, None
+
+
+def cmd_autopilot(args, cfg):
+    """At-your-own-risk local mainnet signing: enable / disable / status."""
+    if args.autopilot_cmd == "enable":
+        if C.autopilot_enabled_for((cfg or {}).get("address", "")) or \
+                (C.autopilot_state() or {}).get("enabled"):
+            st = C.autopilot_state()
+            sys.exit(f"autopilot is already enabled for {st.get('account')} "
+                     f"— run `xrpl-trade autopilot disable` first to change it.")
+        print(AUTOPILOT_DISCLOSURE)
+        ans = input("Type ENABLE AUTOPILOT to accept this risk and continue: "
+                    ).strip()
+        if ans != "ENABLE AUTOPILOT":
+            sys.exit("not enabled — nothing was stored.")
+        address = args.address or (cfg or {}).get("address")
+        if not address or not C.is_valid_classic_address(address):
+            sys.exit("no valid account address — pass --address r... or set "
+                     "it in ~/.xrpl/config.json first.")
+        network = (cfg or {}).get("network", "mainnet")
+        if network not in C.NETWORKS:
+            sys.exit(f"unknown network {network!r}")
+        import getpass
+        try:
+            seed = getpass.getpass(
+                "Paste the wallet seed (hidden; stored 0600, never "
+                "displayed): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit("\ncancelled — nothing was stored.")
+        if not seed:
+            sys.exit("empty — nothing was stored.")
+        if not C._looks_like_seed(seed):
+            sys.exit("that does not look like an XRPL seed — nothing was "
+                     "stored.")
+        client = get_client(network)
+        ok, kind = autopilot_seed_controls_account(seed, address, client)
+        if not ok:
+            sys.exit(
+                "that seed does not control the account — nothing was stored.\n"
+                f"  account: {address}\n"
+                "  The seed must derive to the account address (master key) "
+                "or its on-ledger RegularKey.")
+        C.write_autopilot_state(address, network, seed)
+        C.audit("autopilot_enable", None, None, network, address, "enabled",
+                note="operator typed ENABLE AUTOPILOT after the at-your-own-"
+                     "risk disclosure; seed stored 0600, never in the log")
+        print(f"\nautopilot ENABLED for {address} ({kind} key, {network}).")
+        print("The signer will use the local seed for this account; every")
+        print("signing still needs a proposal and still enforces the policy.")
+        print("Review your caps: ~/.xrpl/policy.json")
+        print("To remove the seed: xrpl-trade autopilot disable")
+    elif args.autopilot_cmd == "disable":
+        st = C.autopilot_state()
+        if not st or not st.get("enabled"):
+            print("autopilot is not enabled — nothing to do.")
+            return
+        account = st.get("account", "?")
+        ans = input(f"Remove the autopilot seed for {account}? "
+                    f"(type the address to confirm): ").strip()
+        if ans != account:
+            sys.exit("confirmation did not match — autopilot still enabled.")
+        try:
+            C.AUTOPILOT_PATH.unlink()
+        except OSError as e:
+            sys.exit(f"could not remove {C.AUTOPILOT_PATH}: {e}")
+        C.audit("autopilot_disable", None, None, st.get("network", "?"),
+                account, "disabled",
+                note="operator-confirmed removal; seed deleted from disk")
+        print("autopilot disabled — the seed was removed from disk.")
+        print("Mainnet signing is vault-only again for this account.")
+    elif args.autopilot_cmd == "status":
+        st = C.autopilot_state()
+        if not st or not st.get("enabled"):
+            print("autopilot: disabled (vault-only mainnet signing)")
+            return
+        print("autopilot: ENABLED — at your own risk")
+        print(f"  account:   {st.get('account')}")
+        print(f"  network:   {st.get('network')}")
+        print(f"  enabled:   {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(st.get('enabled_at', 0)))} UTC")
+        print(f"  seed file: {C.AUTOPILOT_PATH} (0600, never displayed)")
+        print("  Every signing still needs a proposal + policy checks.")
+    else:
+        sys.exit(f"unknown autopilot subcommand {args.autopilot_cmd!r}")
+
+
 def cmd_setup(_args):
     print("XRPL setup (v0.6). Two paths:")
     print("  1. Generate a brand new wallet — seed created locally, stored in")
@@ -2031,6 +2170,20 @@ def main():
     wf.add_argument("--path", default=None,
                     help="file to strip the seed from "
                          "(default ~/.xrpl/config.json)")
+    p = sub.add_parser("autopilot",
+                       help="at-your-own-risk local mainnet signing: "
+                            "enable / disable / status")
+    ap_ = p.add_subparsers(dest="autopilot_cmd", required=True)
+    ape = ap_.add_parser("enable",
+                         help="store the seed locally (0600) after the risk "
+                              "disclosure — explicit opt-in")
+    ape.add_argument("--address", default=None,
+                     help="account address (default: config.json address)")
+    ap_.add_parser("disable",
+                   help="remove the autopilot seed from disk "
+                        "(vault-only again)")
+    ap_.add_parser("status",
+                   help="show autopilot state (never displays the seed)")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
     p = sub.add_parser("quote", help="order book for any pair")
@@ -2274,6 +2427,11 @@ def main():
     if args.cmd == "wallet":
         # Local-only: key generation and backup display need no network.
         cmd_wallet(args, load_config())
+        return
+    if args.cmd == "autopilot":
+        # Local-only state + (for enable) one ledger read to verify the
+        # seed controls the account. No XRPL client needed up front.
+        cmd_autopilot(args, load_config())
         return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")

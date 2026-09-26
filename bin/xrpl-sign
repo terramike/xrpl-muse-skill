@@ -512,6 +512,10 @@ def load_seed(seed_src=("env", "XRPL_SEED")):
     human approval. Never a raw exported variable in a shared shell.
     ("file", PATH): seed read from a local file — TESTNET ONLY; mainnet
     profiles may not use this kind (enforced in resolve_signing_context).
+    ("autopilot", ACCOUNT): seed from the owner-only ~/.xrpl/autopilot.json
+    — mainnet ONLY when the operator explicitly ran
+    `xrpl-trade autopilot enable` for that account (at-your-own-risk;
+    enforced in resolve_signing_context, fail-closed otherwise).
 
     The old giveaway.json fallback is REMOVED on mainnet (P1-2 vault-only);
     on testnet adhoc it survives via C.read_giveaway_seed().
@@ -527,7 +531,13 @@ def load_seed(seed_src=("env", "XRPL_SEED")):
             seed = open(os.path.expanduser(ref)).read().strip()
         except OSError:
             seed = None
+    elif kind == "autopilot":
+        seed = C.read_autopilot_seed(ref)
     if not seed:
+        if kind == "autopilot":
+            sys.exit("autopilot seed unavailable (disabled, wrong account, "
+                     "or bad file permissions) — run "
+                     "`xrpl-trade autopilot status` to inspect.")
         sys.exit(f"No seed from {kind}:{ref} — the vault injects it after "
                  f"genuine human approval. It is never exported by hand or "
                  f"read from a chat log (see SECURITY.md).")
@@ -566,6 +576,15 @@ def resolve_signing_context(args, prop):
             sys.exit(f"profile binding failed: {e}")
         # P1-2: vault-only mainnet — no seed material in local files.
         C.block_mainnet_on_legacy_seeds()
+        # Autopilot (at-your-own-risk): the operator explicitly enabled
+        # local signing for this account (`xrpl-trade autopilot enable`).
+        # The seed comes from the owner-only autopilot file instead of
+        # the vault injection. Policy enforcement is unchanged; the
+        # disclosure at enable time states the residual risk plainly.
+        if C.autopilot_enabled_for(profile["account"]):
+            policy = C.load_policy(profile["policy_path"])
+            return policy, ("autopilot", profile["account"]), \
+                (profile["state"] == "giveaway"), args.profile
         cred = profile["credential"]
         if cred["kind"] != C.CRED_KIND_ENV:
             sys.exit(f"mainnet: profile {args.profile!r} uses a stored-file "
@@ -776,7 +795,7 @@ def cmd_sign(args):
     tracker.bind_reservation(mrid, thash, last_ledger, submit_ledger)
     C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
             prop["network"], tx["Account"], "signed",
-            f"last_ledger={last_ledger}", spends)
+            f"last_ledger={last_ledger} seed_source={seed_src[0]}", spends)
     net = "livenet" if prop["network"] == "mainnet" else "testnet"
     print(f"\nSigned {thash[:16]}… "
           f"(https://{net}.xrpl.org/transactions/{thash}) — submitting…")
