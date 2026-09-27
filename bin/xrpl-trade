@@ -271,7 +271,13 @@ def cmd_balance(args, cfg, client):
     info = client.request(AccountInfo(account=addr, ledger_index="validated"))
     if not info.is_successful():
         sys.exit(f"AccountInfo failed: {info.result}")
-    print(f"XRP: {drops_to_xrp(info.result['account_data']['Balance'])}")
+    xrp_bal = drops_to_xrp(info.result['account_data']['Balance'])
+    px = C.fetch_xrp_usd()
+    if px is not None:
+        print(f"XRP/USD (Bitstamp): ${px:.5f}")
+        print(f"XRP: {xrp_bal} (~${float(xrp_bal) * px:,.2f})")
+    else:
+        print(f"XRP: {xrp_bal}")
     lines = client.request(AccountLines(account=addr, ledger_index="validated"))
     if lines.is_successful():
         for l in lines.result.get("lines", []):
@@ -544,7 +550,7 @@ def cmd_send(args, cfg, client):
 # PINATA_JWT is read from the environment only at pin time - never
 # stored, logged, or written into proposal files.
 
-STAGE_FORMAT = "nft-stage/2"
+STAGE_FORMAT = "nft-stage/3"
 
 # The exact mint flags every staged NFT is minted with. Bound into the
 # stage digest so a tampered stage record cannot change mint semantics.
@@ -554,12 +560,19 @@ NFT_MINT_FLAGS = (int(NFTokenMintFlag.TF_TRANSFERABLE)
 
 def _compute_stage_digest(file_sha256, name, description, royalty_bps,
                           taxon, mint_flags, account, network, source_path,
-                          media_dir):
+                          media_dir, issuer=None, attribution=True,
+                          fields=None):
     """The stage digest: sha256 over canonical JSON binding the artwork
     bytes, the full mint metadata, the mint flags, and the account +
     network that will mint. Any change to any bound value — edited stage
     record, swapped file, different minter or network — produces a
-    different digest, and the pin step refuses the mismatch."""
+    different digest, and the pin step refuses the mismatch.
+
+    issuer/attribution/fields are part of the bound metadata: the
+    collection issuer (None = self-issued), whether the XRPL-Muse
+    attribution block is injected, and the extra template metadata
+    fields. Omitting any of them from the digest would let a tampered
+    stage record redirect the mint or silently drop the attribution."""
     payload = {
         "file_sha256": file_sha256,
         "name": name,
@@ -571,14 +584,37 @@ def _compute_stage_digest(file_sha256, name, description, royalty_bps,
         "network": network,
         "source_path": source_path,
         "media_dir": media_dir,
+        "issuer": issuer or "",
+        "attribution": bool(attribution),
+        "fields": fields or {},
     }
     canonical = json.dumps(payload, sort_keys=True,
                            separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _validate_stage_fields(fields):
+    """Defensive validation of extra template metadata fields. Returns a
+    problem string, or None when the dict is usable."""
+    if fields is None:
+        return None
+    if not isinstance(fields, dict):
+        return "metadata fields must be a dict"
+    for label, value in fields.items():
+        problem = C.validate_template_label(label)
+        if problem:
+            return problem
+        if not isinstance(value, str) or not value.strip():
+            return (f"metadata field {label!r} must be a non-empty string — "
+                    "omit it to skip an optional field")
+        if len(value) > 2000:
+            return f"metadata field {label!r} exceeds 2000 characters"
+    return None
+
+
 def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
-                  account=None, network="testnet"):
+                  account=None, network="testnet", *, issuer=None,
+                  attribution=True, fields=None, collection=None):
     """Validate artwork and write a stage record. Zero network calls.
 
     Returns the stage record dict. The record carries a stage digest
@@ -589,11 +625,22 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
 
     Artwork must live inside the protected NFT media directory
     (xrpl_pin.protected_media_dir()); anything outside is refused.
+
+    issuer: the collection issuer for the authorized-minter flow (None =
+    self-issued; the NFTokenMint's Account is the minter). attribution:
+    inject the "Minted with XRPL-Muse" block into the pinned metadata
+    JSON (default True; --no-attribution opts out). fields: extra
+    template metadata fields {label: value} merged into the pinned JSON.
+    collection: the registry collection name, informational only (the
+    issuer/taxon it resolved to are what the mint uses).
     """
     if xrpl_pin is None:
         sys.exit("xrpl_pin module missing - cannot stage.")
     if not account:
         sys.exit("an account is required to stage (the future minter)")
+    if issuer is not None and not C.is_valid_classic_address(issuer):
+        sys.exit("issuer is not a valid classic address "
+                 "(base58 checksum failed)")
     royalty_bps = int(royalty_bps)
     if not 0 <= royalty_bps <= 5000:
         sys.exit("royalty must be 0..5000 bps (protocol max is 50%)")
@@ -602,6 +649,10 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
         sys.exit("taxon must fit in a uint32")
     if not name or not str(name).strip():
         sys.exit("NFT name is required")
+    problem = _validate_stage_fields(fields)
+    if problem:
+        sys.exit(problem)
+    fields = dict(fields or {})
     mdir = xrpl_pin.protected_media_dir()
     data, info = xrpl_pin.read_validated_source(file, media_dir=mdir)
     file_sha256 = hashlib.sha256(data).hexdigest()
@@ -609,10 +660,15 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
         sys.exit("internal error: hash mismatch on validated bytes")
     digest = _compute_stage_digest(
         file_sha256, name, description, royalty_bps, taxon,
-        NFT_MINT_FLAGS, account, network, info["path"], info["media_dir"])
+        NFT_MINT_FLAGS, account, network, info["path"], info["media_dir"],
+        issuer=issuer, attribution=attribution, fields=fields)
     created = int(time.time())
     sid = hashlib.sha256(
         f"{info['sha256']}:{created}:{name}".encode()).hexdigest()[:16]
+    metadata = {"name": name, "description": description, "image": None}
+    metadata.update(fields)
+    if attribution:
+        metadata.update(C.NFT_METADATA_ATTRIBUTION)
     record = {
         "format": STAGE_FORMAT,
         "stage_id": sid,
@@ -625,10 +681,20 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
         "description": description,
         # The exact metadata that will be pinned; the image CID is filled
         # in at pin time. The human reviews this record before approving.
-        "metadata": {"name": name, "description": description,
-                     "image": None},
+        "metadata": metadata,
         "royalty_bps": royalty_bps,
         "taxon": taxon,
+        # Collection issuer for the authorized-minter flow (None =
+        # self-issued). Bound into the stage digest; the pin step passes
+        # it as the NFTokenMint's Issuer field.
+        "issuer": issuer,
+        # Whether the XRPL-Muse attribution block is in the metadata.
+        "attribution": bool(attribution),
+        # Extra template metadata fields {label: value}, also in metadata.
+        "fields": fields,
+        # Informational only: the collection name these values resolved
+        # from. The pin step uses issuer/taxon, never this field.
+        "collection": collection,
         # The full stage digest. The pin step recomputes it from CURRENT
         # bytes + CURRENT record values + CURRENT account/network and
         # refuses any mismatch — the stage record is NOT trusted.
@@ -661,10 +727,11 @@ def load_stage_record(stage_id):
         sys.exit(f"Stage record unreadable: {e}")
     if not isinstance(rec, dict) or rec.get("format") != STAGE_FORMAT:
         sys.exit("Stage record has an unsupported format - re-run nft-stage "
-                 "(old stage records predate the digest binding and are "
-                 "not accepted).")
+                 "(records staged before nft-stage/3 predate the "
+                 "issuer/attribution digest binding and are not accepted).")
     for key in ("stage_id", "source_path", "sha256", "bytes", "mime",
                 "name", "description", "metadata", "royalty_bps", "taxon",
+                "issuer", "attribution", "fields", "collection",
                 "stage_digest", "account", "network"):
         if key not in rec:
             sys.exit(f"Stage record is missing {key!r} - re-run nft-stage.")
@@ -674,12 +741,38 @@ def load_stage_record(stage_id):
                    for c in rec["stage_digest"])):
         sys.exit("Stage record has a malformed stage digest - re-run "
                  "nft-stage.")
+    if rec["issuer"] is not None and not isinstance(rec["issuer"], str):
+        sys.exit("Stage record has a malformed issuer - re-run nft-stage.")
+    if not isinstance(rec["attribution"], bool):
+        sys.exit("Stage record has a malformed attribution flag - re-run "
+                 "nft-stage.")
+    if not isinstance(rec["fields"], dict):
+        sys.exit("Stage record has malformed metadata fields - re-run "
+                 "nft-stage.")
+    # The pinned metadata must be EXACTLY the base keys plus the staged
+    # template fields plus (iff attribution is on) the attribution block.
+    # Anything else — a dropped attribution key, an injected field — is a
+    # tampered record.
     meta = rec["metadata"]
-    if (not isinstance(meta, dict)
-            or set(meta) != {"name", "description", "image"}
-            or meta["image"] is not None
-            or meta["name"] != rec["name"]
-            or meta["description"] != rec["description"]):
+    if not isinstance(meta, dict):
+        sys.exit("Stage record metadata is inconsistent - re-run nft-stage.")
+    base_ok = (meta.get("name") == rec["name"]
+               and meta.get("description") == rec["description"]
+               and meta.get("image") is None)
+    extra = set(meta) - {"name", "description", "image"}
+    expected_extra = set(rec["fields"])
+    if rec["attribution"]:
+        for k, v in C.NFT_METADATA_ATTRIBUTION.items():
+            if meta.get(k) != v:
+                sys.exit("Stage record attribution block is inconsistent - "
+                         "re-run nft-stage.")
+        expected_extra |= set(C.NFT_METADATA_ATTRIBUTION)
+    elif any(k in meta for k in C.NFT_METADATA_ATTRIBUTION):
+        sys.exit("Stage record attribution block is inconsistent - re-run "
+                 "nft-stage.")
+    fields_ok = (extra == expected_extra
+                 and all(meta[k] == rec["fields"][k] for k in rec["fields"]))
+    if not (base_ok and fields_ok):
         sys.exit("Stage record metadata is inconsistent - re-run nft-stage.")
     return rec
 
@@ -723,7 +816,9 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
     recomputed = _compute_stage_digest(
         file_sha256, rec["name"], rec["description"],
         rec["royalty_bps"], rec["taxon"], NFT_MINT_FLAGS,
-        acct, network, info["path"], info["media_dir"])
+        acct, network, info["path"], info["media_dir"],
+        issuer=rec["issuer"], attribution=rec["attribution"],
+        fields=rec["fields"])
     if not hmac.compare_digest(recomputed, rec["stage_digest"]):
         sys.exit(
             "refusing: the stage digest does not match what was recorded "
@@ -736,6 +831,20 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
             "Re-run `xrpl-trade nft-stage` and review the new record "
             "before approving. Pinata was NOT contacted.")
     name = rec["name"]
+    issuer = rec.get("issuer")
+    if issuer and issuer != acct:
+        # Authorization could have been revoked between staging and
+        # pinning — re-verify FAIL-CLOSED against the validated ledger
+        # BEFORE any byte leaves the machine. A missing client means we
+        # cannot verify: refuse rather than mint blind.
+        if client is None:
+            sys.exit("refusing: cannot re-verify authorized-minter status "
+                     "without a network client — re-run `xrpl-trade "
+                     "nft-pin-and-propose` normally.")
+        problem = C.check_nft_mint_authorization(client, issuer, acct)
+        if problem:
+            sys.exit(problem + "\nThe collection issuer may have revoked "
+                     "your NFTokenMinter authorization after staging.")
     print("pinning to IPFS via Pinata (external write):")
     print(f"  stage digest: {rec['stage_digest']}")
     print(f"    ^ the human approval below covers THIS digest. If it does")
@@ -745,6 +854,15 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
     print(f"  size/mime: {info['bytes']} bytes, {info['mime']}")
     print(f"  name:      {C.safe_terminal_text(name, 120)}")
     print(f"  account:   {acct}")
+    if issuer and issuer != acct:
+        print(f"  issuer:    {issuer} (you mint as authorized minter)")
+    if rec.get("collection"):
+        print(f"  collection:{rec['collection']}")
+    if rec["attribution"]:
+        print(f"  attribution: Minted with {C.MINTED_WITH_LABEL} "
+              f"({C.MINTED_WITH_URL})")
+    else:
+        print("  attribution: omitted (--no-attribution)")
     print(f"  network:   {network}")
     # TOCTOU-safe: upload the exact bytes that were hashed above. The
     # file is never reopened between the hash check and the upload.
@@ -758,35 +876,154 @@ def pin_and_propose_stage(stage_id, cfg, client, pinner=None):
         sys.exit("metadata URI exceeds the 256-byte ledger limit")
     # XRPL TransferFee is in 1/100000 units: 10000 = 10% = 1000 bps.
     transfer_fee = int(rec["royalty_bps"]) * 10
-    tx = NFTokenMint(
-        account=acct,
-        nftoken_taxon=int(rec["taxon"]),
-        uri=uri_hex,
-        transfer_fee=transfer_fee,
-        flags=NFT_MINT_FLAGS,
-    )
-    return propose(tx, client, cfg, "nft-mint",
-                   [f"stage digest: {rec['stage_digest']}",
-                    "  ^ approving the proposal hash below approves the "
-                    "mint of EXACTLY this staged artwork + metadata",
-                    f"nft:      {C.safe_terminal_text(name, 120)}",
-                    f"image:    ipfs://{image_cid}",
-                    f"metadata: {uri}",
-                    f"royalty:  {int(rec['royalty_bps']) / 100:.2f}% "
-                    f"(immutable after mint - verify it)",
-                    f"flags:    transferable + burnable",
-                    f"taxon:    {rec['taxon']}",
-                    "note:     the ledger stores the URI, not the art - "
-                    "keep the IPFS pin alive"])
+    mint_kw = dict(account=acct,
+                   nftoken_taxon=int(rec["taxon"]),
+                   uri=uri_hex,
+                   transfer_fee=transfer_fee,
+                   flags=NFT_MINT_FLAGS)
+    if issuer and issuer != acct:
+        # Authorized-minter flow: Account signs, Issuer names the
+        # collection issuer. The ledger enforces the authorization; the
+        # CLI pre-checked it fail-closed before staging and re-checked
+        # it above before pinning.
+        mint_kw["issuer"] = issuer
+    tx = NFTokenMint(**mint_kw)
+    summary = [f"stage digest: {rec['stage_digest']}",
+               "  ^ approving the proposal hash below approves the "
+               "mint of EXACTLY this staged artwork + metadata",
+               f"nft:      {C.safe_terminal_text(name, 120)}",
+               f"image:    ipfs://{image_cid}",
+               f"metadata: {uri}",
+               f"royalty:  {int(rec['royalty_bps']) / 100:.2f}% "
+               f"(immutable after mint - verify it)",
+               f"flags:    transferable + burnable",
+               f"taxon:    {rec['taxon']}"]
+    if rec.get("collection"):
+        summary.append(f"collection: {rec['collection']} "
+                       f"(issuer {rec['issuer'] or acct}, "
+                       f"taxon {rec['taxon']})")
+    if issuer and issuer != acct:
+        summary.append(f"issuer:   {issuer} "
+                       "(you mint as its authorized minter)")
+    if rec["fields"]:
+        shown = ", ".join(f"{k}={C.safe_terminal_text(v, 40)}"
+                          for k, v in rec["fields"].items())
+        summary.append(f"fields:   {shown}")
+    if rec["attribution"]:
+        summary.append(f"attribution: Minted with {C.MINTED_WITH_LABEL} "
+                       f"({C.MINTED_WITH_URL})")
+    else:
+        summary.append("attribution: omitted (--no-attribution)")
+    summary.append("note:     the ledger stores the URI, not the art - "
+                   "keep the IPFS pin alive")
+    return propose(tx, client, cfg, "nft-mint", summary)
+
+
+def _parse_meta_args(meta_args):
+    """--meta KEY=VALUE (repeatable) -> {KEY: VALUE}. Refuses malformed
+    entries, empty keys, and empty values (omit the flag to skip an
+    optional field)."""
+    fields = {}
+    for item in meta_args or []:
+        if "=" not in item:
+            sys.exit(f"--meta {item!r} must be KEY=VALUE")
+        key, value = item.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not key:
+            sys.exit(f"--meta {item!r} has an empty key")
+        if not value:
+            sys.exit(f"--meta {key!r} has an empty value — omit the flag "
+                     "to skip an optional field")
+        if key in fields:
+            sys.exit(f"--meta {key!r} given twice")
+        fields[key] = value
+    return fields
 
 
 def cmd_nft_stage(args, cfg, client):
     """Step 1: validate + hash artwork locally, write a stage record."""
     acct = need_account(cfg)
     network = cfg.get("network", "testnet")
+    # 1. Collection resolution: --collection <name> pulls issuer, taxon,
+    #    and the default royalty from the local registry.
+    coll_name, coll = None, None
+    if args.collection:
+        try:
+            colls = C.load_collections()
+        except C.RegistryError as e:
+            sys.exit(str(e))
+        coll = colls.get(args.collection)
+        if coll is None:
+            sys.exit(f"unknown collection {args.collection!r} — see "
+                     "`xrpl-trade collection list`")
+        coll_name = args.collection
+    # 2. Taxon: explicit --taxon wins, else the collection's, else 0.
+    #    Both at once is ambiguous — refuse rather than guess.
+    if args.taxon is not None and coll_name:
+        sys.exit("use one of --collection or --taxon, not both")
+    taxon = args.taxon if args.taxon is not None else (
+        coll["taxon"] if coll else 0)
+    # 3. Issuer: explicit --issuer, else the collection's. When set and
+    #    different from the minter, this is the authorized-minter flow —
+    #    verify it FAIL-CLOSED against the validated ledger BEFORE
+    #    staging (a tampered registry can never pass this check).
+    issuer = args.issuer or (coll["issuer"] if coll else None) or None
+    if issuer:
+        if not C.is_valid_classic_address(issuer):
+            sys.exit("issuer is not a valid classic address "
+                     "(base58 checksum failed)")
+        if coll and args.issuer and args.issuer != coll["issuer"]:
+            sys.exit("--issuer does not match the collection's registered "
+                     "issuer — refusing")
+        if issuer == acct:
+            # Self-issued: mint normally with no Issuer field on the
+            # transaction (the minter IS the issuer).
+            issuer = None
+        else:
+            problem = C.check_nft_mint_authorization(client, issuer, acct)
+            if problem:
+                sys.exit(problem)
+    # 4. Royalty: explicit --royalty-bps wins, else the collection's
+    #    default, else 1000 (10%).
+    royalty = args.royalty_bps
+    if royalty is None:
+        royalty = (coll.get("royalty_bps")
+                   if coll and coll.get("royalty_bps") is not None else 1000)
+    # 5. Template fields: --template <name> validates --meta against the
+    #    template (unknown keys and missing required fields are refused);
+    #    without a template, --meta is ad-hoc (labels still validated).
+    meta_fields = _parse_meta_args(args.meta)
+    if args.template:
+        try:
+            tmpls = C.load_templates()
+        except C.RegistryError as e:
+            sys.exit(str(e))
+        tmpl = tmpls.get(args.template)
+        if tmpl is None:
+            sys.exit(f"unknown template {args.template!r} — see "
+                     "`xrpl-trade template list`")
+        known = {f["label"] for f in tmpl["fields"]}
+        for key in meta_fields:
+            if key not in known:
+                sys.exit(f"--meta {key!r} is not a field of template "
+                         f"{args.template!r}")
+        missing = [f["label"] for f in tmpl["fields"]
+                   if f["required"] and f["label"] not in meta_fields]
+        if missing:
+            sys.exit(f"template {args.template!r} requires: "
+                     f"{', '.join(missing)}")
+    else:
+        for key in meta_fields:
+            problem = C.validate_template_label(key)
+            if problem:
+                sys.exit(problem)
     rec = stage_artwork(args.file, args.name, args.description or "",
-                        args.royalty_bps, args.taxon,
-                        account=acct, network=network)
+                        royalty, taxon,
+                        account=acct, network=network,
+                        issuer=issuer,
+                        attribution=not args.no_attribution,
+                        fields=meta_fields or None,
+                        collection=coll_name)
     print("STAGED - nothing has left this machine (zero network calls).")
     print(f"  stage id: {rec['stage_id']}")
     print(f"  stage digest: {rec['stage_digest'][:16]}... "
@@ -796,6 +1033,21 @@ def cmd_nft_stage(args, cfg, client):
     print(f"  size:     {rec['bytes']} bytes ({rec['mime']})")
     print(f"  name:     {C.safe_terminal_text(rec['name'], 120)}")
     print(f"  account:  {rec['account']} (the minter)")
+    if issuer:
+        print(f"  issuer:   {issuer} (collection issuer — you mint as "
+              f"its authorized minter)")
+    if coll_name:
+        print(f"  collection: {coll_name} (taxon {rec['taxon']})")
+    if args.template:
+        print(f"  template: {args.template}")
+    if meta_fields:
+        for k, v in meta_fields.items():
+            print(f"    field:  {k} = {C.safe_terminal_text(v, 80)}")
+    if rec["attribution"]:
+        print(f"  attribution: Minted with {C.MINTED_WITH_LABEL} "
+              f"({C.MINTED_WITH_URL})")
+    else:
+        print("  attribution: omitted (--no-attribution)")
     print(f"  network:  {rec['network']}")
     print(f"  royalty:  {rec['royalty_bps'] / 100:.2f}% "
           f"(immutable after mint - verify it)")
@@ -1095,6 +1347,258 @@ def cmd_favorites(args):
             print(f"  {name} → {f.get('address')}  added {added}{note}")
     else:  # pragma: no cover — argparse restricts choices
         sys.exit(f"unknown favorites command {cmd!r}")
+
+
+def cmd_collection(args, cfg, client):
+    """Local NFT collection registry: name -> {issuer, taxon, ...}.
+
+    A collection is the pair issuer + NFTokenTaxon — XRPL has no
+    on-ledger collection object, and taxon alone is not unique across
+    issuers. create/remove are LOCAL ONLY (no ledger transaction): the
+    collection exists on-ledger only once you mint into it with
+    `nft-stage --collection <name>`. inspect is read-only.
+
+    Registry writes follow the policy.json rule: the assistant shows the
+    exact diff and gets an explicit human yes before invoking
+    create/remove — a tampered entry could otherwise point a collection
+    name at someone else's issuer. The mint-time issuer /
+    authorized-minter check is the backstop regardless.
+    """
+    try:
+        colls = C.load_collections()
+    except C.RegistryError as e:
+        sys.exit(str(e))
+    cmd = args.coll_cmd
+    if cmd == "create":
+        problem = C.validate_registry_name(args.name, "collection")
+        if problem:
+            sys.exit(problem)
+        if args.name in colls:
+            sys.exit(f"collection {args.name!r} already exists — remove "
+                     "it first to re-register")
+        taxon, problem = C.validate_taxon(args.taxon)
+        if problem:
+            sys.exit(problem)
+        issuer = args.issuer or (cfg.get("address") if cfg else None)
+        if not issuer:
+            sys.exit("no issuer: pass --issuer or run `xrpl-trade setup` "
+                     "first")
+        if not C.is_valid_classic_address(issuer):
+            sys.exit("issuer is not a valid classic address "
+                     "(base58 checksum failed)")
+        royalty_bps = None
+        if args.royalty_bps is not None:
+            try:
+                royalty_bps = int(args.royalty_bps)
+            except (TypeError, ValueError):
+                sys.exit("--royalty-bps must be an integer 0..5000")
+            if not 0 <= royalty_bps <= 5000:
+                sys.exit("--royalty-bps must be 0..5000 bps "
+                         "(protocol max is 50%)")
+        description = (args.description or "").strip()
+        if len(description) > 500:
+            sys.exit("--description exceeds 500 characters")
+        colls[args.name] = {"issuer": issuer,
+                            "taxon": taxon,
+                            "description": description,
+                            "royalty_bps": royalty_bps,
+                            "created_at": int(time.time())}
+        C.save_collections(colls)
+        network = cfg.get("network", "?") if cfg else "?"
+        C.audit("collection_create", None, None, network, issuer,
+                "registered",
+                note=f"name={args.name} taxon={taxon}")
+        print(f"collection {args.name!r} registered LOCALLY — no ledger "
+              "transaction was made.")
+        print(f"  issuer:  {issuer}")
+        print(f"  taxon:   {taxon}")
+        if royalty_bps is not None:
+            print(f"  royalty: {royalty_bps / 100:.2f}% default for mints "
+                  "in this collection")
+        if description:
+            print(f"  note:    {C.safe_terminal_text(description, 120)}")
+        print("It exists on-ledger only once you mint into it:")
+        print(f"  xrpl-trade nft-stage --collection {args.name} --file "
+              "<art> --name <name>")
+    elif cmd == "list":
+        if not colls:
+            print("no collections yet — register one with: "
+                  "xrpl-trade collection create --name <name> --taxon <n>")
+            return
+        for name in sorted(colls):
+            c = colls[name]
+            roy = (f", royalty {c['royalty_bps'] / 100:.2f}%"
+                   if c.get("royalty_bps") is not None else "")
+            desc = (f" — {C.safe_terminal_text(c['description'], 60)}"
+                    if c.get("description") else "")
+            print(f"  {name}: issuer {C.short_addr(c['issuer'])}, "
+                  f"taxon {c['taxon']}{roy}{desc}")
+    elif cmd == "inspect":
+        c = colls.get(args.name)
+        if c is None:
+            sys.exit(f"unknown collection {args.name!r} — see "
+                     "`xrpl-trade collection list`")
+        issuer, taxon = c["issuer"], c["taxon"]
+        print(f"collection {args.name!r} (read-only):")
+        print(f"  issuer: {issuer}")
+        print(f"  taxon:  {taxon}")
+        if c.get("description"):
+            print(f"  note:   {C.safe_terminal_text(c['description'], 120)}")
+        count, recent, problem = C.count_collection_tokens(
+            client, issuer, taxon)
+        if problem:
+            sys.exit(problem)
+        print(f"  on-ledger tokens in this collection: {count}")
+        for nid in recent:
+            print(f"    • {nid}")
+            print(f"      {C.XRP_CAFE_NFT_URL.format(nid)}")
+    elif cmd == "remove":
+        if args.name not in colls:
+            sys.exit(f"no collection named {args.name!r}")
+        del colls[args.name]
+        C.save_collections(colls)
+        network = cfg.get("network", "?") if cfg else "?"
+        C.audit("collection_remove", None, None, network, "?", "removed",
+                note=f"name={args.name}")
+        print(f"removed collection {args.name!r} (local registry only — "
+              "nothing on-ledger was touched)")
+    else:  # pragma: no cover — argparse restricts choices
+        sys.exit(f"unknown collection command {cmd!r}")
+
+
+def _template_fields_interactive():
+    """Prompt for template fields until a blank label. Returns
+    ([(label, required)], cancelled)."""
+    fields = []
+    seen = set()
+    while True:
+        try:
+            label = input("  field label (blank to finish): ").strip()
+        except EOFError:
+            return None, True
+        if not label:
+            break
+        if label.lower() == "quit":
+            return None, True
+        problem = C.validate_template_label(label)
+        if problem:
+            print(f"  ✗ {problem}")
+            continue
+        if label in seen or label.lower() in {s.lower() for s in seen}:
+            print(f"  ✗ duplicate field label {label!r}")
+            continue
+        try:
+            req = input("  required? [y/N]: ").strip().lower()
+        except EOFError:
+            return None, True
+        fields.append((label, req in ("y", "yes")))
+        seen.add(label)
+    return fields, False
+
+
+def cmd_template(args, cfg, client):
+    """Local NFT metadata templates: name -> {fields: [{label,
+    required}]}. String fields only (v1). Templates are NOT bound to a
+    collection — one template is reused across collections; the
+    collection is picked fresh at each mint.
+
+    Template writes follow the policy.json rule: the assistant shows the
+    exact diff and gets an explicit human yes before invoking create/
+    remove. A template can never change where funds or NFTs go — only
+    metadata labels.
+    """
+    try:
+        tmpls = C.load_templates()
+    except C.RegistryError as e:
+        sys.exit(str(e))
+    cmd = args.tmpl_cmd
+    if cmd == "create":
+        name = args.name
+        fields = []
+        if name is None or not args.field:
+            # Interactive: missing name and/or fields.
+            if name is None:
+                try:
+                    name = input("template name: ").strip()
+                except EOFError:
+                    sys.exit("\ncancelled — nothing was saved.")
+            problem = C.validate_registry_name(name, "template")
+            if problem:
+                sys.exit(problem)
+            if name in tmpls:
+                sys.exit(f"template {name!r} already exists — remove it "
+                         "first to re-create")
+            if not args.field:
+                print("define the metadata fields (labels only, v1 "
+                      "strings):")
+                got, cancelled = _template_fields_interactive()
+                if cancelled:
+                    sys.exit("\ncancelled — nothing was saved.")
+                fields = got
+        else:
+            problem = C.validate_registry_name(name, "template")
+            if problem:
+                sys.exit(problem)
+            if name in tmpls:
+                sys.exit(f"template {name!r} already exists — remove it "
+                         "first to re-create")
+        for spec in args.field or []:
+            label, required, problem = C.parse_template_field(spec)
+            if problem:
+                sys.exit(f"--field {spec!r}: {problem}")
+            if label in [f[0] for f in fields] or label.lower() in \
+                    [f[0].lower() for f in fields]:
+                sys.exit(f"--field {spec!r}: duplicate label {label!r}")
+            fields.append((label, required))
+        if not fields:
+            sys.exit("a template needs at least one field — nothing was "
+                     "saved")
+        tmpls[name] = {"fields": [{"label": l, "required": r}
+                                  for l, r in fields],
+                       "created_at": int(time.time())}
+        C.save_templates(tmpls)
+        network = cfg.get("network", "?") if cfg else "?"
+        C.audit("template_create", None, None, network,
+                cfg.get("address", "?") if cfg else "?", "saved",
+                note=f"name={name} fields={len(fields)}")
+        req = sum(1 for _, r in fields if r)
+        print(f"template {name!r} saved ({len(fields)} fields, "
+              f"{req} required):")
+        for label, required in fields:
+            print(f"  • {label}" + ("  (required)" if required else ""))
+        print("Use it at mint time:")
+        print(f"  xrpl-trade nft-stage --template {name} --meta "
+              "<label>=<value> … --file <art> --name <nft-name>")
+    elif cmd == "list":
+        if not tmpls:
+            print("no templates yet — create one with: "
+                  "xrpl-trade template create")
+            return
+        for name in sorted(tmpls):
+            t = tmpls[name]
+            req = sum(1 for f in t["fields"] if f["required"])
+            print(f"  {name}: {len(t['fields'])} fields ({req} required)")
+    elif cmd == "show":
+        t = tmpls.get(args.name)
+        if t is None:
+            sys.exit(f"unknown template {args.name!r} — see "
+                     "`xrpl-trade template list`")
+        print(f"template {args.name!r}:")
+        for f in t["fields"]:
+            print(f"  • {f['label']}" +
+                  ("  (required)" if f["required"] else ""))
+    elif cmd == "remove":
+        if args.name not in tmpls:
+            sys.exit(f"no template named {args.name!r}")
+        del tmpls[args.name]
+        C.save_templates(tmpls)
+        network = cfg.get("network", "?") if cfg else "?"
+        C.audit("template_remove", None, None, network,
+                cfg.get("address", "?") if cfg else "?", "removed",
+                note=f"name={args.name}")
+        print(f"removed template {args.name!r}")
+    else:  # pragma: no cover — argparse restricts choices
+        sys.exit(f"unknown template command {cmd!r}")
 
 
 def _profile_input(prompt, default="", _input=input):
@@ -2339,11 +2843,32 @@ def main():
     p.add_argument("--name", required=True, help="NFT name")
     p.add_argument("--description", default="",
                    help="NFT description (goes in the metadata JSON)")
-    p.add_argument("--royalty-bps", default=1000, type=int,
+    p.add_argument("--royalty-bps", default=None, type=int,
                    help="creator royalty in basis points, 0..5000 "
-                        "(default 1000 = 10%%; IMMUTABLE after mint)")
-    p.add_argument("--taxon", default=0, type=int,
-                   help="NFTokenTaxon grouping id (default 0)")
+                        "(default: the collection's default, else 1000 = "
+                        "10%%; IMMUTABLE after mint)")
+    p.add_argument("--taxon", default=None, type=int,
+                   help="NFTokenTaxon grouping id (default: the "
+                        "collection's taxon, else 0)")
+    p.add_argument("--collection", default=None,
+                   help="mint into a registered collection: pulls issuer, "
+                        "taxon, and default royalty from the local "
+                        "registry (see: collection list)")
+    p.add_argument("--issuer", default=None,
+                   help="collection issuer for the authorized-minter flow "
+                        "(default: the collection's issuer, else "
+                        "self-issued). The minter must be the issuer or "
+                        "its on-ledger authorized NFTokenMinter — "
+                        "verified fail-closed before staging")
+    p.add_argument("--template", default=None,
+                   help="metadata template name: --meta values are "
+                        "validated against it (see: template list)")
+    p.add_argument("--meta", default=None, action="append",
+                   help="extra metadata field as KEY=VALUE (repeatable); "
+                        "with --template, keys must be template fields")
+    p.add_argument("--no-attribution", action="store_true",
+                   help="omit the default 'Minted with XRPL-Muse' "
+                        "attribution block from the pinned metadata")
     p = sub.add_parser("nft-pin-and-propose",
                        help="PIN staged artwork + metadata to IPFS "
                             "(external write via your Pinata key) and "
@@ -2399,6 +2924,50 @@ def main():
     rn = fav.add_parser("rename", help="rename a favorite")
     rn.add_argument("old")
     rn.add_argument("new")
+    p = sub.add_parser("collection", help="local NFT collection registry: "
+                                          "name -> issuer + NFTokenTaxon "
+                                          "(local bookkeeping only — "
+                                          "nothing on-ledger)")
+    coll = p.add_subparsers(dest="coll_cmd", required=True)
+    c = coll.add_parser("create", help="register a collection locally "
+                                       "(no ledger transaction)")
+    c.add_argument("--name", required=True,
+                   help="collection name, 1-32 chars [a-z0-9_-]")
+    c.add_argument("--taxon", required=True,
+                   help="NFTokenTaxon grouping id (uint32)")
+    c.add_argument("--issuer", default=None,
+                   help="collection issuer classic address (default: "
+                        "your configured account)")
+    c.add_argument("--description", default="",
+                   help="optional note about the collection")
+    c.add_argument("--royalty-bps", default=None, type=int,
+                   help="default creator royalty for mints in this "
+                        "collection, 0..5000 (explicit --royalty-bps on "
+                        "the mint overrides it)")
+    coll.add_parser("list", help="list registered collections")
+    i = coll.add_parser("inspect", help="show a collection: issuer, taxon, "
+                                        "on-ledger token count (read-only)")
+    i.add_argument("name", help="collection name")
+    r = coll.add_parser("remove", help="unregister a collection "
+                                       "(local only)")
+    r.add_argument("name", help="collection name")
+    p = sub.add_parser("template", help="local NFT metadata templates: "
+                                        "named field schemas (string "
+                                        "fields, v1)")
+    tmpl = p.add_subparsers(dest="tmpl_cmd", required=True)
+    t = tmpl.add_parser("create", help="create a template (args, or "
+                                       "interactive when --name/--field "
+                                       "are omitted)")
+    t.add_argument("--name", default=None,
+                   help="template name, 1-32 chars [a-z0-9_-]")
+    t.add_argument("--field", default=None, action="append",
+                   help="field as 'label', 'label:required', or "
+                        "'label:optional' (repeatable)")
+    tmpl.add_parser("list", help="list saved templates")
+    s = tmpl.add_parser("show", help="show a template's fields")
+    s.add_argument("name", help="template name")
+    r = tmpl.add_parser("remove", help="delete a template")
+    r.add_argument("name", help="template name")
     p = sub.add_parser("profile", help="your local assistant profile: name, "
                                        "watch-only addresses, memberships, "
                                        "interests (local only, never leaves "
@@ -2571,6 +3140,8 @@ def main():
         "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
         "nft-bid": lambda: cmd_nft_bid(args, cfg, client),
         "nft-new": lambda: cmd_nft_new(args, cfg, client),
+        "collection": lambda: cmd_collection(args, cfg, client),
+        "template": lambda: cmd_template(args, cfg, client),
         "giveaway": lambda: cmd_giveaway(args, cfg, client),
     }[args.cmd]()
 

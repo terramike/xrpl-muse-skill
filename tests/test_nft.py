@@ -124,8 +124,13 @@ with tempfile.TemporaryDirectory() as td:
               no_taxon, C.DEFAULT_ALLOWED_TX_TYPES)))
     smuggle_issuer = mint_tx()
     smuggle_issuer["Issuer"] = DEST
-    check("NFTokenMint+Issuer (mint-for-other) rejected",
-          any("Issuer" in p for p in C.validate_tx_shape(
+    # v0.9: Issuer is schema-allowed for the authorized-minter flow
+    # (collection issuer != minting account). Enforcement moved to the
+    # fail-closed pre-stage ledger check (AccountRoot.NFTokenMinter on a
+    # validated ledger) plus the ledger's own tecNO_PERMISSION — the
+    # schema no longer blocks minting for another issuer.
+    check("NFTokenMint+Issuer (authorized-minter flow) schema-allowed",
+          not any("Issuer" in p for p in C.validate_tx_shape(
               smuggle_issuer, C.DEFAULT_ALLOWED_TX_TYPES)))
     smuggle_memo = mint_tx()
     smuggle_memo["Memos"] = [{"Memo": {"MemoData": "hi"}}]
