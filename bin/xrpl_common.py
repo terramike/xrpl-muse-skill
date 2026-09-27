@@ -58,6 +58,7 @@ import os
 import re
 import sys
 import time
+import urllib.request
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -97,6 +98,25 @@ CRED_KIND_FILE = "file"
 # against — the disclosure says so in plain words.
 AUTOPILOT_PATH = XRPL_DIR / "autopilot.json"
 AUTOPILOT_SCHEMA_VERSION = 1
+# NFT collections + templates: local registries (agent-writable). A
+# collection is the pair issuer + NFTokenTaxon — XRPL has no on-ledger
+# collection object. Writes follow the policy.json rule (exact diff +
+# explicit human yes, enforced by the assistant at runtime); the mint-time
+# issuer/authorized-minter check is the backstop even if a registry is
+# tampered with.
+COLLECTIONS_PATH = XRPL_DIR / "collections.json"
+TEMPLATES_PATH = XRPL_DIR / "nft-templates.json"
+# Attribution injected into every mint's metadata JSON by default
+# (--no-attribution opts out). Stable key names so indexers and
+# marketplaces can recognize XRPL-Muse mints later.
+MINTED_WITH_LABEL = "XRPL-Muse"
+MINTED_WITH_URL = "https://github.com/terramike/xrpl-muse-skill"
+NFT_METADATA_ATTRIBUTION = {"minted_with": MINTED_WITH_LABEL,
+                            "minted_with_url": MINTED_WITH_URL}
+# Metadata keys the minter may not override via template fields: the
+# pinned base keys plus the attribution block.
+NFT_METADATA_RESERVED = {"name", "description", "image",
+                         "minted_with", "minted_with_url"}
 
 NETWORKS = {
     "mainnet": ["https://s1.ripple.com:51234", "https://s2.ripple.com:51234"],
@@ -910,11 +930,15 @@ ALLOWED_FIELDS = {
     "OfferCancel": COMMON_FIELDS | {"OfferSequence"},
     "TrustSet": COMMON_FIELDS | {"LimitAmount"},
     "Payment": COMMON_FIELDS | {"Destination", "Amount", "DestinationTag"},
-    # NOTE: no "Issuer" on NFTokenMint (minting for another issuer is out
-    # of scope). NFTokenCreateOffer allows "Owner" for buy offers (bids);
-    # sell offers must NOT carry it (enforced in check_nft_offer).
+    # NOTE: "Issuer" on NFTokenMint is allowed ONLY for the authorized-minter
+    # flow: the tx's Account (the signer) mints on behalf of Issuer. The
+    # LEDGER enforces this — only the issuer itself or its on-ledger
+    # authorized NFTokenMinter can submit such a mint (anything else fails
+    # tecNO_PERMISSION) — and the CLI pre-checks the minter fail-closed
+    # BEFORE staging. NFTokenCreateOffer allows "Owner" for buy offers
+    # (bids); sell offers must NOT carry it (enforced in check_nft_offer).
     "NFTokenMint": COMMON_FIELDS | {"NFTokenTaxon", "URI", "TransferFee",
-                                    "Flags"},
+                                    "Flags", "Issuer"},
     "NFTokenCreateOffer": COMMON_FIELDS | {"NFTokenID", "Amount",
                                            "Expiration", "Destination",
                                            "Owner", "Flags"},
@@ -1369,6 +1393,196 @@ def resolve_fav_or_addr(token, favs):
         return token, None
     return None, (f"{token!r} is neither a favorite name nor a valid "
                   "classic address (base58 checksum failed)")
+
+
+# ---------- NFT collections + templates (local registries) ----------
+#
+# A collection is the pair issuer + NFTokenTaxon (XRPL has no on-ledger
+# collection object; taxon alone is not unique across issuers). A
+# template is a named metadata field schema (labels only, v1 strings).
+# Both files are agent-writable local state: the assistant shows the
+# exact diff and gets an explicit human yes before any write (the
+# policy.json rule). The mint-time issuer/authorized-minter check is the
+# backstop — it passes or fails on ledger facts, never on these files.
+
+class RegistryError(ValueError):
+    """A collections/templates registry file is corrupt or invalid."""
+
+
+REGISTRY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def validate_registry_name(name, kind):
+    """Returns a problem string, or None when the name is usable."""
+    if not isinstance(name, str) or not REGISTRY_NAME_RE.match(name):
+        return (f"{kind} name {name!r} is invalid — use 1-32 chars: "
+                "lowercase letters, digits, '-' or '_'")
+    return None
+
+
+def _load_registry(path, kind):
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise RegistryError(
+            f"{kind} registry is unreadable ({path}): {e} — fix or delete it")
+    if not isinstance(data, dict):
+        raise RegistryError(f"{kind} registry is not a JSON object ({path})")
+    return data
+
+
+def _save_registry(data, path):
+    """Persist a registry atomically, owner-only 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_collections(path=None):
+    p = Path(path) if path else COLLECTIONS_PATH
+    return _load_registry(p, "collections")
+
+
+def save_collections(data, path=None):
+    p = Path(path) if path else COLLECTIONS_PATH
+    _save_registry(data, p)
+
+
+def load_templates(path=None):
+    p = Path(path) if path else TEMPLATES_PATH
+    return _load_registry(p, "templates")
+
+
+def save_templates(data, path=None):
+    p = Path(path) if path else TEMPLATES_PATH
+    _save_registry(data, p)
+
+
+def validate_taxon(value):
+    """NFTokenTaxon must be an integer fitting in a uint32. Returns
+    (taxon_int, problem)."""
+    if isinstance(value, bool):
+        return None, "taxon must be an integer 0..4294967295"
+    try:
+        t = int(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None, f"taxon {value!r} is not an integer"
+    if not 0 <= t <= 0xFFFFFFFF:
+        return None, f"taxon {value!r} must fit in a uint32 (0..4294967295)"
+    return t, None
+
+
+def validate_template_label(label):
+    """A template field label: non-empty, <=64 chars, no control chars,
+    and never one of the reserved metadata keys. Returns a problem
+    string, or None when usable."""
+    if not isinstance(label, str) or not label.strip():
+        return "field label must be a non-empty string"
+    label = label.strip()
+    if len(label) > 64:
+        return f"field label {label!r} exceeds 64 characters"
+    if any(ord(c) < 32 or ord(c) == 127 for c in label):
+        return f"field label {label!r} contains control characters"
+    if label in NFT_METADATA_RESERVED:
+        return (f"field label {label!r} is reserved "
+                "(name, description, image, minted_with, minted_with_url)")
+    return None
+
+
+def parse_template_field(spec):
+    """'label' | 'label:required' | 'label:optional' -> (label, required,
+    problem). A trailing ':required'/':optional' is only treated as a
+    marker when it is exactly that suffix; anything else stays part of
+    the label."""
+    if not isinstance(spec, str) or not spec.strip():
+        return None, None, "template field must be a non-empty string"
+    s = spec.strip()
+    label, required = s, False
+    if ":" in s:
+        maybe_label, maybe_req = s.rsplit(":", 1)
+        if maybe_req.lower() in ("required", "optional"):
+            label, required = maybe_label.strip(), maybe_req.lower() == "required"
+    problem = validate_template_label(label)
+    if problem:
+        return None, None, problem
+    return label, required, None
+
+
+def check_nft_mint_authorization(client, issuer, signer):
+    """Fail-closed authorization for minting into a collection.
+
+    Returns None when `signer` may mint for `issuer`: the signer IS the
+    issuer, or the issuer's on-ledger authorized NFTokenMinter (read from
+    the VALIDATED ledger). Returns a problem string otherwise — including
+    on ANY lookup failure. The ledger is the authority; a tampered local
+    registry can never pass this check.
+    """
+    if signer == issuer:
+        return None
+    from xrpl.models.requests import AccountInfo
+    try:
+        r = client.request(AccountInfo(account=issuer,
+                                       ledger_index="validated"))
+    except Exception as e:  # noqa: BLE001
+        return (f"could not verify NFTokenMinter for {short_addr(issuer)}: "
+                f"{e} — refusing")
+    if not r.is_successful():
+        return (f"could not verify NFTokenMinter for {short_addr(issuer)} "
+                "(node error) — refusing")
+    res = r.result or {}
+    # ledger_index="validated" is a request, not a guarantee — refuse the
+    # data unless the node confirms it.
+    if res.get("validated") is not True:
+        return ("NFTokenMinter lookup returned unvalidated ledger data — "
+                "refusing")
+    minter = (res.get("account_data") or {}).get("NFTokenMinter")
+    if minter == signer:
+        return None
+    return (f"{short_addr(signer)} is not {short_addr(issuer)} and is not "
+            "its authorized NFTokenMinter — refusing")
+
+
+def count_collection_tokens(client, issuer, taxon, max_pages=25):
+    """Read-only: (count, recent_ids, problem). Pages the issuer's NFTs on
+    the validated ledger and counts those with NFTokenTaxon == taxon
+    (client-side filter — the ledger has no taxon filter). recent_ids
+    holds up to 10 token IDs, newest page first."""
+    from xrpl.models.requests import AccountNFTs
+    count = 0
+    recent = []
+    marker = None
+    for _ in range(max_pages):
+        kw = {"account": issuer, "limit": 400, "ledger_index": "validated"}
+        if marker:
+            kw["marker"] = marker
+        try:
+            r = client.request(AccountNFTs(**kw))
+        except Exception as e:  # noqa: BLE001
+            return None, None, f"could not read the issuer's NFTs: {e} — refusing"
+        if not r.is_successful():
+            return None, None, ("could not read the issuer's NFTs "
+                                "(node error) — refusing")
+        res = r.result or {}
+        if res.get("validated") is not True:
+            return None, None, ("issuer NFT lookup returned unvalidated "
+                                "ledger data — refusing")
+        for n in res.get("account_nfts", []):
+            try:
+                t = int(n.get("NFTokenTaxon"))
+            except (TypeError, ValueError):
+                continue
+            if t == taxon:
+                count += 1
+                if len(recent) < 10:
+                    recent.append(n.get("NFTokenID"))
+        marker = res.get("marker")
+        if not marker:
+            break
+    return count, recent, None
 
 
 # ---------- assistant profile (onboarding) ----------
@@ -2905,6 +3119,20 @@ def audit(action, proposal_hash, tx_hash, network, account, result, note="",
 
 
 # ---------- network client (lazy: imports xrpl-py only when called) ----------
+
+def fetch_xrp_usd(timeout=10):
+    """Current XRP/USD from Bitstamp's public ticker (no auth).
+
+    Returns a float, or None if the fetch fails. Read-only; never raises —
+    callers (e.g. the balance display) must degrade gracefully."""
+    try:
+        req = urllib.request.Request(
+            "https://www.bitstamp.net/api/v2/ticker/xrpusd/",
+            headers={"User-Agent": "xrpl-muse-skill/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return float(json.load(resp)["last"])
+    except Exception:  # noqa: BLE001 — price display is best-effort
+        return None
 
 def make_client(network):
     import asyncio

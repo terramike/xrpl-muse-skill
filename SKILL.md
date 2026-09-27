@@ -258,7 +258,7 @@ is mandatory and must match the profile the proposal was built for.
   `NFTokenAcceptOffer` to enable NFTs (and set `nft.allow_buy_offers=true`
   for the buy side).
 
-## NFTs (v0.5): mint, list, inventory, buy, bid
+## NFTs (v0.5+): collections, templates, mint, list, inventory, buy, bid
 
 Minting is a deliberate **two-step** flow — pinning is an external write
 and happens inside the approved action, never before it:
@@ -277,6 +277,65 @@ xrpl-trade nft-pin-and-propose --stage <stage-id>
 # → re-validates the file against the staged hash, pins art + metadata
 #   under YOUR Pinata account, proposes NFTokenMint
 ```
+
+### Collections, templates & attribution (v0.9)
+
+Saying "mint an nft" starts a guided chat, not a one-shot command: the
+assistant walks through **collection → template/ad-hoc fields → artwork
+→ values → review**, then the usual stage → pin → propose → approve →
+sign flow. Collections and templates are plain local JSON registries —
+there is no on-ledger "collection" object; a collection is just a named
+**issuer + NFTokenTaxon** pair you reuse, and a template is a reusable
+field schema (v1: string fields only) that is **not** bound to any
+collection — you pick both fresh at each mint.
+
+```bash
+# Register a collection LOCALLY (no ledger transaction — it exists
+# on-ledger only once you mint into its issuer+taxon):
+xrpl-trade collection create --name jets --taxon 200 \
+    [--issuer r...] [--royalty-bps 1000] [--description "..."]
+xrpl-trade collection list
+xrpl-trade collection inspect jets   # issuer, taxon, on-ledger token count
+xrpl-trade collection remove jets
+
+# Reusable metadata field schemas (string values, v1):
+xrpl-trade template create --name jets \
+    --field "attack:required" --field "speed:required" --field "gun1"
+# (omit --name/--field for an interactive walkthrough)
+xrpl-trade template list
+xrpl-trade template show jets
+xrpl-trade template remove jets
+
+# Mint into a collection with a template; extra fields ad-hoc:
+xrpl-trade nft-stage --collection jets --template jets \
+    --meta attack=90 --meta speed=75 --meta gun1=railgun \
+    --file art.png --name "Jet #1"
+# --royalty-bps overrides the collection's default royalty;
+# --taxon is refused together with --collection (the collection owns it);
+# --issuer is for authorized-minter mints (below).
+```
+
+- Registry files live in `~/.xrpl/` (`collections.json`,
+  `nft-templates.json`), written temp-file + atomic rename, mode `0600`.
+  The assistant treats `collection create/remove` and `template
+  create/remove` like policy edits: it shows the **exact diff** and gets
+  an **explicit human yes** before running them — never silent writes.
+- The stage review (and the pin approval ceremony) shows the collection,
+  each template field value, and the attribution state, so a human sees
+  exactly what metadata will be pinned.
+- **Attribution is on by default.** Every staged metadata carries
+  `"minted_with": "XRPL-Muse"` and `"minted_with_url":
+  "https://github.com/terramike/xrpl-muse-skill"` unless the minter
+  passes `--no-attribution`. The pin step re-verifies the attribution
+  block against the stage digest — editing it out of the staged record
+  fails the mint rather than minting silently unattributed.
+- **Minting for someone else's collection:** you can mint as the
+  collection issuer **or** as its on-ledger authorized `NFTokenMinter`
+  (`--issuer r...`). Before staging, the skill reads the issuer's
+  `AccountRoot` from a **validated** ledger and proceeds only if
+  `NFTokenMinter` equals your account — lookup failures, unvalidated
+  data, or a mismatch refuse the mint. The proposed `NFTokenMint`
+  carries the `Issuer` field (self-issued mints never do).
 
 ```bash
 xrpl-trade nft-list --token-id <64-hex-id> --price-xrp 25 \
