@@ -71,6 +71,7 @@ STATE_PATH = XRPL_DIR / "state.json"
 STATE_LOCK_PATH = XRPL_DIR / "state.lock"
 AUDIT_PATH = XRPL_DIR / "audit.log"
 FAVORITES_PATH = XRPL_DIR / "favorites.json"    # named artist watchlist (read-only)
+WATCH_SEEN_PATH = XRPL_DIR / "hidden_files" / "watch-seen.json"  # offer-watcher watermark
 PROFILE_PATH = XRPL_DIR / "profile.json"      # local assistant profile (onboarding)
 PROFILE_SCHEMA_VERSION = 1
 STAGE_DIR = XRPL_DIR / "stage"  # nft-stage records: review before pinning

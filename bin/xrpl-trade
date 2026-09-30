@@ -1348,51 +1348,68 @@ def cmd_nft_send(args, cfg, client):
     propose(tx, client, cfg, "nft-send", lines)
 
 
+def _add_favorite_entry(name, address, kind, note, label, verb="favorite"):
+    """Shared add path for `favorites add` and `watch add`.
+
+    kind is artist/friend/watch. Addresses only: the classic-address
+    base58 checksum rejects seeds (different version byte), so a seed
+    can never be stored here.
+    """
+    if kind not in ("artist", "friend", "watch"):
+        sys.exit("--kind must be artist, friend, or watch")
+    problem = C.validate_favorite_name(name)
+    if problem:
+        sys.exit(problem)
+    try:
+        favs = C.load_favorites()
+    except C.FavoritesError as e:
+        sys.exit(str(e))
+    if name in favs:
+        sys.exit(f"{verb} {name!r} already exists "
+                 f"({favs[name].get('address')}) — "
+                 "remove it first to re-add")
+    if not C.is_valid_classic_address(address):
+        sys.exit("address is not a valid classic address (base58 checksum "
+                 "failed) — only r-addresses are stored here, never seeds")
+    entry = {"address": address,
+             "added_at": int(time.time()),
+             "last_checked_ledger": None,
+             "kind": kind}
+    if note:
+        entry["note"] = note
+    if label:
+        lproblem = C.validate_favorite_label(label)
+        if lproblem:
+            sys.exit(lproblem)
+        entry["label"] = label
+    favs[name] = entry
+    C.save_favorites(favs)
+    shown = f" ({label})" if label else ""
+    print(f"{verb} {name!r}{shown} → {address} [{kind}]")
+
+
 def cmd_favorites(args):
     """Local named watchlist: artist wallets AND people you know.
 
     Entirely local: no network, no proposals, no signing. Names are
     lowercase [a-z0-9_-], 1-32 chars; addresses get the real
     base58-checksum validation. kind=artist wallets are scanned by
-    nft-new; kind=friend entries are just labels (never scanned).
-    Labels are plain characters only — no emoji or stylized unicode —
-    and are your own local notes, never identity proof."""
+    nft-new; kind=friend entries are just labels (never scanned);
+    kind=watch wallets are swept by `watch check` and
+    `incoming --all-watched`. Labels are plain characters only — no emoji
+    or stylized unicode — and are your own local notes, never identity
+    proof.
+    """
     try:
         favs = C.load_favorites()
     except C.FavoritesError as e:
         sys.exit(str(e))
     cmd = args.fav_cmd
     if cmd == "add":
-        problem = C.validate_favorite_name(args.name)
-        if problem:
-            sys.exit(problem)
-        if args.name in favs:
-            sys.exit(f"favorite {args.name!r} already exists "
-                     f"({favs[args.name].get('address')}) — "
-                     "remove it first to re-add")
-        if not C.is_valid_classic_address(args.address):
-            sys.exit("address is not a valid classic address "
-                     "(base58 checksum failed)")
-        kind = getattr(args, "kind", None) or "artist"
-        if kind not in ("artist", "friend"):
-            sys.exit("--kind must be artist or friend")
-        entry = {"address": args.address,
-                 "added_at": int(time.time()),
-                 "last_checked_ledger": None,
-                 "kind": kind}
-        if args.note:
-            entry["note"] = args.note
-        label = getattr(args, "label", None)
-        if label:
-            lproblem = C.validate_favorite_label(label)
-            if lproblem:
-                sys.exit(lproblem)
-            entry["label"] = label
-        favs[args.name] = entry
-        C.save_favorites(favs)
-        shown = f" ({label})" if label else ""
-        print(f"favorite {args.name!r}{shown} → {args.address} "
-              f"[{kind}]")
+        _add_favorite_entry(args.name, args.address,
+                            getattr(args, "kind", None) or "artist",
+                            getattr(args, "note", None),
+                            getattr(args, "label", None))
     elif cmd == "remove":
         if args.name not in favs:
             sys.exit(f"no favorite named {args.name!r}")
@@ -1427,6 +1444,133 @@ def cmd_favorites(args):
                   f"added {added}{note}")
     else:  # pragma: no cover — argparse restricts choices
         sys.exit(f"unknown favorites command {cmd!r}")
+
+
+# ---------- read-only wallet watchlist (incoming-NFT-offer reminders) ----------
+
+def _watched_wallets():
+    """{name: entry} for favorites with kind='watch'. Exits on corrupt store."""
+    try:
+        favs = C.load_favorites()
+    except C.FavoritesError as e:
+        sys.exit(str(e))
+    return {n: f for n, f in favs.items() if f.get("kind") == "watch"}
+
+
+def _load_watch_seen():
+    """Watermark: {address: [offer indices]}. Missing/corrupt → {}."""
+    try:
+        data = json.loads(C.WATCH_SEEN_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_watch_seen(seen):
+    p = C.WATCH_SEEN_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(seen, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+
+
+def cmd_watch(args):
+    """Read-only wallet watchlist for incoming-NFT-offer reminders.
+
+    Wallets are stored as kind='watch' favorites — addresses only (the
+    classic-address checksum rejects seeds, so a seed can never land
+    here). `watch check` sweeps every watched wallet's OPEN NFT offers via
+    xrpl.to, diffs offer indices against a local watermark, and prints only
+    NEW offers. The first run per wallet seeds the baseline silently. The
+    7-day ledger receipt scan is deliberately NOT part of the sweep — open
+    offers are the live signal; history is one `incoming` away. Nothing
+    here proposes, signs, or submits.
+    """
+    cmd = args.watch_cmd
+    if cmd == "add":
+        _add_favorite_entry(args.name, args.address, "watch",
+                            getattr(args, "note", None),
+                            getattr(args, "label", None),
+                            verb="watched wallet")
+    elif cmd == "list":
+        watched = _watched_wallets()
+        if not watched:
+            print("no watched wallets — add one with: "
+                  "xrpl-trade watch add <name> <r-address>")
+            return
+        for name in sorted(watched):
+            f = watched[name]
+            added = time.strftime("%Y-%m-%d",
+                                  time.gmtime(f.get("added_at", 0)))
+            label = f"  [{f['label']}]" if f.get("label") else ""
+            note = f"  ({C.safe_terminal_text(f['note'], 120)})" \
+                if f.get("note") else ""
+            print(f"  {name}{label} → {f.get('address')}  "
+                  f"added {added}{note}")
+    elif cmd == "remove":
+        try:
+            favs = C.load_favorites()
+        except C.FavoritesError as e:
+            sys.exit(str(e))
+        if args.name not in favs or favs[args.name].get("kind") != "watch":
+            sys.exit(f"no watched wallet named {args.name!r} "
+                     "(use `favorites remove` for other kinds)")
+        del favs[args.name]
+        C.save_favorites(favs)
+        print(f"stopped watching {args.name!r}")
+    elif cmd == "check":
+        _cmd_watch_check()
+    else:  # pragma: no cover — argparse restricts choices
+        sys.exit(f"unknown watch command {cmd!r}")
+
+
+def _cmd_watch_check():
+    watched = _watched_wallets()
+    if not watched:
+        print("no watched wallets — add one with: "
+              "xrpl-trade watch add <name> <r-address>")
+        return
+    if xrpl_to is None:
+        print("watch check unavailable: xrpl_to module not loaded")
+        return
+    seen = _load_watch_seen()
+    lines = []
+    for name in sorted(watched):
+        addr = watched[name]["address"]
+        label = watched[name].get("label")
+        who = f"{label} ({name})" if label else name
+        rows, ok = xrpl_to.incoming_offers_report(addr, limit=50)
+        if not ok:
+            lines.append(f"  {who}: offers API unavailable — skipped, "
+                         "watermark untouched")
+            continue
+        current = {r["index"] for r in rows if r.get("index")}
+        if addr not in seen:
+            lines.append(f"  {who}: baseline set "
+                         f"({len(current)} existing offer(s) recorded — "
+                         "future runs alert on new ones)")
+        else:
+            prev = set(seen.get(addr) or ())
+            fresh = [r for r in rows if r.get("index") not in prev]
+            if fresh:
+                lines.append(f"  NEW offers for {who} [{addr}]:")
+                for r in fresh:
+                    flag = ""
+                    if r.get("fraud") or r.get("owner_is_scam"):
+                        flag = ("  [FLAGGED: "
+                                f"{r.get('fraud_type') or 'scam screen'}]")
+                    cp = r.get("counterparty") or "?"
+                    nid = str(r.get("nft_id") or "?")
+                    nid_s = f"{nid[:8]}…{nid[-4:]}" if len(nid) > 14 else nid
+                    lines.append(
+                        f"    {r['side']:3}  {r['amount_s']:>14}  "
+                        f"from {cp[:10]}…  nft {nid_s}{flag}")
+                lines.append("    full safety view: "
+                             f"xrpl-trade incoming --watch {name}")
+        seen[addr] = sorted(current)
+    _save_watch_seen(seen)
+    print("\n".join(lines))
 
 
 def cmd_collection(args, cfg, client):
@@ -2043,14 +2187,42 @@ def cmd_incoming(args, cfg, client):
     from the consumed offer. Counterparties render through favorite
     labels ('Jenna X (rABC…WXYZ)'). Nothing here proposes, signs, or
     submits — acting on an offer is the nft-buy ceremony, and offers can
-    be cancelled, so the ledger is authoritative before acting."""
-    account = args.account or cfg.get("address")
-    if not account:
-        sys.exit("no account: pass --account or set address in "
-                 "~/.xrpl/config.json")
+    be cancelled, so the ledger is authoritative before acting.
+
+    --watch NAME reads the address from a watched wallet
+    (`xrpl-trade watch add`); --all-watched sweeps every watched wallet.
+    """
+    watch_name = getattr(args, "watch", None)
+    all_watched = getattr(args, "all_watched", False)
+    if watch_name and all_watched:
+        sys.exit("use only one of --watch / --all-watched")
+    if all_watched:
+        watched = _watched_wallets()
+        if not watched:
+            sys.exit("no watched wallets — add one with: "
+                     "xrpl-trade watch add <name> <r-address>")
+        for name in sorted(watched):
+            _incoming_one(watched[name]["address"], args, cfg, client)
+        return
+    if watch_name:
+        watched = _watched_wallets()
+        if watch_name not in watched:
+            sys.exit(f"no watched wallet named {watch_name!r} — "
+                     "`xrpl-trade watch list` to see them")
+        account = watched[watch_name]["address"]
+    else:
+        account = args.account or cfg.get("address")
+        if not account:
+            sys.exit("no account: pass --account or set address in "
+                     "~/.xrpl/config.json")
     if not C.is_valid_classic_address(account):
         sys.exit("account is not a valid classic address "
                  "(base58 checksum failed)")
+    _incoming_one(account, args, cfg, client)
+
+
+def _incoming_one(account, args, cfg, client):
+    """Per-account body of `incoming`: offers + 7d ledger receipts."""
     try:
         favs = C.load_favorites()
     except C.FavoritesError:
@@ -3200,9 +3372,12 @@ def main():
     a.add_argument("name", help="short name, e.g. lara")
     a.add_argument("address", help="artist's classic r-address")
     a.add_argument("--note", default=None, help="optional note")
-    a.add_argument("--kind", default="artist", choices=("artist", "friend"),
+    a.add_argument("--kind", default="artist",
+                   choices=("artist", "friend", "watch"),
                    help="artist wallets are scanned by nft-new; "
-                        "friend is for people you know (default: artist)")
+                        "friend is for people you know; "
+                        "watch wallets are swept by `watch check` and "
+                        "`incoming --all-watched` (default: artist)")
     a.add_argument("--label", default=None,
                    help="display name, e.g. \"Jenna X\" — plain characters "
                         "only (letters, numbers, spaces, basic punctuation), "
@@ -3213,6 +3388,21 @@ def main():
     rn = fav.add_parser("rename", help="rename a favorite")
     rn.add_argument("old")
     rn.add_argument("new")
+    w = sub.add_parser("watch", help="read-only wallet watchlist for "
+                                     "incoming-NFT-offer reminders")
+    wc = w.add_subparsers(dest="watch_cmd", required=True)
+    wa = wc.add_parser("add", help="watch a wallet (read-only, address only)")
+    wa.add_argument("name", help="short name, e.g. studio-vault")
+    wa.add_argument("address", help="classic r-address to watch")
+    wa.add_argument("--note", default=None, help="optional note")
+    wa.add_argument("--label", default=None,
+                    help="display name — plain characters only, no emoji "
+                         "or stylized unicode")
+    wc.add_parser("list", help="show watched wallets")
+    wr = wc.add_parser("remove", help="stop watching a wallet")
+    wr.add_argument("name")
+    wc.add_parser("check", help="sweep watched wallets for NEW open NFT "
+                                "offers (offers only, read-only)")
     p = sub.add_parser("collection", help="local NFT collection registry: "
                                           "name -> issuer + NFTokenTaxon "
                                           "(local bookkeeping only — "
@@ -3296,6 +3486,10 @@ def main():
                                         "(read-only)")
     p.add_argument("--account", default=None,
                    help="classic address (default: configured main account)")
+    p.add_argument("--watch", default=None, metavar="NAME",
+                   help="watched wallet name (see `xrpl-trade watch list`)")
+    p.add_argument("--all-watched", action="store_true",
+                   help="sweep every watched wallet")
     p.add_argument("--limit", type=int, default=10,
                    help="offer rows (default 10, max 50)")
     p.add_argument("--hide-flagged", dest="hide_flagged",
@@ -3397,6 +3591,11 @@ def main():
     if args.cmd == "favorites":
         # Local-only: no config, no network client needed.
         cmd_favorites(args)
+        return
+    if args.cmd == "watch":
+        # Local-only store; `check` uses the xrpl.to API directly —
+        # no config, no XRPL client, no signing.
+        cmd_watch(args)
         return
     if args.cmd == "profile" and args.prof_cmd != "init":
         # Local-only: no config, no network client needed.
