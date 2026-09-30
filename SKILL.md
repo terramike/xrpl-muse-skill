@@ -104,6 +104,35 @@ Never paste a seed into chat to enable this. The seed is entered at a
 hidden terminal prompt, is never printed, logged, or echoed, and the audit
 log records only `seed_source=autopilot` — never the seed.
 
+### Autonomous mode (P0: dry-run only) — separate feature, plan-level approval
+
+Autonomous mode does **not** change anything above. It is a separate
+feature with its own wallet, config, audit log, and approval model:
+
+- **Standalone bot wallet.** `xrpl-trade autonomous setup` generates a
+  fresh wallet (one-time backup ceremony, seed in
+  `~/.xrpl/autonomous-seed.json` 0600) and writes
+  `~/.xrpl/autonomous.json` (0600). The runner is code-locked to that one
+  address — it can never address the main account.
+- **Approval is per-plan, not per-trade.** Setup prints the exact plan
+  (pair, strategy params, caps, schedule) and its sha256 hash;
+  `autonomous approve --plan-hash <hash>` activates it. Any plan change
+  needs a fresh approval. `pause` / `resume` / `stop` always work; `stop`
+  requires re-approval to restart.
+- **Code-level whitelist** (`xrpl_autonomous.validate_autonomous_tx`,
+  unit-tested in `tests/test_autonomous.py`): OfferCreate/OfferCancel only,
+  Account must equal the bot wallet, XRP/RLUSD with the approved issuer
+  only, per-trade cap, fee cap, no memos. Violations halt the runner.
+- **P0 is dry-run only.** `autonomous tick` reads the validated-ledger
+  mid-book + a Bitstamp sanity bound, evaluates the v1 grid (resting buy
+  X% below / sell X% above mid, re-arm on fill), builds the exact txs,
+  runs them through the whitelist, logs them — and never signs or
+  submits. Live mode is refused until P1.
+- **Bankroll cap 100 XRP** — the tick halts if the wallet ever exceeds it.
+- **Trusted inputs only**: validated ledger + Bitstamp. Never memos/chat.
+- Non-dev setup guide: `references/autonomous-setup.md`.
+
+
 ### The envelope (what the hash binds)
 
 A proposal is `format: xrpl-proposal/4` and the approval hash covers:
@@ -372,7 +401,13 @@ xrpl-trade nft-send --token-id <64-hex> --to <favorite-name|r...> \
   mint the same artwork, so check that the issuer is the artist you
   expect — the seller is only the current owner. The skill reports
   on-ledger facts; it never calls a token "authentic". Each NFT is one-of-one: there is no fungible order-book
-  price check, and price sanity is the human's call.
+  price check, and price sanity is the human's call — but both `nft-buy`
+  and `nft-bid` now append an advisory xrpl.to safety section (issuer
+  scam screen, collection floor, asking × floor multiple, approx last
+  sale; `--no-safety` skips).
+- `top-collections [--sort vol24h|trendingScore] [--limit 10]` — ranked
+  NFT collections with floor, 24h volume, owners, and 24h sales
+  (read-only, "Data by xrpl.to" credit).
 - Accepting a sell offer spends XRP immediately: the offer's price plus
   fee runs through the per-transaction and rolling-24h spend caps.
 - Bids need `nft.allow_buy_offers: true` and are capped by
@@ -393,23 +428,49 @@ Entirely read-only — no proposals, no signing, no approvals.
 
 ```bash
 xrpl-trade favorites add lara r… --note "Neon Drift series"
+xrpl-trade favorites add jenna r… --kind friend --label "Jenna X"
 xrpl-trade favorites list
 xrpl-trade favorites rename lara larva
 xrpl-trade favorites remove larva
 
 xrpl-trade nft-new              # new mints since the last check
 xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the watermark
+xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
 ```
 
 - Names are lowercase `[a-z0-9_-]`, 1–32 chars; addresses get the real
   base58-checksum validation. Stored in `~/.xrpl/favorites.json`
   (owner-only `0600`, covered by the signer's protected-file check).
-- `nft-new` walks each favorite's `account_tx` for `NFTokenMint`s since
-  its per-favorite watermark (first run: last 7 days), then advances the
-  watermark to the validated ledger. `--days` is a pure window scan.
+- Favorites have a `kind`: `artist` (default) or `friend`, plus an
+  optional `label` — the plain display name shown next to the address
+  ("Jenna X (rABC…WXYZ)"). Labels accept plain letters, numbers,
+  spaces, and basic punctuation only; emoji and stylized Unicode are
+  rejected. Labels are local notes — not proof of who owns a wallet.
+- `nft-new` walks each **artist** favorite's `account_tx` for
+  `NFTokenMint`s since its per-favorite watermark (first run: last 7
+  days), then advances the watermark to the validated ledger. Friend
+  favorites are never scanned — they're just labels. `--days` is a
+  pure window scan.
 - Each new piece shows the token ID, mint time, taxon, decoded URI, the
-  cheapest current listing price if any ("not listed" otherwise), and an
-  `https://xrp.cafe/nft/<NFTokenID>` link.
+  cheapest current listing price if any ("not listed" otherwise), an
+  `https://xrp.cafe/nft/<NFTokenID>` link, and a one-line xrpl.to
+  safety note (issuer scam-blocklist screen + collection/floor,
+  advisory, fail-open; max 20 enriched per run, later rows say so;
+  `--no-safety` skips). "Data by xrpl.to" credit on every run.
+- `xrpl-trade incoming [--account r…] [--limit 10] [--collection text]
+  [--min-xrp N] [--max-xrp N] [--from name-or-address] [--include-flagged]
+  [--no-safety]` — what's coming IN, read-only: (1) open NFT offers —
+  bids on your NFTs plus sell/gift offers directed at you, with a
+  per-row issuer blocklist screen and floor-vs-bid context; (2) recent
+  ledger receipts/sends from `account_tx` (direction derived from the
+  consumed offer, the validated ledger as authority). Flagged offers
+  are hidden by default (the count is shown). Counterparties render
+  through favorite labels where you have them — an unlabeled wallet
+  gets a 🏷️ "label this wallet" follow-up button. Accepting an offer
+  stays a separate `nft-buy` propose → approve → sign ceremony; offers
+  can be cancelled, so the ledger is authoritative before you act.
+  Zero-XRP offers from wallets you don't recognize print a loud
+  caution: only accept those from people you know.
 - Favorite names also work wherever a read command takes an address
   (`nft-inventory lara`). Among writes, only `nft-send --to` accepts a
   name — it resolves against the local favorites file (case-insensitive)
@@ -636,6 +697,28 @@ not by typing commands.
 - Coffee & Crypto
 - xBoost
 
+**XRPL Actions submenu** (tappable; also as `xrpl_to.py` CLI):
+- 📈 Markets → Market Movers (`movers --view gainers|losers|volume|trending`),
+  Token Lookup (`token-lookup --issuer … --currency …`), Explain a
+  Transaction (`tx-explain --hash …`), 🐋 Whale Watch
+  (`whale-watch --issuer r… --currency … [--limit 10]`)
+
+**NFT submenu** adds:
+- Top Collections (`top-collections [--sort vol24h|trendingScore]`)
+- 📥 Incoming (`xrpl-trade incoming` — bids on your NFTs, sell/gift
+  offers to you, recent ledger receipts; per-row issuer screens;
+  flagged offers hidden by default; friend labels on counterparties)
+
+Market data is read-only and carries a "Data by xrpl.to" credit on every
+surface. Movers print volume + market cap on each row — a +1300%
+micro-cap reads as what it is; discovery, not advice, no trade buttons
+on mover rows. `tx-explain` shows ledger-derived facts and only prints a
+plain-English summary when xrpl.to actually returns one. Whale Watch is
+flow discovery, not advice — 24h volumes are wash-tradable, and rows
+show trade counts + P&L so thin activity reads as thin. Incoming offers
+can be cancelled: the validated ledger is authoritative before acting,
+and accepting an offer is always the separate `nft-buy` ceremony.
+
 Each button opens its own focused submenu of tappable exact-command
 buttons. After showing command results, attach a fresh set of the most
 useful follow-up commands as buttons.
@@ -651,8 +734,50 @@ Reading (no seed, no proposals):
 - `quote --pair ARMY/XRP` — order book top-of-book, any pair
 - `offers [address]` — open offers
 - `pairs` — approved pairs
+- `movers [--view gainers|losers|volume|trending] [--limit 10]` — xrpl.to
+  token rankings (read-only). Rows show XRP price, 24h %, 24h volume,
+  and market cap. "Data by xrpl.to" credit on every row set.
+- `token-lookup --issuer r… --currency CODE` — one-screen token brief:
+  XRP + USD price, market cap, holders, trustlines, 24h/7d change,
+  24h volume, verified badge, plus the scam-check + risk score.
+  Read-only; carries the "Data by xrpl.to" credit.
+- `tx-explain --hash <64-hex>` — ledger-derived facts for a transaction
+  (type, account, status, fee, date). Prints xrpl.to's plain-English
+  summary only when the API actually returns one — never invented.
 - `inspect-token --currency FUZZY --issuer r…` — issuer risk: domain,
   transfer fee, global-freeze / no-freeze flags
+- `token-safety --currency FUZZY --issuer r…` — xrpl.to scam blocklist
+  check + 1–10 token risk score for an IOU (read-only, no key needed).
+  Advisory only: a hit is LOUD but never blocks; the human decides.
+  Buy/sell proposals run this automatically on every IOU leg
+  (`--no-safety` skips). Surfaces carry a "Data by xrpl.to" credit.
+- `xrpl_to.py nft-safety --nft-id <64-hex> [--ask-xrp 40]` — NFT
+  buy-side safety: issuer scam-blocklist screen, tracked collection +
+  floor (24h-ago floor), asking-price × floor multiple, cheapest live
+  ask, and approx last sale from ledger history. `nft-buy` and `nft-bid`
+  proposals run this automatically (`--no-safety` skips); every line is
+  advisory — floors and last-sales can be wash-traded, and the on-ledger
+  seller/issuer/URI/taxon verification stays the authority. Fail-open:
+  an unreachable API prints UNAVAILABLE (unknown, not clean).
+- `xrpl_to.py whale-watch --issuer r… --currency CODE [--limit 10]` —
+  token trader discovery (read-only): top wallets ranked by 24h volume,
+  with 24h trade counts and 24h P&L. Flow discovery, not advice —
+  volumes are wash-tradable; carries the "Data by xrpl.to" credit.
+- `xrpl_to.py incoming-offers --account r… [--limit 10]
+  [--collection text] [--min-xrp N] [--max-xrp N] [--from name-or-address]
+  [--include-flagged] [--no-safety]` — open NFT offers for an account:
+  bids on its NFTs plus sell/gift offers directed at it, newest first,
+  with floor context and a per-row issuer blocklist screen. Flagged
+  offers hidden by default (count shown). `xrpl-trade incoming` wraps
+  this with recent ledger receipts and your favorite labels.
+  Read-only; "Data by xrpl.to" credit.
+- `xrpl_to.py keys create --yes` — mint a free xrpl.to API key via a
+  wallet-signed login message (nothing submitted on-chain; key stored
+  0600 at `~/.xrpl/xrplto.json`). Raises rate limits; most endpoints
+  work without a key. Creating a key accepts xrpl.to's API terms.
+  `keys list` shows keys on the wallet; `keys revoke --id … --yes`
+  revokes one (both wallet-signed; free tier allows one active key,
+  so revoke-then-create rotates).
 - `plan-trade --pair ARMY/XRP --side buy --amount 1000 --price 0.005` —
   estimated fill, price impact vs mid, max spend (read-only)
 - `reconcile --hash …` — validated outcome of a submitted transaction

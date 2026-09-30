@@ -358,6 +358,10 @@ with tempfile.TemporaryDirectory() as td:
           == f"https://xrp.cafe/nft/{NID1}")
 
     # --- 13. nft-new end to end (stubbed ledger) ---
+    # stub xrpl.to enrichment: unit tests must not hit the network
+    T.nft_safety_oneliner = (lambda nid, ask_xrp=None:
+                             "safety: stubbed enrichment")
+
     C.save_favorites({"lara": {"address": GOOD_ADDR, "added_at": 1,
                                "last_checked_ledger": None}})
 
@@ -394,6 +398,46 @@ with tempfile.TemporaryDirectory() as td:
           NID1 in out.getvalue())
     check("--days does not move the watermark",
           C.load_favorites()["lara"]["last_checked_ledger"] == 999999)
+
+    # --- 13b. Phase 3: nft-new skips friend-kind, enriches, caps at 20 ---
+    check("nft-new runs the safety enrichment (stubbed)",
+          "safety: stubbed enrichment" in text)
+    many_nids = ["%064x" % i for i in range(21)]
+
+    def many_handler(d):
+        return FakeResp({"transactions": [
+            mint_entry(2000000 + i, now_ripple - 60, URI_HEX, 7,
+                       created_meta(nid, URI_HEX))
+            for i, nid in enumerate(many_nids)], "marker": None})
+
+    fc_many = FakeClient({
+        "ledger": lambda d: FakeResp({"ledger_index": 3000000}),
+        "account_tx": many_handler,
+        "nft_sell_offers": lambda d: FakeResp({"offers": []})})
+    C.save_favorites({"many": {"address": GOOD_ADDR, "added_at": 1,
+                               "last_checked_ledger": None}})
+    out = io.StringIO()
+    with redirect_stdout(out):
+        T.cmd_nft_new(A(days=None), {}, fc_many)
+    text = out.getvalue()
+    check("nft-new enriches at most 20 rows per run",
+          text.count("safety: stubbed enrichment") == 20)
+    check("nft-new notes the cap for later rows",
+          "over 20-item enrich cap" in text)
+    check("nft-new lists all 21 mints regardless",
+          sum(1 for nid in many_nids if nid in text) == 21)
+
+    C.save_favorites({"jenna": {"address": GOOD_ADDR, "added_at": 1,
+                                "last_checked_ledger": None,
+                                "kind": "friend", "label": "Jenna X"}})
+    out = io.StringIO()
+    with redirect_stdout(out):
+        T.cmd_nft_new(A(days=None), {}, fc_many)
+    check("nft-new skips kind=friend favorites",
+          "friends are labels only" in out.getvalue()
+          and "new (" not in out.getvalue())
+    C.save_favorites({"lara": {"address": GOOD_ADDR, "added_at": 1,
+                               "last_checked_ledger": 999999}})
     out = io.StringIO()
     with redirect_stdout(out):
         T.cmd_nft_new(A(days=None), {}, fc)
@@ -444,6 +488,98 @@ with tempfile.TemporaryDirectory() as td:
           and mints[0]["token_ids"] == [NID1]
           and mints[0]["uri_hex"] == URI_HEX
           and mints[0]["taxon"] == 7)
+
+# Phase 3: friend labels -------------------------------------------------------
+check("label accepts plain display names",
+      C.validate_favorite_label("Jenna X") is None)
+check("label accepts punctuation",
+      C.validate_favorite_label("O'Brien-2 (VIP), Jr.") is None)
+for bad in ("Jenna \U0001d54f", "\U0001f600", "", " x", "a" * 49,
+            "   ", "Jenna\tX", 123, None):
+    check("label rejects %r" % (bad,), C.validate_favorite_label(bad) is not None)
+
+from xrpl.wallet import Wallet as _W
+_FRIEND = _W.create().classic_address
+FAVS = {"jenna": {"address": _FRIEND, "label": "Jenna X", "kind": "friend"},
+        "lara": {"address": GOOD_ADDR, "kind": "artist"}}
+check("display_address prefers the label",
+      C.display_address(_FRIEND, FAVS) == "Jenna X (%s\u2026%s)" % (
+          _FRIEND[:4], _FRIEND[-4:]))
+check("display_address falls back to the favorite name",
+      C.display_address(GOOD_ADDR, FAVS) == "lara (%s\u2026%s)" % (
+          GOOD_ADDR[:4], GOOD_ADDR[-4:]))
+check("display_address truncates strangers",
+      C.display_address("rSTRANGER00000000000000000005", FAVS)
+      == "rSTR\u2026" + "0005")
+check("display_address never raises on junk",
+      C.display_address(None, FAVS) == "?"
+      and C.display_address(None, None) == "?")
+
+# Phase 3: ledger receipt scan --------------------------------------------------
+_RIPPLE_NOW = int(time.time()) - 946684800
+
+
+def _accept_entry(acct, sell, owner, nft_id, ripple_date):
+    fld = "NFTokenSellOffer" if sell else "NFTokenBuyOffer"
+    return {"ledger_index": 99,
+            "tx": {"TransactionType": "NFTokenAcceptOffer", "Account": acct,
+                   fld: "OFFIDX", "date": ripple_date},
+            "meta": {"AffectedNodes": [
+                {"DeletedNode": {"LedgerEntryType": "NFTokenOffer",
+                                 "FinalFields": {"Owner": owner,
+                                                 "NFTokenID": nft_id}}}]},
+            "validated": True}
+
+
+def _mint_entry(acct, issuer, dest, ripple_date, nid):
+    tx = {"TransactionType": "NFTokenMint", "Account": acct,
+          "NFTokenTaxon": 0, "date": ripple_date}
+    if issuer:
+        tx["Issuer"] = issuer
+    if dest:
+        tx["Destination"] = dest
+    return {"ledger_index": 98, "tx": tx,
+            "meta": created_meta(nid, "5555"), "validated": True}
+
+
+_NOW = _RIPPLE_NOW
+receipts_handler = lambda d: FakeResp({"transactions": [
+    _accept_entry(GOOD_ADDR, True, _FRIEND, NID1, _NOW - 100),   # I buy
+    _accept_entry(GOOD_ADDR, False, _FRIEND, NID1, _NOW - 200),  # I sell
+    _accept_entry(_FRIEND, False, GOOD_ADDR, NID1, _NOW - 300),  # fills my buy
+    _accept_entry(_FRIEND, True, GOOD_ADDR, NID1, _NOW - 400),   # takes my ask
+    _mint_entry(GOOD_ADDR, None, None, _NOW - 500, NID1),       # my mint
+    _mint_entry(_FRIEND, _FRIEND, GOOD_ADDR, _NOW - 600, NID1),  # gifted mint
+]})
+fc = FakeClient({"account_tx": receipts_handler})
+recs, prob = C.scan_nft_receipts(fc, GOOD_ADDR)
+check("receipt scan: no problem", prob is None and len(recs) == 6)
+by = [(r["direction"], r["counterparty"], r["nft_id"]) for r in recs]
+check("receipt scan: I accept sell -> received (token id from offer)",
+      by[0] == ("received", _FRIEND, NID1))
+check("receipt scan: I accept buy -> sent",
+      by[1] == ("sent", _FRIEND, NID1))
+check("receipt scan: stranger fills my buy offer -> received",
+      by[2] == ("received", _FRIEND, NID1))
+check("receipt scan: stranger takes my sell offer -> sent",
+      by[3] == ("sent", _FRIEND, NID1))
+check("receipt scan: my own mint",
+      by[4][0] == "minted" and by[4][2] == NID1)
+check("receipt scan: mint by friend to me -> received",
+      by[5] == ("received", _FRIEND, NID1))
+
+old_handler = lambda d: FakeResp({"transactions": [
+    _accept_entry(GOOD_ADDR, True, _FRIEND, NID1, _NOW - 8 * 86400)]})
+fc = FakeClient({"account_tx": old_handler})
+recs, prob = C.scan_nft_receipts(fc, GOOD_ADDR)
+check("receipt scan: stops at the 7d cutoff",
+      prob is None and recs == [])
+
+boom = lambda d: (_ for _ in ()).throw(RuntimeError("nope"))
+fc = FakeClient({"account_tx": boom})
+recs, prob = C.scan_nft_receipts(fc, GOOD_ADDR)
+check("receipt scan: RPC failure is a soft problem",
+      recs == [] and prob and "account_tx failed" in prob)
 
 n_fail = sum(1 for _, ok in PASS if not ok)
 print(f"\n{len(PASS) - n_fail}/{len(PASS)} favorites checks passed")

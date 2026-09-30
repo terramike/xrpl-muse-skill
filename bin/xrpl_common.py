@@ -1381,6 +1381,50 @@ def validate_favorite_name(name):
     return None
 
 
+FAVORITE_LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _\-.'(),&]{0,47}")
+
+
+def validate_favorite_label(label):
+    """Display labels stay plain: ASCII letters, digits, spaces and basic
+    punctuation only (1-48 chars, must start alphanumeric). No emoji or
+    stylized unicode — 'Jenna X', not 'Jenna 𝕏'. Returns a problem
+    string, or None when the label is usable."""
+    if not isinstance(label, str):
+        return "label must be text"
+    if not label or len(label) > 48 or not FAVORITE_LABEL_RE.fullmatch(label):
+        return ("label must be 1-48 plain characters (letters, numbers, "
+                "spaces, -_.'(),&) starting with a letter or digit — "
+                "no emoji or stylized unicode")
+    try:
+        label.encode("ascii")
+    except (UnicodeEncodeError, ValueError):
+        return ("label must be plain ASCII — no emoji or stylized unicode")
+    if not label.strip():
+        return "label cannot be blank"
+    return None
+
+
+def display_address(addr, favs=None):
+    """Human rendering of a classic address.
+
+    Favorite with a label -> 'Jenna X (rABC…WXYZ)'; favorite without a
+    label -> 'name (rABC…WXYZ)'; anything else -> 'rABC…WXYZ'.
+    Labels are the user's own local notes, never identity proof.
+    Never raises."""
+    try:
+        if not addr or not isinstance(addr, str):
+            return "?"
+        short = f"{addr[:4]}…{addr[-4:]}" if len(addr) > 12 else addr
+        if favs:
+            for name, fav in favs.items():
+                if isinstance(fav, dict) and fav.get("address") == addr:
+                    shown = fav.get("label") or name
+                    return f"{shown} ({short})"
+        return short
+    except Exception:
+        return "?"
+
+
 def resolve_fav_or_addr(token, favs):
     """Resolve a favorite name or classic address for READ commands.
     Returns (address, problem). Favorites take precedence; anything
@@ -2503,6 +2547,118 @@ def scan_artist_mints(client, address, stop_ledger=None, cutoff_unix=None,
         if not marker or pages >= max_pages:
             break
     return mints, pages, None
+
+
+def _consumed_offer_info(meta):
+    """(owner, nft_id) of a consumed NFTokenOffer from its DeletedNode.
+
+    Checks PreviousFields then FinalFields (servers differ on which is
+    present). Returns (None, None) when not found. Never raises."""
+    try:
+        for node in (meta or {}).get("AffectedNodes", []) or []:
+            if not isinstance(node, dict):
+                continue
+            nd = node.get("DeletedNode")
+            if not isinstance(nd, dict):
+                continue
+            if nd.get("LedgerEntryType") != "NFTokenOffer":
+                continue
+            owner, nft_id = None, None
+            for sect in ("PreviousFields", "FinalFields"):
+                f = nd.get(sect) or {}
+                owner = owner or f.get("Owner")
+                nft_id = nft_id or f.get("NFTokenID")
+            if owner or nft_id:
+                return owner, nft_id
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def scan_nft_receipts(client, address, max_tx=200, cutoff_days=7,
+                      page_limit=100):
+    """Newest-first account_tx walk for NFTs the account received or sent.
+
+    Covers NFTokenAcceptOffer (direction derived from the consumed offer:
+    who accepted, whose offer it was) and NFTokenMint (issuer vs
+    destination). Stops after max_tx examined or past cutoff_days.
+    Returns (receipts, problem). Each receipt: {ledger_index, date_unix,
+    kind, nft_id, counterparty, direction, tx_hash} where direction is
+    'received', 'sent', 'minted' (own mint) or 'unknown'. Read-only,
+    best-effort — never raises."""
+    from xrpl.models.requests import AccountTx
+    cutoff = time.time() - cutoff_days * 86400 if cutoff_days else None
+    receipts, marker, examined = [], None, 0
+    while True:
+        try:
+            r = client.request(AccountTx(account=address, limit=page_limit,
+                                         marker=marker))
+        except Exception as e:  # noqa: BLE001
+            return receipts, f"account_tx failed: {e}"
+        if not r.is_successful():
+            return receipts, \
+                f"account_tx failed: {(r.result or {}).get('error', r.result)}"
+        for entry in (r.result or {}).get("transactions", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            examined += 1
+            tx = entry.get("tx") or entry.get("tx_json") or {}
+            tt = tx.get("TransactionType")
+            if tt not in ("NFTokenAcceptOffer", "NFTokenMint"):
+                if examined >= max_tx:
+                    break
+                continue
+            ripple_d = _entry_ripple_date(entry, tx)
+            unix = ripple_d + RIPPLE_EPOCH \
+                if isinstance(ripple_d, (int, float)) else None
+            if cutoff is not None and unix is not None and unix < cutoff:
+                return receipts, None
+            meta = entry.get("meta") or entry.get("metaData") or {}
+            h = tx.get("hash") or entry.get("hash")
+            if tt == "NFTokenMint":
+                issuer = tx.get("Issuer") or tx.get("Account")
+                dest = tx.get("Destination")
+                tids = extract_mint_token_ids(meta)
+                if issuer == address:
+                    direction, cpty = "minted", dest
+                else:
+                    direction, cpty = "received", issuer
+                receipts.append({
+                    "ledger_index": entry.get("ledger_index"),
+                    "date_unix": unix, "kind": "mint",
+                    "nft_id": tids[0] if tids else None,
+                    "counterparty": cpty, "direction": direction,
+                    "tx_hash": h,
+                })
+            else:
+                sell_id = tx.get("NFTokenSellOffer")
+                is_sell = bool(sell_id)
+                accepter = tx.get("Account")
+                offer_owner, offer_nft = _consumed_offer_info(meta)
+                if accepter == address:
+                    cpty = offer_owner
+                    direction = "received" if is_sell else "sent"
+                elif offer_owner == address:
+                    cpty = accepter
+                    direction = "received" if not is_sell else "sent"
+                else:
+                    cpty, direction = accepter, "unknown"
+                receipts.append({
+                    "ledger_index": entry.get("ledger_index"),
+                    "date_unix": unix, "kind": "accept",
+                    "nft_id": tx.get("NFTokenID") or offer_nft,
+                    "counterparty": cpty, "direction": direction,
+                    "tx_hash": h,
+                })
+            if examined >= max_tx:
+                break
+        else:
+            marker = (r.result or {}).get("marker")
+            if not marker:
+                break
+            continue
+        break
+    return receipts, None
 
 
 def nft_sell_price(client, nft_id):

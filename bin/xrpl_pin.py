@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """xrpl_pin: Pinata IPFS pinning for the XRPL NFT skill.
 
-Bring-your-own-key design: the ONLY credential is the PINATA_JWT
-environment variable. This module never stores keys, never logs them,
-and the repository ships no credentials — every skill operator pins
-with their OWN Pinata account, so each operator hosts their own media.
+Bring-your-own-key design: the pinning credential is the PINATA_JWT
+environment variable, or — when that is unset — the operator's own
+"custom.pinata" Secure Vault connector, attached to the request as an
+authd surrogate (the same pattern as the github-pat skill's gh-api CLI).
+This module never stores keys, never logs them, and the repository ships
+no credentials — every skill operator pins with their OWN Pinata account,
+so each operator hosts their own media.
 See references/nft-pinata.md for setup.
 
 P1-4 hardening:
@@ -164,14 +167,26 @@ def read_validated_source(path, media_dir=None):
         os.close(fd)
 
 
-def _jwt():
+def _apply_auth(req):
+    """Attach Pinata auth to a request. Prefers PINATA_JWT from the
+    environment; falls back to the operator's "custom.pinata" Secure Vault
+    connector via the authd surrogate (credential is never printed, logged,
+    or persisted). Exits with setup help when neither exists."""
     jwt = os.environ.get("PINATA_JWT")
-    if not jwt:
+    if jwt:
+        req.add_header("Authorization", f"Bearer {jwt}")
+        return req
+    try:
+        sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+        from dynamic_credentials import add_surrogate_to_request
+        add_surrogate_to_request(
+            req, "custom.pinata", allowed_hosts=("api.pinata.cloud",))
+        return req
+    except Exception:
         sys.exit(
-            "PINATA_JWT is not set. Create a (free) Pinata account, "
-            "mint an API key with pinning scope, and export PINATA_JWT — "
-            "see references/nft-pinata.md. The key is never stored or logged.")
-    return jwt
+            "No Pinata credential: set PINATA_JWT, or save your Pinata JWT "
+            "to the Secure Vault as a custom.pinata connector — see "
+            "references/nft-pinata.md. The key is never stored or logged.")
 
 
 def _post(url, body: bytes, content_type: str, filename: str = None) -> dict:
@@ -186,10 +201,9 @@ def _post(url, body: bytes, content_type: str, filename: str = None) -> dict:
         tail = f"\r\n--{boundary}--\r\n".encode()
         body = head + body + tail
         content_type = f"multipart/form-data; boundary={boundary}"
-    req = urllib.request.Request(
-        url, data=body,
-        headers={"Authorization": f"Bearer {_jwt()}",
-                 "Content-Type": content_type})
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": content_type})
+    _apply_auth(req)
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
