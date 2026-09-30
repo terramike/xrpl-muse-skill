@@ -553,6 +553,33 @@ refuses seed-shaped input with an explicit warning and never stores it.
 - Keep the public skill generic: memberships and interests are open
   tag lists, never hardcoded to one DAO or one user.
 
+## Onboarding wizard: the install after the install
+
+After the profile questionnaire, offer the guided setup walkthrough —
+one question at a time, buttons-first, custom per person. The full
+script is `references/onboarding-wizard.md`; the shape:
+
+1. **Phase 0 — the free tier** (statements, not questions): install,
+   `xrpl-trade setup`, `xrpl-sign init-policy`, `profile init`, one
+   first read. Zero keys; say so out loud.
+2. **Phase 1 — the important question:** "Want to do anything on-chain?"
+   Yes → the `xrpl-trade live` typed ceremony, signing profiles,
+   exact-diff policy review, testnet trial trade before mainnet is ever
+   discussed. No → read-only is a complete install.
+3. **Phase 2 — the optionals, one yes/no each:** NFT minting (Pinata
+   JWT walkthrough), xrpl.to key (nice-to-have — most endpoints work
+   keyless), fiat on-ramp (changelly_buy handoff), then an advanced gate
+   hiding autopilot, the autonomous bot, and giveaway setup.
+4. **Phase 3 — your install:** a personalized checklist with only what
+   they said yes to and the exact commands; saved resumable state.
+
+State lives in `~/.xrpl/onboarding.json` (`0600`, `schema_version: 1`,
+step states `pending`/`done`/`skipped`). While any step is pending, the
+main menu shows "✨ Finish your setup (n/m)". Skipped steps never
+re-prompt — skipped is skipped, no nagging. The seed rule is absolute
+inside the wizard: credentials at hidden prompts or per-operation
+injection only, never in chat.
+
 ## Friday community giveaway
 
 Every Friday at 7:37 AM, one random entrant wins a gift — funded by the
