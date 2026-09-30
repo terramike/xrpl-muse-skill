@@ -153,14 +153,45 @@ cross-check line. Illiquid pairs get a volume-staleness label.
   (aggregator, not ledger authority)".
 - Rate: occasional lookups only.
 
+## Tier 3 (built 2026-09-30): XLS-47 price oracles
+
+### 8. Band Protocol + DIA — on-ledger price feeds
+
+- Verified live 2026-09-30. Both publishers write `Oracle` ledger
+  objects (XLS-47 `SetOracle`); reads are keyless public RPC.
+- Publisher identities (from their published docs — label every line):
+  - Band Protocol: `rsNvoAZ9MquZSRhu4cEY9wTv1VqHXpVPPt`, doc 1
+    (bandprotocol.com XRPL mainnet launch post). Feeds: XRP, BTC,
+    ETH, RLUSD, USDC, USDT, WBTC.
+  - DIA: `rP24Lp7bcUHvEW7T7c8xkxtQKKd9fZyra7`, doc 42, provider hex
+    `64696164617461` ("diadata") (XRPLF dev portal, 2025-05-16).
+    Feeds: XRP, BTC, ETH, EURO, RLUSD, USDC, USDT. Config: VWAPIR,
+    1% deviation, 120s refresh, 24h heartbeat.
+- `LastUpdateTime` is **unix** seconds (not ripple epoch) — verified
+  against wall clock.
+- `get_aggregate_price` currency matching: pass the **ledger form** —
+  plain code for XRP/USD, 160-bit hex for RLUSD etc. ("RLUSD" as
+  base_asset errors; hex succeeds).
+- Live check 2026-09-30: XRP/USD aggregate median $1.4936 (Band
+  $1.496171, DIA $1.491030); RLUSD/USD median $0.999995 — doubles as
+  an on-ledger peg monitor.
+- Wiring: `xrpl-trade oracle [BASE] [QUOTE]` (defaults XRP USD):
+  per-publisher price + update age, 26h staleness warning, aggregate
+  median/mean/trimmed-mean (trim 20). Fail-open throughout.
+  Boundary: publisher-attested prices, not ledger truth.
+- Use: primary price source for the skill's price reads; Bitstamp is
+  the backup (price-alert task still Bitstamp-primary as of
+  2026-09-30 — flip needs Mike's go on the cron config).
+
 ## Tier 2 backlog (not built)
 
-- Bithomp (key wall), Sologenic (API docs 404 as of 2026-09-30),
-  Evernode (compute, not a read API), XLS-65/66 lending (not live),
-  on-chain oracles (need verified publisher IDs).
+- Bithomp (key wall), Sologenic (API docs 404 as of 2026-09-30 —
+  Mike said skip), Evernode (tabled), XLS-65/66 lending (not live
+  — oracles are the price rail it will use when it ships).
 
 ## Wizard tie-in
 
-Phase 0 power-reads try-list gains `xrpl-trade validators` and
+Phase 0 power-reads try-list gains `xrpl-trade validators`,
 `xrpl-trade amendments` ("watch the network upgrade itself — still
-zero keys").
+zero keys"), and `xrpl-trade oracle` ("prices straight from the
+ledger, no exchange API").

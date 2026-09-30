@@ -320,5 +320,100 @@ class TestDexScreener(unittest.TestCase):
                 eco.format_dexscreener_lines("RLUSD", "rX"), [])
 
 
+class TestOracle(unittest.TestCase):
+    BAND_OBJ = {
+        "OracleDocumentID": 1, "Provider": "42616E642050726F746F636F6C",
+        "LastUpdateTime": int(__import__("time").time()) - 3600,
+        "PriceDataSeries": [
+            {"PriceData": {
+                "BaseAsset": {"currency": "XRP"},
+                "QuoteAsset": {"currency": "USD"},
+                "Scale": 8, "AssetPrice": "8e321a5"}},
+        ],
+    }
+    DIA_OBJ = {
+        "OracleDocumentID": 42, "Provider": "64696164617461",
+        "LastUpdateTime": int(__import__("time").time()) - 7200,
+        "PriceDataSeries": [
+            {"PriceData": {
+                "BaseAsset": {"currency": "XRP"},
+                "QuoteAsset": {"currency": "USD"},
+                "Scale": 8, "AssetPrice": "8e30000"}},
+        ],
+    }
+    AGG = {"status": "success", "median": "1.49",
+           "entire_set": {"mean": "1.49", "size": 2,
+                          "standard_deviation": "0.01"},
+           "trimmed_set": {"mean": "1.49", "size": 2,
+                           "standard_deviation": "0.0"}}
+
+    def _rpc(self, method, params):
+        if method == "account_objects":
+            acct = params["account"]
+            obj = (self.BAND_OBJ if "NvoAZ" in acct else self.DIA_OBJ)
+            return {"account_objects": [obj]}
+        if method == "get_aggregate_price":
+            return self.AGG
+        raise AssertionError(method)
+
+    def test_decode_price(self):
+        self.assertAlmostEqual(
+            eco.decode_oracle_price("8e321a5", 8), 1.49103013, places=8)
+        self.assertAlmostEqual(
+            eco.decode_oracle_price("5f5dd17", 8), 0.99998999, places=8)
+
+    def test_hex_label(self):
+        self.assertEqual(
+            eco._hex_label("524C555344000000000000000000000000000000"),
+            "RLUSD")
+        self.assertEqual(eco._hex_label("XRP"), "XRP")
+
+    def test_format(self):
+        with mock.patch.object(eco, "_rpc",
+                               side_effect=self._rpc):
+            text = "\n".join(eco.format_oracle("XRP", "USD"))
+        self.assertIn("XLS-47 on-ledger price oracles for XRP/USD", text)
+        self.assertIn("Band Protocol", text)
+        self.assertIn("DIA", text)
+        self.assertIn("aggregate median: $1.490000", text)
+        self.assertIn("publisher-attested", text)
+
+    def test_rlusd_hex_normalized(self):
+        seen = {}
+
+        def fake_rpc(method, params):
+            seen[method] = params
+            return self._rpc(method, params)
+
+        with mock.patch.object(eco, "_rpc", side_effect=fake_rpc):
+            eco.format_oracle("RLUSD", "USD")
+        self.assertEqual(
+            seen["get_aggregate_price"]["base_asset"],
+            "524C555344000000000000000000000000000000")
+
+    def test_stale_warning(self):
+        old = dict(self.DIA_OBJ)
+        old["LastUpdateTime"] = int(__import__("time").time()) - 30 * 3600
+
+        def rpc(method, params):
+            if method == "account_objects":
+                acct = params["account"]
+                return {"account_objects":
+                        [self.BAND_OBJ if "NvoAZ" in acct else old]}
+            return self.AGG
+
+        with mock.patch.object(eco, "_rpc", side_effect=rpc):
+            text = "\n".join(eco.format_oracle("XRP", "USD"))
+        self.assertIn("DIA feed stale", text)
+
+    def test_fail_open(self):
+        with mock.patch.object(eco, "_rpc",
+                               side_effect=RuntimeError("down")):
+            lines = eco.format_oracle("XRP", "USD")
+        text = "\n".join(lines)
+        self.assertIn("feed unreachable", text)
+        self.assertIn("UNKNOWN", text)
+
+
 if __name__ == "__main__":
     unittest.main()

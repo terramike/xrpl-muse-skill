@@ -469,6 +469,186 @@ def format_stablecoin(symbol="RLUSD"):
     return lines
 
 
+# ---------------------------------------------------------------- price oracles (XLS-47)
+
+# Verified publisher identities. Band's address is published in Band
+# Protocol's XRPL mainnet launch post (blog.bandprotocol.com); DIA's in
+# the XRPLF dev portal ("Integrating DIA Oracles on the XRP Ledger",
+# 2025-05-16). Doc IDs from the same sources. Publisher-attested data
+# is an opinion, not ledger truth — always label the publisher.
+ORACLE_PUBLISHERS = [
+    {"name": "Band Protocol",
+     "account": "rsNvoAZ9MquZSRhu4cEY9wTv1VqHXpVPPt",
+     "oracle_document_id": 1},
+    {"name": "DIA",
+     "account": "rP24Lp7bcUHvEW7T7c8xkxtQKKd9fZyra7",
+     "oracle_document_id": 42},
+]
+
+# Warn when a publisher's feed is older than this (DIA's heartbeat is
+# 24h; anything past it plus a margin means updates stopped).
+ORACLE_STALE_AFTER_SECS = 26 * 3600
+
+
+def _rpc(method, params):
+    """Call a public rippled method across RPC_SERVERS in order.
+
+    Returns the result dict. Raises on total failure (caller decides
+    how to fail open).
+    """
+    last = None
+    for url in RPC_SERVERS:
+        try:
+            res = _http_post_json(url, {"method": method, "params": [params]})
+        except Exception as e:  # noqa: BLE001 — try next server
+            last = e
+            continue
+        if isinstance(res, dict) and res.get("result", {}).get("status") \
+                in ("success", None) and "error" not in res.get("result", {}):
+            return res["result"]
+        last = RuntimeError(str(res)[:120])
+    raise last if last else RuntimeError("no RPC servers configured")
+
+
+def decode_oracle_price(asset_price, scale):
+    """Decode an XLS-47 AssetPrice hex string at Scale -> float.
+
+    Raises ValueError on bad input.
+    """
+    raw = str(asset_price).strip()
+    if raw.lower().startswith("0x"):
+        raw = raw[2:]
+    return int(raw, 16) / (10 ** int(scale))
+
+
+def _hex_label(ccy):
+    """Human label for a ledger-form currency: 'RLUSD' for its hex."""
+    c = (ccy or "").strip()
+    if len(c) == 40:
+        try:
+            text = bytes.fromhex(c).rstrip(b"\x00").decode("ascii")
+            if text and all(32 < ord(ch) < 127 for ch in text):
+                return text
+        except (ValueError, UnicodeDecodeError):
+            pass
+        return c[:8] + "…"
+    return c
+
+
+def fetch_oracle_object(account, oracle_document_id):
+    """Fetch one publisher's Oracle ledger object (dict) or None.
+
+    Never raises. LastUpdateTime is unix seconds.
+    """
+    try:
+        res = _rpc("account_objects",
+                   {"account": account, "type": "oracle", "limit": 20})
+    except Exception:  # noqa: BLE001 — fail-open
+        return None
+    objs = [o for o in res.get("account_objects", [])
+            if isinstance(o, dict)]
+    for o in objs:
+        if o.get("OracleDocumentID") == oracle_document_id:
+            return o
+    return objs[0] if objs else None
+
+
+def oracle_series_price(obj, base_hex, quote_hex):
+    """Price + LastUpdateTime for a base/quote pair from an Oracle object.
+
+    Returns (value_or_None, last_update_or_None). Never raises.
+    """
+    try:
+        last_update = obj.get("LastUpdateTime")
+        for s in obj.get("PriceDataSeries", []):
+            if not isinstance(s, dict):
+                continue
+            pd = s.get("PriceData", {})
+            ba, qa = pd.get("BaseAsset", {}), pd.get("QuoteAsset", {})
+            b = ba.get("currency") if isinstance(ba, dict) else ba
+            q = qa.get("currency") if isinstance(qa, dict) else qa
+            if str(b).upper() == str(base_hex).upper() \
+                    and str(q).upper() == str(quote_hex).upper():
+                return decode_oracle_price(pd.get("AssetPrice"),
+                                           pd.get("Scale")), last_update
+        return None, last_update
+    except Exception:  # noqa: BLE001 — fail-open
+        return None, None
+
+
+def _fmt_age(secs):
+    if secs is None or secs < 0:
+        return "age unknown"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{secs / 3600:.0f}h ago"
+    return f"{secs / 86400:.1f}d ago"
+
+
+def format_oracle(base="XRP", quote="USD"):
+    """On-ledger XLS-47 oracle prices: per-publisher + aggregate median.
+
+    Primary price source is the ledger itself (Band Protocol + DIA
+    publishers); no exchange API involved. Advisory + fail-open: RPC
+    failures return 'unavailable' lines, never raise.
+    """
+    b_in = (base or "XRP").strip().upper()
+    q_in = (quote or "USD").strip().upper()
+    b_hex, q_hex = currency_to_hex(b_in), currency_to_hex(q_in)
+    pair = f"{b_in}/{q_in}"
+    lines = [f"  XLS-47 on-ledger price oracles for {pair}:"]
+    now = int(time.time())
+    pubs = []
+    try:
+        for pub in ORACLE_PUBLISHERS:
+            obj = fetch_oracle_object(pub["account"],
+                                      pub["oracle_document_id"])
+            if obj is None:
+                lines.append(f"    {pub['name']}: feed unreachable "
+                             f"(treat as UNKNOWN)")
+                continue
+            value, updated = oracle_series_price(obj, b_hex, q_hex)
+            pubs.append(pub)
+            if value is None:
+                lines.append(f"    {pub['name']}: no {pair} series published")
+                continue
+            age = now - updated if updated else None
+            lines.append(f"    {pub['name']}: {pair} = "
+                         f"${value:,.6f} (updated {_fmt_age(age)})")
+            if age is not None and age > ORACLE_STALE_AFTER_SECS:
+                lines.append(f"      ⚠️  {pub['name']} feed stale "
+                             f"(>{ORACLE_STALE_AFTER_SECS // 3600}h "
+                             f"without update)")
+    except Exception:  # noqa: BLE001 — fail-open
+        return [f"  oracle feed unavailable for {pair} "
+                "(rippled unreachable) — treat as UNKNOWN."]
+    if pubs:
+        try:
+            agg = _rpc("get_aggregate_price", {
+                "ledger_index": "current",
+                "base_asset": b_hex, "quote_asset": q_hex, "trim": 20,
+                "oracles": [{"account": p["account"],
+                             "oracle_document_id": p["oracle_document_id"]}
+                            for p in pubs]})
+            entire = agg.get("entire_set") or {}
+            tset = agg.get("trimmed_set") or {}
+            med = agg.get("median")
+            if med is not None:
+                lines.append(f"    aggregate median: ${float(med):,.6f} "
+                             f"(mean ${float(entire.get('mean', med)):,.6f}, "
+                             f"{entire.get('size', '?')} publishers)")
+                if tset.get("mean") is not None:
+                    lines.append(f"    trimmed mean (20%): "
+                                 f"${float(tset['mean']):,.6f}")
+        except Exception:  # noqa: BLE001 — aggregate optional
+            lines.append("    aggregate unavailable (per-publisher "
+                         "prices above still stand)")
+    lines.append("  publisher-attested prices, not ledger truth; "
+                 "Band + DIA identities per their published docs.")
+    return lines
+
+
 # ---------------------------------------------------------------- DEX Screener
 
 def dexscreener_xrpl_pair(currency, issuer):
