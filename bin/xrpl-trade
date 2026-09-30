@@ -2160,6 +2160,59 @@ def backup_ceremony(seed, address):
     return ans == "I HAVE WRITTEN IT DOWN"
 
 
+def _fuzzy_lore_path():
+    return Path(__file__).resolve().parent.parent / "references" / "fuzzy-lore.md"
+
+
+def cmd_fuzzy(args):
+    """Hidden Easter egg: the Fuzzy Dossier + JoelKatz mode.
+
+    Not in any menu, not in SKILL.md, hidden from --help. Lore lives in
+    references/fuzzy-lore.md (single source of truth); this command only
+    presents it and picks the random opening wisdom quote.
+    """
+    import random
+    import re
+
+    lore_path = _fuzzy_lore_path()
+    try:
+        text = lore_path.read_text(encoding="utf-8")
+    except OSError:
+        print("the fuzzy lore file is missing — the bear has left the building")
+        return
+
+    # Fuzzy wisdom: one random genuine quote from the lore file.
+    m = re.search(r"## Fuzzy wisdom.*?(?=^## )", text,
+                  re.DOTALL | re.MULTILINE)
+    quotes = re.findall(r'"([^"]+)"', m.group(0), re.DOTALL) if m else []
+    wisdom = random.choice(quotes) if quotes else \
+        "I know much less about this than you think."
+    wisdom = " ".join(wisdom.split())
+
+    # The canon: lore file section between "## The canon" and "## Fuzzy wisdom".
+    c = re.search(r"## The canon(.*?)^## Fuzzy wisdom", text,
+                  re.DOTALL | re.MULTILINE)
+    canon = c.group(1).strip() if c else text.strip()
+
+    print("=" * 64)
+    print("  FUZZY WISDOM OF THE MOMENT")
+    print("=" * 64)
+    print(f'  "{wisdom}"')
+    print("   — David \"JoelKatz\" Schwartz (genuine quote)")
+    print()
+    print("=" * 64)
+    print("  THE FUZZY DOSSIER — on-chain canon")
+    print("=" * 64)
+    print(canon)
+    print()
+    print("-" * 64)
+    print("  JoelKatz mode engaged. Ask about FUZZY, AMMs, trustlines —")
+    print("  answers come back dry, precise, and definitely not financial")
+    print("  advice. This command is not in the menus. You found it. Good.")
+    print("  Data: the validated ledger. Vibes: the bear.")
+    print("-" * 64)
+
+
 def cmd_wallet(args, cfg):
     """Wallet management: vault-flow create for mainnet, local for testnet."""
     if args.wallet_cmd == "create":
@@ -2935,6 +2988,14 @@ def cmd_giveaway_announce(args, gw):
 
 
 def main():
+    # Hidden Easter egg, intercepted before argparse so it appears in no
+    # help text, no choices list, and no menu. Do not document in SKILL.md.
+    if len(sys.argv) > 1 and sys.argv[1] == "fuzzy" and \
+            (len(sys.argv) == 2 or sys.argv[2].startswith("-")):
+        class _A:  # noqa - no CLI args for the easter egg
+            pass
+        cmd_fuzzy(_A())
+        return
     ap = argparse.ArgumentParser(prog="xrpl-trade",
                                  description="XRPL proposer: builds tx, never signs.")
     ap.add_argument("--network", choices=list(C.NETWORKS),
