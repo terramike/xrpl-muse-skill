@@ -35,6 +35,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    import xrpl_eco
+except ImportError:
+    xrpl_eco = None  # XRPL Meta second opinion unavailable; xrpl.to unaffected
+
 API_BASE = "https://api.xrpl.to/v1"
 USER_AGENT = "xrpl-muse-skill/0.9.0 (+https://github.com/terramike/xrpl-muse-skill)"
 KEY_PATH = Path.home() / ".xrpl" / "xrplto.json"
@@ -225,6 +230,11 @@ def format_safety_lines(issuer, currency):
                      f"{rev.get('positiveCount', '?')} positive signals")
     else:
         lines.append("  risk score: unavailable for this token")
+    if xrpl_eco is not None:
+        try:
+            lines.extend(xrpl_eco.format_xrplmeta_lines(ccy, issuer))
+        except Exception:  # noqa: BLE001 — second opinion is optional
+            pass
     lines.append(f"  {ATTRIBUTION}")
     return lines
 
@@ -562,6 +572,13 @@ def format_movers(view="gainers", limit=10):
         px = f"{price:.4g} XRP" if price is not None else "n/a"
         lines.append(f"  {i}. {name} · {px} · {chg_s} 24h · "
                      f"vol {vol} XRP · mcap {mc} XRP")
+    if xrpl_eco is not None:
+        try:
+            note = xrpl_eco.format_onthedex_note()
+            if note:
+                lines.append(note)
+        except Exception:  # noqa: BLE001 — cross-check is optional
+            pass
     lines.append(f"  {ATTRIBUTION}")
     return lines
 
@@ -632,6 +649,12 @@ def format_token_lookup(issuer, currency):
     if rev:
         lines.append(f"  risk score: {_risk_emoji(rev.get('score'))} "
                      f"{rev.get('score')}/10 ({rev.get('riskLevel', '?')})")
+    if xrpl_eco is not None:
+        try:
+            lines.extend(xrpl_eco.format_xrplmeta_lines(
+                rep["currency"], rep["issuer"]))
+        except Exception:  # noqa: BLE001 — second opinion is optional
+            pass
     lines.append(f"  {ATTRIBUTION}")
     return lines
 
