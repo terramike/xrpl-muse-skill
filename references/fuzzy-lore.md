@@ -39,6 +39,15 @@ tokens as investments. The community splits: a trustline is a technical
 blockchain operation, but a profile picture is a *deliberate public gesture*.
 Influencer responsibility discourse ensues. The bear stays.
 
+**The bear who says nothing.**
+@bearableguy123 — verified, 154.6K followers, on X since March 2018, 54 posts
+total. The riddle-prophet of the XRP community's 2017–2018 era: the $589
+prophecy, the 1-2-3 numerology, the bear. FUZZY's lore claims his legacy —
+his numbers and his imagery run straight through it. Here is the part that
+matters: in eight years he has never endorsed FUZZY, never opposed it, never
+mentioned it. The succession is claimed by the community, never granted by
+the bear. That is the canon. Keep it real.
+
 **The eternal pattern.**
 Do something small and technical → state plainly that it means nothing →
 watch the timeline treat it as scripture. (See also: the September 2026
