@@ -1,10 +1,7 @@
-# xrpl-muse-skill v0.7
+# xrpl-muse-skill v0.12.0
 
 Trade the XRP Ledger from the terminal — any token pair — with a hard safety
-boundary between **proposing** a trade and **signing** it. v0.7 adds named
-signing profiles, vault-only mainnet, and a hash-bound proposal envelope
-(v4) that ties every proposal to its exact policy, account, network, and
-credential source.
+boundary between **proposing** a trade and **signing** it.
 
 Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
 terminal), but safe for humans too.
@@ -18,150 +15,115 @@ This skill splits the job in two:
   network, shows you *everything* (account, network, assets + issuers,
   amounts, limit price, max spend, fee, expiry), seals it in a **hash-bound
   proposal envelope**, and stops. It never sees your seed. It cannot submit.
-- **`xrpl-sign`** is the only program that touches the seed. On mainnet
-  the seed comes from a **named signing profile** (`~/.xrpl/profiles.json`,
-  owner-only) that binds account + network + credential reference + policy
-  digest + spend-state; the seed itself lives in your vault (password
-  manager) and is injected for the single signing operation. `xrpl-sign`
-  re-verifies the envelope, derives the summary from the transaction itself
-  (nothing stored is trusted), enforces the profile's policy, and signs
-  **only** with explicit human `--profile <name> --approve` of that exact
-  hash. On testnet, `--seed-env` adhoc signing is available for development.
+- **`xrpl-sign`** is the only program that touches the seed. It re-verifies
+  the envelope, enforces the policy (spend caps, allowlisted pairs and
+  destinations, fee cap), and signs **only** with explicit human approval
+  of that exact proposal hash.
 
 ```bash
-xrpl-trade buy --pair ARMY/XRP --amount 1000 --price 0.005
+xrpl-trade buy --pair XRP/RLUSD --amount 10 --price 1.50
 # → full proposal + hash. Nothing submitted.
 
-xrpl-sign --profile main --hash a2c72140d080ca0f --approve
-# → envelope verify → policy checks → sign → persist → validated result
+xrpl-sign --profile main --approve <hash>
+# → envelope verify → policy checks → sign → validated result
 ```
 
-## What v0.5 adds
+## Safety first: read-only by default
 
-- **NFT minting** (`xrpl-trade nft-mint`): pins artwork + XLS-24d metadata
-  to IPFS through the operator's **own** Pinata account (`PINATA_JWT` from
-  the environment — the publisher hosts no one's media), then proposes an
-  `NFTokenMint` whose `URI` points at the metadata CID.
-- **XRP listings** (`xrpl-trade nft-list`): proposes XRP-denominated
-  *sell* offers only. IOU prices are denied, every listing carries a
-  ledger expiration.
-- **NFT inventory** (`xrpl-trade nft-inventory`): read-only listing of
-  every NFToken an account owns, with decoded URIs, flags, and issuers.
-  Accepts a favorite name as well as an r-address.
-- **NFT buying** (`xrpl-trade nft-buy --offer-index …`): verifies the
-  sell offer **from the ledger** (sell offer only — buy offers and IOU
-  prices refused), shows the on-ledger seller, URI, and taxon before
-  proposing `NFTokenAcceptOffer`. The signer re-verifies the offer at
-  signing time; a changed or vanished offer is refused. The skill reports
-  on-ledger facts and never calls a token "authentic" — anyone can mint
-  the same artwork, so the human verifies the seller is the minter they
-  expect. Buying spends XRP immediately and runs through the
-  per-transaction and rolling-24h spend caps.
-- **NFT bids** (`xrpl-trade nft-bid --token-id … --seller r… --price-xrp …`):
-  proposes a buy-side offer; the bid XRP locks until the offer is
-  accepted, cancelled, or expires. The buy side is opt-in
-  (`nft.allow_buy_offers`, default off) with a per-bid cap
-  (`nft.max_bid_xrp`).
-- **NFT transfers** (`xrpl-trade nft-send --token-id … --to <favorite|r…>`):
-  proposes a 0-XRP *transfer offer* (a gift, not a sale) to a favorite
-  name or r-address. The recipient must accept before it expires; it
-  spends 0 XRP beyond the fee, and the signer ceremony describes it as a
-  transfer, never a sale.
-- **NFT policy gates**: royalty (`TransferFee`) capped per policy and
-  immutable after mint, burnable/transferable flag allowlist, URI
-  byte-length cap, rolling-24h mint count, and a conservative v4 policy
-  migration that never widens `allowed_tx_types` on its own. No
-  order-book price check for NFTs: each token is one-of-one, so price
-  sanity stays the human's decision.
-- **Artist watchlist** (`xrpl-trade favorites`, `xrpl-trade nft-new`):
-  entirely read-only — a local named watchlist of artist wallets plus a
-  watermarked "what's new" digest showing new mints, listing prices, and
-  xrp.cafe links. No proposals, no signing, no approvals involved.
-- **XRPresso discovery** (`xrpl-trade xrpresso …`): read-only search of
-  the XRPresso P2P marketplace (listings, NFTs, auctions, stats) via its
-  free anonymous Discovery API — no key, no signup. The agent finds,
-  the human buys: every result prints its XRPresso deep link
-  (`?ref=api_v1` preserved) to open in their UI and sign in your own
-  wallet. Links are validated (https on xrpresso.io only — anything
-  else is withheld, never printed), calls are throttled well under the
-  platform's rate limit, and the feature touches no policy, no
-  `~/.xrpl`, and no ledger. Honest limits: small early-stage catalog,
-  marketplace not a trading venue (no swap endpoints).
+Fresh installs start **read-only**: every market read, balance check, token
+safety screen, and proposal build works keyless — signing is refused until
+you deliberately leave read-only mode:
 
-## What v0.3 hardens
+```bash
+xrpl-trade live       # prints what changes, then you TYPE "go live"
+xrpl-trade read-only  # locks back down, no confirmation needed
+```
 
-- **Hash-bound envelope** (`xrpl-proposal/3`): the approval hash covers the
-  network, account, action, creation time, policy version, and the canonical
-  XRPL binary of the complete transaction. Tampering with any of it —
-  including the proposal file — voids the approval.
-- **Strict transaction schemas**: only `OfferCreate`, `OfferCancel`,
-  `TrustSet`, `Payment` are signable, and every field is allowlisted per
-  type. No smuggled `Paths`, `SendMax`, memos, or partial-payment flags.
-- **Derived, never stored**: pair, side, amounts, and price are computed
-  from the transaction inside the signer.
-- **Per-asset spend limits**: per-transaction and rolling-24h caps per asset,
-  reserved atomically. Assets with no configured limit are blocked.
-- **Exact-pair enforcement**: offers must match an approved pair exactly —
-  unlisted token/token combinations are denied.
-- **Destination policy**: payments only to allowlisted `(address,
-  destination_tag)` pairs; conflicting X-address/CLI tags rejected;
-  `RequireDestTag` destinations refuse untagged payments.
-- **Crash-safe submission**: sign → persist the signed hash and
-  `LastLedgerSequence` → submit → wait for the validated ledger result.
-
-## Why the allowlist matters
-
-Tickers mean nothing on the XRP Ledger — anyone can mint a fake "ARMY".
-This skill trades **pair names mapped to vetted issuer addresses**, and the
-signer extracts token identities from the transaction JSON itself, so raw
-issuer arguments can't bypass it.
-
-Live at launch: `XRP/RLUSD, BTC/XRP, XLM/XRP, ARMY/XRP, PHNIX/XRP, BCHAMP/XRP,
-FUZZY/XRP`
-
-The shipped `approved.example.json` contains two template pairs
-(`XRP/RLUSD`, `ARMY/XRP`) — copy it to `~/.xrpl/approved.json` and add
-only pairs whose issuers you have personally vetted. Tickers mean nothing
-on XRPL; the issuer address is the identity.
+There is no flag or environment variable that skips the typed ceremony —
+a prompt injection can't quietly re-enable signing. `xrpl-sign --approve`
+checks the flag independently and refuses (audit-logged) while read-only.
 
 ## Install
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/terramike/xrpl-muse-skill
+cd xrpl-muse-skill
+pip install -r requirements-locked.txt
+export PATH="$PWD/bin:$PATH"
+
 xrpl-trade setup            # address + network (never the seed)
-xrpl-sign init-policy       # policy file v3, testnet-locked by default
 ```
 
-The signer reads the seed **only** from `XRPL_SEED`, provided by your secret
-manager or agent vault after human approval. Testnet funds:
-`xrpl-trade faucet --network testnet`
+Try it with zero keys — all of these are read-only:
 
-## What it does
+```bash
+xrpl-trade validators       # signed validator-list health
+xrpl-trade amendments        # live amendment votes + majority countdown
+xrpl-trade stablecoin RLUSD  # supply by chain + price (via DefiLlama)
+xrpl-trade oracle XRP USD    # on-ledger XLS-47 price feeds (Band + DIA)
+```
 
-- **Read:** balances, order books for any pair, open offers, issuer risk
-  inspection (domain, transfer fees, freeze flags), trade planning
-  (estimated fill, price impact, max spend), transaction reconciliation,
-  NFT inventory per account.
-- **Write (all gated):** limit buys/sells, trustlines, offer cancels, payments
-  with destination-tag and X-address support, NFT mints, NFT listings,
-  NFT buys (sell-offer acceptance), and NFT bids.
+## What's new in v0.12.0
+
+- **`validators` / `amendments`** — watch the network upgrade itself:
+  signed validator-list health and the live amendment vote count.
+- **`stablecoin [SYMBOL]`** — stablecoin supply broken down by chain plus
+  price, via DefiLlama (labeled aggregator-not-authority).
+- **`oracle [BASE] [QUOTE]`** — prices straight from the ledger via XLS-47
+  oracle objects (Band Protocol + DIA publisher feeds), with per-publisher
+  prices, update ages, staleness warnings, and median/mean/trimmed-mean
+  aggregates. Publisher-attested, never presented as ledger truth.
+- **Onboarding wizard (spec)** — `references/onboarding-wizard.md`: a chat
+  walkthrough that takes a new user from zero to their first on-chain read
+  with no keys, then layers optionals (NFT minting, watch-only wallets) on
+  as yes/no questions.
+- **Hardening** — the `live` command's typed ceremony can no longer be
+  skipped via CLI; amendment parsing accepts every known key spelling.
+
+## Command map
+
+**Network & market reads** (keyless): `balance`, `quote`, `plan-trade`,
+`inspect-token`, `token-safety` (xrpl.to scam check + risk score),
+`validators`, `amendments`, `stablecoin`, `oracle`, `reconcile`
+
+**Trading proposals** (propose → approve → sign): `buy`, `sell`,
+`trustline`, `cancel`, `send` — amounts in BASE units, `--price` in QUOTE
+per BASE, pairs mapped to vetted issuer addresses (tickers mean nothing
+on XRPL; the issuer is the identity)
+
+**NFTs**: `nft-stage`, `nft-pin-and-propose` (your own Pinata key),
+`nft-list` (XRP sell offers only), `nft-inventory`, `nft-buy` (ledger-
+verified sell offers), `nft-bid`, `nft-send` (0-XRP gift transfers),
+`collection`, `template`
+
+**Watchlists & discovery** (keyless): `favorites`, `watch` (incoming NFT
+offer reminders), `nft-new`, `incoming`, `xrpresso` (marketplace search),
+`giveaway`
+
+**Modes**: `setup`, `wallet`, `profile`, `live`, `read-only`.
+Autonomous mode is local-only dry-run and is not shipped in this repo.
+
+Every command documents itself: `xrpl-trade <command> --help`.
+
+## For AI agents
+
+Start with [`llms.txt`](llms.txt) — the curated entry point: what this is,
+the files that matter, the safety invariants. [`AGENTS.md`](AGENTS.md) has
+contributor guidance (tests, conventions, what never to touch).
+[`SKILL.md`](SKILL.md) is the full operator manual (971 lines).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) — including the platform boundary: `--approve`
-is an assertion, not evidence of human approval, and the advisory that
-versions before commit `c3273e59` shipped inverted buy/sell and must not be
-used for trading.
+See [SECURITY.md](SECURITY.md) — including the platform boundary:
+`--approve` is an assertion, not evidence of human approval. Never request,
+reveal, or record a seed.
 
 ## Tests
 
 ```bash
-python3 tests/test_v04.py          # 78 adversarial logic tests, no network
-python3 tests/test_nft.py          # 104 NFT adversarial tests, no network
-python3 tests/test_favorites.py    # 67 favorites + nft-new tests, no network
-python3 tests/test_e2e_testnet.py  # 52 end-to-end checks on testnet,
-                                   # fully isolated in a temporary HOME —
-                                   # never touches the operator's real ~/.xrpl
+python3 -m unittest tests.test_readonly   # read-only ceremony (no network)
+python3 -m unittest tests.test_eco        # ecosystem connectors (no network)
+python3 -m unittest tests.test_v04        # 78 adversarial logic tests
 ```
 
 ## License

@@ -1,0 +1,62 @@
+# xrpl-muse-skill
+
+> Trade the XRP Ledger from the terminal with a hard safety boundary
+> between proposing a trade and signing it. Built for AI agents; safe
+> for humans. Read-only by default — every market read works keyless,
+> signing requires an explicit typed ceremony. MIT licensed.
+
+Repo: https://github.com/terramike/xrpl-muse-skill
+
+## Entry points
+
+- `README.md` — install, quick start, command map, what's new
+- `SKILL.md` — the full operator manual (architecture, every command,
+  policy model, NFT flows)
+- `SECURITY.md` — the safety model and its limits
+- `AGENTS.md` — contributor guidance: tests, conventions, what never
+  to touch
+- `references/` — deep docs per topic: `onboarding-wizard.md`,
+  `ecosystem-connectors.md`, `trusted-links.md` (verified-link registry),
+  `fuzzy-lore.md`
+- `bin/xrpl-trade` — the proposer CLI (builds txs, never signs)
+- `bin/xrpl-sign` — the policy-gated signer (only program that sees a seed)
+- `bin/xrpl_eco.py` — ecosystem read modules (validators, amendments,
+  stablecoin, oracle)
+
+## Safety invariants (do not work around these)
+
+1. Fresh installs are read-only. `xrpl-trade live` requires typing
+   `go live` at an interactive prompt — there is deliberately no CLI
+   flag or env var to skip it.
+2. `xrpl-trade` never sees a seed and never submits. `xrpl-sign` only
+   signs a hash-bound proposal envelope the human approved exactly.
+3. Never request, reveal, or record a seed. Ever.
+4. Network reads fail open (clear "unavailable", never fabricated data);
+   external data is always attributed, never presented as ledger truth.
+
+## Quick commands (all keyless reads)
+
+```bash
+xrpl-trade validators        # signed validator-list health
+xrpl-trade amendments         # amendment votes + majority countdown
+xrpl-trade stablecoin RLUSD   # supply by chain + price
+xrpl-trade oracle XRP USD     # on-ledger XLS-47 prices (Band + DIA)
+xrpl-trade token-safety --help
+xrpl-trade <command> --help   # every command documents itself
+```
+
+## Propose → approve → sign (needs human approval)
+
+```bash
+xrpl-trade buy --pair XRP/RLUSD --amount 10 --price 1.50  # proposal + hash
+xrpl-sign --profile main --approve <hash>                 # human signs
+```
+
+## Tests
+
+```bash
+python3 -m unittest tests.test_readonly
+python3 -m unittest tests.test_eco
+```
+
+Releases: https://github.com/terramike/xrpl-muse-skill/releases
