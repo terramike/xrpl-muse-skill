@@ -127,6 +127,57 @@ NETWORKS = {
 RIPPLE_EPOCH = 946684800  # unix seconds of 2000-01-01T00:00:00Z
 REQUIRE_DEST_TAG_FLAG = 0x00020000  # lsfRequireDestTag
 
+# ---------- read-only mode (v0.11.0) ----------
+# The skill defaults to read-only: everything keyless works (balances,
+# lookups, proposals, market reads), but the signing path refuses until the
+# operator explicitly goes live (`xrpl-trade live`, a typed ceremony).
+# Fresh installs (no config file yet) are read-only by default. Existing
+# installs that predate the flag are grandfathered (signing stays enabled)
+# so an upgrade never silently changes behavior; setup/wallet-create stamp
+# read_only=true when they create a brand-new config file.
+# The flag lives in config.json and can ONLY be flipped by the live/read-only
+# ceremony commands — no CLI flag or environment variable overrides it, so a
+# prompt injection cannot quietly re-enable signing.
+
+def is_read_only():
+    """True if the signing path must refuse. Fail closed on unreadable config."""
+    if not CONFIG_PATH.exists():
+        return True
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return True
+    if "read_only" not in cfg:
+        return False  # grandfathered install: keep prior behavior
+    return bool(cfg["read_only"])
+
+
+def set_read_only(value):
+    """Atomically flip the read_only flag, preserving every other key."""
+    cfg = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+    cfg["read_only"] = bool(value)
+    XRPL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def default_read_only_for_new_config(cfg):
+    """Stamp read_only=true when creating a brand-new config file.
+
+    Call with the config dict right before writing it. Configs written over
+    an existing file keep their grandfathered state (key stays absent).
+    """
+    if "read_only" not in cfg and not CONFIG_PATH.exists():
+        cfg["read_only"] = True
+    return cfg
+
 __version__ = "0.7.0"
 POLICY_VERSION = 4
 # Envelope v4 (P1-1 approval binding): adds the bound signing profile name

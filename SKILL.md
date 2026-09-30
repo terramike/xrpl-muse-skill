@@ -3,6 +3,27 @@
 Trade the XRP Ledger from the terminal — any token pair, with a hard safety
 boundary between proposing a trade and signing it.
 
+## Read-only mode: the default (v0.11.0)
+
+Fresh installs start **read-only**: everything keyless works, nothing can
+sign. Balances, token lookups with XRPL.to risk scores, market movers, top
+collections, tx-explain, whale-watch, incoming NFT offer scans, the watchlist,
+Koi market reads, the trusted-links registry — all of it, no keys anywhere.
+`xrpl-trade` can even *build* proposals (terms + hash, fully keyless) so you
+can rehearse the whole flow and stop one step short of the chain.
+
+Going live is a deliberate ceremony, not a flag:
+
+- `xrpl-trade live` — prints what changes, then requires typing `go live`
+- `xrpl-trade read-only` — locks back down, no confirmation needed
+
+The `read_only` bit lives in `~/.xrpl/config.json` and can **only** be flipped
+by those two commands. No CLI flag or environment variable overrides it, so a
+prompt injection can't quietly re-enable signing. `xrpl-sign --approve`
+checks the flag independently and refuses (audit-logged) while read-only.
+Existing installs that predate the flag are grandfathered — an upgrade never
+silently changes signing behavior.
+
 ## Architecture: propose → approve → sign (v0.7)
 
 Two programs. The agent only ever runs the first.

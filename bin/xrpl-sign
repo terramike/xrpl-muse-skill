@@ -627,6 +627,18 @@ def resolve_signing_context(args, prop):
 
 
 def cmd_sign(args):
+    # v0.11.0 read-only mode: the signing path refuses before touching
+    # anything else. Review (--hash without --approve) stays keyless and
+    # always works.
+    if args.approve and C.is_read_only():
+        print("READ-ONLY MODE: signing is disabled.")
+        print("Nothing was signed or submitted.")
+        print("Run `xrpl-trade live` (explicit typed ceremony) to enable")
+        print("signing, then re-run your approve command.")
+        C.audit("sign", args.hash or "?", None, "?", "?",
+                "read_only_refused",
+                "approve attempted while read_only=true")
+        sys.exit(1)
     prop, path = C.load_proposal(args.hash)
 
     # envelope verification: tamper evidence for everything the human reviewed

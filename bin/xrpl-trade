@@ -2299,6 +2299,7 @@ def generate_wallet_into_config(network, force=False):
     seed = wallet.seed
     del wallet
     cfg.update({"seed": seed, "address": address, "network": network})
+    C.default_read_only_for_new_config(cfg)  # fresh installs: read-only
     del seed
     C.XRPL_DIR.mkdir(parents=True, exist_ok=True)
     tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
@@ -2734,6 +2735,7 @@ def cmd_setup(_args):
                  f"Migrate it to your vault first with "
                  f"`xrpl-trade wallet forget-seed`, then re-run setup.")
     cfg.update({"network": net, "address": address})
+    C.default_read_only_for_new_config(cfg)  # fresh installs: read-only
     tmp = C.CONFIG_PATH.with_name(C.CONFIG_PATH.name + ".tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     os.chmod(tmp, 0o600)
@@ -3160,6 +3162,48 @@ def cmd_giveaway_announce(args, gw):
     print("Next draw: Friday 7:37 AM PT.")
 
 
+# ---------- read-only mode ceremony (v0.11.0) ----------
+
+def cmd_live(args):
+    """Leave read-only mode: enable the signing path via a typed ceremony."""
+    if not C.is_read_only():
+        print("Signing is already enabled (not in read-only mode).")
+        print("Run `xrpl-trade read-only` to lock back down.")
+        return
+    print("=" * 60)
+    print("GOING LIVE — read-only mode OFF")
+    print("=" * 60)
+    print("Read-only mode lets you explore everything keyless: balances,")
+    print("token lookups, proposals, market reads. Going live enables the")
+    print("signing path: `xrpl-sign --approve` will sign and SUBMIT real")
+    print("transactions, bound by your policy limits.")
+    print("This changes local config only. It never touches keys.")
+    print("=" * 60)
+    phrase = args.confirm
+    if phrase is None:
+        try:
+            phrase = input("Type 'go live' to enable signing: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled — staying read-only.")
+            return
+    if phrase != "go live":
+        print("Phrase did not match — staying read-only.")
+        return
+    C.set_read_only(False)
+    print("Live. Signing is now enabled.")
+    print("Run `xrpl-trade read-only` any time to lock back down.")
+
+
+def cmd_read_only(args):
+    """Enter read-only mode: proposals and reads only, signing refused."""
+    if C.is_read_only():
+        print("Already in read-only mode.")
+        return
+    C.set_read_only(True)
+    print("Read-only mode ON: proposals and reads only — signing refused.")
+    print("Run `xrpl-trade live` (explicit typed ceremony) to go live.")
+
+
 def main():
     # Hidden Easter egg, intercepted before argparse so it appears in no
     # help text, no choices list, and no menu. Do not document in SKILL.md.
@@ -3237,6 +3281,15 @@ def main():
                   help="stop autonomous mode (re-approval needed to restart)")
     au.add_parser("report",
                   help="activity summary from the autonomous audit log")
+    p = sub.add_parser("live",
+                       help="leave read-only mode: enable signing via an "
+                            "explicit typed ceremony")
+    p.add_argument("--confirm", default=None,
+                   help="type 'go live' here to skip the interactive prompt "
+                        "(still prints the full ceremony text)")
+    sub.add_parser("read-only",
+                   help="enter read-only mode: proposals and reads only, "
+                        "signing refused")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
     p = sub.add_parser("quote", help="order book for any pair")
@@ -3618,8 +3671,20 @@ def main():
     if args.cmd == "autonomous":
         # Self-contained: the module manages its own config/client and never
         # touches the main account, main policy, or any other command.
-        import xrpl_autonomous as A
+        try:
+            import xrpl_autonomous as A
+        except ImportError:
+            sys.exit("autonomous mode is not included in this build "
+                     "(local-only, dry-run).")
         A.cmd_autonomous(args)
+        return
+    if args.cmd == "live":
+        # Local-only config flip; no network, no keys.
+        cmd_live(args)
+        return
+    if args.cmd == "read-only":
+        # Local-only config flip; no network, no keys.
+        cmd_read_only(args)
         return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
