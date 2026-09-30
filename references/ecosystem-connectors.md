@@ -77,9 +77,10 @@ domain match the claimed issuer?), `kyc` flag, `trust_level` (1–5,
 publisher-derived — label as opinion), holder/trustline counts.
 Disagreement with the xrpl.to score is shown, never resolved by us.
 
-Currency encoding: 3-char ASCII codes pass as-is; longer names must be
-160-bit hex (uppercase, zero-padded) — reuse the skill's existing
-currency-hex helper.
+Currency encoding: the `/token/{currency}:{issuer}` route takes the
+**plain** currency code (`RLUSD`), NOT hex — verified 2026-09-30 (hex
+form returns 400). The `currency_to_hex` helper in `xrpl_eco.py` remains
+for any future route that needs it.
 
 ## 4. OnTheDEX — ledger-native price data
 
@@ -99,22 +100,64 @@ Wiring: `movers` tries OnTheDEX first for 24h change/volume, falls back
 to the existing source on any failure. `quote` may show an OnTheDEX
 cross-check line. Illiquid pairs get a volume-staleness label.
 
-## Tier 2 (spec'd later, not built)
+## Tier 2 (building 2026-09-30)
 
-- **xrpscan API** (`api.xrpscan.com/api/v1`): keyless, 10k/day, AI-native
-  docs — but **CC BY-NC-SA 4.0 (non-commercial)**. Fallback only for
-  account history / NFT / AMM reads.
-- **DefiLlama** (`api.llama.fi`, `stablecoins.llama.fi`, `coins.llama.fi`):
-  RLUSD supply/peg, XRP DeFi TVL. No key. Label cross-chain vs
-  XRPL-native precisely.
-- **DEX Screener**: XRPL website pages confirmed; public-API chain
-  coverage UNVERIFIED — verify before wiring.
+### 5. xrpscan API — fallback cross-checks (NON-COMMERCIAL LICENSE)
 
-## Parked
+- Base `https://api.xrpscan.com/api/v1`, keyless, 10k/day free, AI-native
+  docs (`docs.xrpscan.com`, llms.txt + .md pages).
+- **LICENSE: CC BY-NC-SA 4.0 — non-commercial.** Every xrpscan line
+  carries "(per api.xrpscan.com — CC BY-NC-SA 4.0, non-commercial)".
+- Verified 2026-09-30: `GET /validators` → 200 array of
+  `{master_key, chain, domain, ephemeral_key, ...}`;
+  `GET /validator/registry` → literal `"Error"` (do NOT use);
+  `GET /amendments` → 113 entries `{amendment_id, enabled, majority
+  (ledger), name, supported, introduced, count, threshold, validations}`.
+  No `/health` endpoint (404).
+- Wiring: one-line cross-checks — `format_validators` gains "xrpscan
+  sees N validators (agrees/disagrees)"; `format_amendments` gains
+  "xrpscan: M in voting". Silent on failure. Never primary.
 
-Bithomp (key wall), Sologenic (API docs 404 as of 2026-09-30),
-Evernode (compute, not a read API), XLS-65/66 lending (not live),
-on-chain oracles (need verified publisher IDs).
+### 6. DefiLlama — stablecoin reads
+
+- Bases `https://stablecoins.llama.fi`, `https://api.llama.fi`,
+  `https://coins.llama.fi`. No key, soft ~500 req/min free.
+- Verified 2026-09-30: `GET /stablecoins?includePrices=true` →
+  `{peggedAssets[], chains[]}`; RLUSD = id 250, chains
+  `[Ethereum, XRPL]`; fields `price`, `pegDeviation`,
+  `chainCirculating{chain: {current: {peggedUSD}}}`.
+  Chart `GET /stablecoincharts/all?stablecoin=250` → 749 points
+  (response shape unverified — not parsed in v1).
+- Wiring: `xrpl-trade stablecoin [SYMBOL]` (default RLUSD) prints total
+  circulating, per-chain table, XRPL share %, price. Labels: "per
+  DefiLlama (aggregator, not ledger authority) — XRPL-native supply
+  should be verified on-ledger." Cross-chain supply ≠ XRPL-native
+  supply — label precisely.
+- Observed 2026-09-30 (do not hardcode as current): RLUSD ~$2.52B
+  total, XRPL ~$1.124B, Ethereum ~$1.396B, price 1.00007.
+
+### 7. DEX Screener — XRPL pair cross-check
+
+- Verified 2026-09-30: `GET /latest/dex/search?q={symbol}` returns
+  pairs including `chainId: "xrpl"`. `GET
+  /token-pairs/v1/xrpl/{currency-hex}` returned `[]` — do NOT use that
+  route for XRPL tokens.
+- Pair shape: `{dexId, pairAddress: "{HEX}.{issuer}_{quote}",
+  baseToken: {name, symbol, address}, priceUsd, liquidity: {usd},
+  volume: {h24}, txns: {h24: {buys, sells}}, priceChange: {h24}, fdv,
+  marketCap}`.
+- Wiring: `token-safety` gains a DEX Screener block — top XRPL pair by
+  liquidity: priceUsd, liquidity, vol24, buys/sells, 24h change. Match
+  rule: `chainId == "xrpl"` AND (`baseToken.symbol == currency` OR
+  issuer in `pairAddress`). Silent on failure. Label "per DEX Screener
+  (aggregator, not ledger authority)".
+- Rate: occasional lookups only.
+
+## Tier 2 backlog (not built)
+
+- Bithomp (key wall), Sologenic (API docs 404 as of 2026-09-30),
+  Evernode (compute, not a read API), XLS-65/66 lending (not live),
+  on-chain oracles (need verified publisher IDs).
 
 ## Wizard tie-in
 

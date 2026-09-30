@@ -497,6 +497,13 @@ def cmd_amendments(args, cfg, client):
         print(ln)
 
 
+def cmd_stablecoin(args, cfg, client):
+    if xrpl_eco is None:
+        sys.exit("xrpl_eco module unavailable")
+    for ln in xrpl_eco.format_stablecoin(args.symbol):
+        print(ln)
+
+
 def nft_safety_lines(args, nft_id, ask_xrp):
     """Advisory xrpl.to NFT safety for a buy/bid proposal.
 
@@ -3323,6 +3330,8 @@ def main():
     p.add_argument("--currency", required=True); p.add_argument("--issuer", required=True)
     p = sub.add_parser("validators", help="signed validator-list health: count, sequence, expiry (read-only)")
     p = sub.add_parser("amendments", help="protocol amendment status: voting, enabled, majority countdown (read-only)")
+    p = sub.add_parser("stablecoin", help="stablecoin supply by chain + price via DefiLlama (read-only)")
+    p.add_argument("symbol", nargs="?", default="RLUSD")
     p = sub.add_parser("plan-trade", help="estimate fill, impact, max spend (read-only)")
     p.add_argument("--pair", default=None)
     p.add_argument("--base", default="XRP"); p.add_argument("--quote", default="RLUSD")
@@ -3729,6 +3738,7 @@ def main():
         "token-safety": lambda: cmd_token_safety(args, cfg, client),
         "validators": lambda: cmd_validators(args, cfg, client),
         "amendments": lambda: cmd_amendments(args, cfg, client),
+        "stablecoin": lambda: cmd_stablecoin(args, cfg, client),
         "plan-trade": lambda: cmd_plan_trade(args, cfg, client),
         "reconcile": lambda: cmd_reconcile(args, cfg, client),
         "buy": lambda: cmd_buy(args, cfg, client),

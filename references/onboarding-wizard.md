@@ -69,7 +69,9 @@ Power reads to try next: `tx-explain --hash …` (what happened on-ledger),
 `token-safety` (scam screen + risk score), `top-collections` (ranked NFT
 collections), `xrpresso listings --q …` (the XRPresso marketplace),
 `validators` + `amendments` (watch the network upgrade itself — the
-signed validator lists and the live amendment vote count). And
+signed validator lists and the live amendment vote count, each with an
+xrpscan cross-check), `stablecoin [SYMBOL]` (RLUSD supply by chain +
+price via DefiLlama). And
 the trusted-links registry (`references/trusted-links.md`) is the answer
 for "is this link legit" — never a search result.
 

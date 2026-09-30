@@ -166,6 +166,18 @@ class TestXrplMeta(unittest.TestCase):
         with mock.patch.object(eco, "xrplmeta_lookup", return_value=None):
             self.assertEqual(eco.format_xrplmeta_lines("X", "rY"), [])
 
+    def test_lookup_uses_plain_currency(self):
+        seen = {}
+
+        def fake_get(url, **kw):
+            seen["url"] = url
+            return {"meta": {}, "metrics": {}}
+
+        with mock.patch.object(eco, "_http_get_json", side_effect=fake_get):
+            eco.xrplmeta_lookup("RLUSD", "rIssuer")
+        self.assertIn("/token/RLUSD:rIssuer", seen["url"])
+        self.assertNotIn("524C555344", seen["url"])
+
 
 class TestOnTheDex(unittest.TestCase):
     def test_error_envelope_returns_none(self):
@@ -185,6 +197,127 @@ class TestOnTheDex(unittest.TestCase):
                                return_value={"A": 1, "B": 2}):
             note = eco.format_onthedex_note()
         self.assertIn("OnTheDEX cross-check: live", note)
+
+
+class TestXrpscan(unittest.TestCase):
+    VALS = [{"master_key": "k1"}, {"master_key": "k2"}]
+    AMDS = [
+        {"name": "FixB", "supported": True, "enabled": False},
+        {"name": "FixA", "supported": True, "enabled": True},
+    ]
+
+    def test_validator_line_agrees(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               return_value=self.VALS):
+            line = eco.format_xrpscan_validator_line({"xrplf": 2})
+        self.assertIn("tracks 2 validators — agrees with signed lists", line)
+        self.assertIn("CC BY-NC-SA 4.0", line)
+
+    def test_validator_line_differs(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               return_value=self.VALS):
+            line = eco.format_xrpscan_validator_line({"xrplf": 35})
+        self.assertIn("network-wide registry", line)
+
+    def test_validator_line_none_when_down(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               side_effect=RuntimeError("down")):
+            self.assertIsNone(
+                eco.format_xrpscan_validator_line({"xrplf": 2}))
+
+    def test_amendment_line_agrees(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               return_value=self.AMDS):
+            line = eco.format_xrpscan_amendment_line(["FixB"])
+        self.assertIn("1 in voting (agrees)", line)
+
+    def test_amendment_line_differs(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               return_value=self.AMDS):
+            line = eco.format_xrpscan_amendment_line(["FixB", "FixZ"])
+        self.assertIn("differs on: FixZ", line)
+
+    def test_amendment_line_none_when_down(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               side_effect=RuntimeError("down")):
+            self.assertIsNone(eco.format_xrpscan_amendment_line(["FixB"]))
+
+
+class TestDefiLlama(unittest.TestCase):
+    REC = {"symbol": "RLUSD", "price": 1.00007,
+           "chainCirculating": {
+               "XRPL": {"current": {"peggedUSD": 1124820117.42}},
+               "Ethereum": {"current": {"peggedUSD": 1396385422.07}}}}
+
+    def test_format(self):
+        with mock.patch.object(eco, "defillama_stablecoin",
+                               return_value=self.REC):
+            text = "\n".join(eco.format_stablecoin("RLUSD"))
+        self.assertIn("price: $1.0001", text)
+        self.assertIn("total circulating: $2.52B", text)
+        self.assertIn("XRPL: $1.12B (44.6%)", text)
+        self.assertIn("XRPL share: 44.6%", text)
+        self.assertIn("not ledger authority", text)
+
+    def test_unknown_symbol(self):
+        with mock.patch.object(eco, "defillama_stablecoin",
+                               return_value=None):
+            text = "\n".join(eco.format_stablecoin("NOPE"))
+        self.assertIn("unavailable or unknown symbol", text)
+
+    def test_fail_open(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               side_effect=RuntimeError("down")):
+            self.assertIsNone(eco.defillama_stablecoin("RLUSD"))
+
+
+class TestDexScreener(unittest.TestCase):
+    PAIR = {"chainId": "xrpl", "dexId": "xrpl",
+            "pairAddress": "524C555344.rMxCK_XRP",
+            "baseToken": {"symbol": "RLUSD"},
+            "priceUsd": "0.9997",
+            "liquidity": {"usd": 4816434.53},
+            "volume": {"h24": 5582122.53},
+            "txns": {"h24": {"buys": 10488, "sells": 17814}},
+            "priceChange": {"h24": 0.05}}
+
+    def test_lines(self):
+        with mock.patch.object(eco, "dexscreener_xrpl_pair",
+                               return_value=self.PAIR):
+            text = "\n".join(
+                eco.format_dexscreener_lines("RLUSD", "rMxCK"))
+        self.assertIn("DEX Screener XRPL cross-check", text)
+        self.assertIn("price: $0.9997", text)
+        self.assertIn("liquidity: $4.82M", text)
+        self.assertIn("10488 buys / 17814 sells", text)
+        self.assertIn("aggregator data", text)
+
+    def test_empty_when_no_pair(self):
+        with mock.patch.object(eco, "dexscreener_xrpl_pair",
+                               return_value=None):
+            self.assertEqual(
+                eco.format_dexscreener_lines("ZZZ", "rX"), [])
+
+    def test_match_rule(self):
+        pairs = [
+            {"chainId": "ethereum", "baseToken": {"symbol": "RLUSD"},
+             "pairAddress": "x", "liquidity": {"usd": 999}},
+            {"chainId": "xrpl", "baseToken": {"symbol": "OTHER"},
+             "pairAddress": "abc.rIssuer_XRP",
+             "liquidity": {"usd": 100}},
+        ]
+        with mock.patch.object(
+                eco, "_http_get_json",
+                return_value={"pairs": pairs}):
+            p = eco.dexscreener_xrpl_pair("RLUSD", "rIssuer")
+        self.assertEqual(p["pairAddress"], "abc.rIssuer_XRP")
+
+    def test_fail_open(self):
+        with mock.patch.object(eco, "_http_get_json",
+                               side_effect=RuntimeError("down")):
+            self.assertIsNone(eco.dexscreener_xrpl_pair("RLUSD", "rX"))
+            self.assertEqual(
+                eco.format_dexscreener_lines("RLUSD", "rX"), [])
 
 
 if __name__ == "__main__":

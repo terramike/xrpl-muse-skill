@@ -235,6 +235,10 @@ def format_safety_lines(issuer, currency):
             lines.extend(xrpl_eco.format_xrplmeta_lines(ccy, issuer))
         except Exception:  # noqa: BLE001 — second opinion is optional
             pass
+        try:
+            lines.extend(xrpl_eco.format_dexscreener_lines(ccy, issuer))
+        except Exception:  # noqa: BLE001 — cross-check is optional
+            pass
     lines.append(f"  {ATTRIBUTION}")
     return lines
 

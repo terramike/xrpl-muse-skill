@@ -132,7 +132,7 @@ class TestWizardSpec(unittest.TestCase):
         phase0 = text[text.find("## Phase 0"):text.find("## Phase 1")]
         for cmd in ["tx-explain", "whale-watch", "token-safety",
                     "top-collections", "xrpresso", "trusted-links",
-                    "validators", "amendments"]:
+                    "validators", "amendments", "stablecoin"]:
             self.assertIn(cmd, phase0,
                           f"Phase 0 try-list missing: {cmd}")
 
