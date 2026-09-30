@@ -199,50 +199,6 @@ class TestOnTheDex(unittest.TestCase):
         self.assertIn("OnTheDEX cross-check: live", note)
 
 
-class TestXrpscan(unittest.TestCase):
-    VALS = [{"master_key": "k1"}, {"master_key": "k2"}]
-    AMDS = [
-        {"name": "FixB", "supported": True, "enabled": False},
-        {"name": "FixA", "supported": True, "enabled": True},
-    ]
-
-    def test_validator_line_agrees(self):
-        with mock.patch.object(eco, "_http_get_json",
-                               return_value=self.VALS):
-            line = eco.format_xrpscan_validator_line({"xrplf": 2})
-        self.assertIn("tracks 2 validators — agrees with signed lists", line)
-        self.assertIn("CC BY-NC-SA 4.0", line)
-
-    def test_validator_line_differs(self):
-        with mock.patch.object(eco, "_http_get_json",
-                               return_value=self.VALS):
-            line = eco.format_xrpscan_validator_line({"xrplf": 35})
-        self.assertIn("network-wide registry", line)
-
-    def test_validator_line_none_when_down(self):
-        with mock.patch.object(eco, "_http_get_json",
-                               side_effect=RuntimeError("down")):
-            self.assertIsNone(
-                eco.format_xrpscan_validator_line({"xrplf": 2}))
-
-    def test_amendment_line_agrees(self):
-        with mock.patch.object(eco, "_http_get_json",
-                               return_value=self.AMDS):
-            line = eco.format_xrpscan_amendment_line(["FixB"])
-        self.assertIn("1 in voting (agrees)", line)
-
-    def test_amendment_line_differs(self):
-        with mock.patch.object(eco, "_http_get_json",
-                               return_value=self.AMDS):
-            line = eco.format_xrpscan_amendment_line(["FixB", "FixZ"])
-        self.assertIn("differs on: FixZ", line)
-
-    def test_amendment_line_none_when_down(self):
-        with mock.patch.object(eco, "_http_get_json",
-                               side_effect=RuntimeError("down")):
-            self.assertIsNone(eco.format_xrpscan_amendment_line(["FixB"]))
-
-
 class TestDefiLlama(unittest.TestCase):
     REC = {"symbol": "RLUSD", "price": 1.00007,
            "chainCirculating": {

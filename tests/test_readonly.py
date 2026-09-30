@@ -17,6 +17,7 @@ import tempfile
 from argparse import Namespace
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 
@@ -134,15 +135,17 @@ check("existing config: key stays absent (grandfathered)",
 # ---------- ceremony commands ----------
 
 fresh_state()  # read-only (no config)
-out, code = run_cmd(T.cmd_live, Namespace(confirm="please"))
+with patch("builtins.input", return_value="please"):
+    out, code = run_cmd(T.cmd_live, Namespace())
 check("live with wrong phrase: refused",
       "did not match" in out and C.is_read_only() is True)
 
-out, code = run_cmd(T.cmd_live, Namespace(confirm="go live"))
+with patch("builtins.input", return_value="go live"):
+    out, code = run_cmd(T.cmd_live, Namespace())
 check("live with 'go live': enabled",
       "Live. Signing is now enabled." in out and C.is_read_only() is False)
 
-out, code = run_cmd(T.cmd_live, Namespace(confirm=None))
+out, code = run_cmd(T.cmd_live, Namespace())
 check("live when already live: no-op message",
       "already enabled" in out and C.is_read_only() is False)
 
@@ -157,7 +160,8 @@ check("read-only when already read-only: no-op message",
 # live then read-only round-trip preserves the rest of the config
 fresh_state()
 write_cfg({"address": "rABC", "network": "testnet"})
-run_cmd(T.cmd_live, Namespace(confirm="go live"))
+with patch("builtins.input", return_value="go live"):
+    run_cmd(T.cmd_live, Namespace())
 run_cmd(T.cmd_read_only, Namespace())
 cfg = json.loads(C.CONFIG_PATH.read_text())
 check("ceremony round-trip preserves other keys",
@@ -171,6 +175,8 @@ for name, path in [("xrpl-trade", BIN / "xrpl-trade"),
     src = Path(path).read_text()
     check(f"{name}: no XRPL_READ_ONLY env bypass", "XRPL_READ_ONLY" not in src)
     check(f"{name}: no --no-read-only flag", "--no-read-only" not in src)
+check("xrpl-trade: no --confirm flag on live (typed ceremony cannot be skipped via CLI)",
+      "--confirm" not in (BIN / "xrpl-trade").read_text())
 
 sign_src = (BIN / "xrpl-sign").read_text()
 check("xrpl-sign: no --read-only CLI flag",

@@ -102,21 +102,15 @@ cross-check line. Illiquid pairs get a volume-staleness label.
 
 ## Tier 2 (building 2026-09-30)
 
-### 5. xrpscan API — fallback cross-checks (NON-COMMERCIAL LICENSE)
+### 5. xrpscan API — REMOVED 2026-09-30 (licensing)
 
-- Base `https://api.xrpscan.com/api/v1`, keyless, 10k/day free, AI-native
-  docs (`docs.xrpscan.com`, llms.txt + .md pages).
-- **LICENSE: CC BY-NC-SA 4.0 — non-commercial.** Every xrpscan line
-  carries "(per api.xrpscan.com — CC BY-NC-SA 4.0, non-commercial)".
-- Verified 2026-09-30: `GET /validators` → 200 array of
-  `{master_key, chain, domain, ephemeral_key, ...}`;
-  `GET /validator/registry` → literal `"Error"` (do NOT use);
-  `GET /amendments` → 113 entries `{amendment_id, enabled, majority
-  (ledger), name, supported, introduced, count, threshold, validations}`.
-  No `/health` endpoint (404).
-- Wiring: one-line cross-checks — `format_validators` gains "xrpscan
-  sees N validators (agrees/disagrees)"; `format_amendments` gains
-  "xrpscan: M in voting". Silent on failure. Never primary.
+- The xrpscan cross-check lines (`format_validators` / `format_amendments`
+  one-liners) were stripped before the v0.12.0 release: xrpscan data is
+  CC BY-NC-SA 4.0 non-commercial and the call was made not to ship it.
+- Notes from the 2026-09-30 evaluation, kept for reference:
+  base `https://api.xrpscan.com/api/v1`, keyless; `GET /validators` → 200
+  array; `GET /validator/registry` → literal `"Error"` (do NOT use);
+  `GET /amendments` → 113 entries. No `/health` endpoint (404).
 
 ### 6. DefiLlama — stablecoin reads
 

@@ -34,9 +34,6 @@ RPC_SERVERS = [
 XRPLMETA_BASE = "https://s1.xrplmeta.org"
 ONTHEDEX_BASE = "https://api.onthedex.live/public/v1"
 
-XRPSCAN_BASE = "https://api.xrpscan.com/api/v1"
-XRPSCAN_NOTE = "(per api.xrpscan.com — CC BY-NC-SA 4.0, non-commercial)"
-
 DEFILLAMA_STABLE = "https://stablecoins.llama.fi"
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
@@ -183,10 +180,6 @@ def format_validators():
     else:
         lines.append("  ⚠️  all validator-list sources unreachable — "
                      "try again later.")
-    xline = format_xrpscan_validator_line(
-        {r["publisher"]: r["count"] for r in recs if r["ok"]})
-    if xline:
-        lines.append(xline)
     lines.append("  per signed validator-list files (vl.ripple.com, "
                  "unl.xrplf.org); the `validators` RPC is admin-only on "
                  "public servers.")
@@ -258,13 +251,10 @@ def format_amendments():
             name = next((f["name"] for i, f in feats.items() if i == aid),
                         aid[:12] + "…")
             lines.append(f"    · {name}: {m.get('count')}/35 "
-                         f"since ledger {m.get('since_ledger', m.get('sinceLedger', '?'))}")
+                         f"since ledger {m.get('since_ledger', m.get('sinceLedger', m.get('since-ledger', '?')))}")
     if blocked:
         lines.append("  🚨 AMENDMENT-BLOCKED RISK on this server: "
                      + ", ".join(blocked))
-    xline = format_xrpscan_amendment_line(voting)
-    if xline:
-        lines.append(xline)
     if rep["ledger"]:
         lines.append(f"  ledger {rep['ledger']}; 80% supermajority held "
                      "2 weeks activates an amendment.")
@@ -358,61 +348,6 @@ def format_onthedex_note():
     n = len(tick) if isinstance(tick, dict) else 0
     return (f"  OnTheDEX cross-check: live ({n} tickers) — "
             "per api.onthedex.live")
-
-
-# ---------------------------------------------------------------- xrpscan (fallback)
-
-def xrpscan_validators_count():
-    """Validator count per xrpscan. Returns int or None. Never raises."""
-    try:
-        data = _http_get_json(f"{XRPSCAN_BASE}/validators",
-                              timeout=15, retries=2)
-        return len(data) if isinstance(data, list) else None
-    except Exception:  # noqa: BLE001 — fallback is optional
-        return None
-
-
-def xrpscan_amendments_voting():
-    """Amendment names in voting per xrpscan. Returns list or None."""
-    try:
-        data = _http_get_json(f"{XRPSCAN_BASE}/amendments",
-                              timeout=15, retries=2)
-        if not isinstance(data, list):
-            return None
-        return sorted(a.get("name", "?") for a in data
-                      if isinstance(a, dict)
-                      and a.get("supported") and not a.get("enabled"))
-    except Exception:  # noqa: BLE001 — fallback is optional
-        return None
-
-
-def format_xrpscan_validator_line(our_counts):
-    """Cross-check line for format_validators. our_counts: {pub: count}."""
-    n = xrpscan_validators_count()
-    if n is None:
-        return None
-    agree = any(c == n for c in our_counts.values()) if our_counts else False
-    # xrpscan tracks every validator it sees on the network; the signed
-    # lists are the UNL roster — a higher xrpscan count is expected.
-    verdict = ("agrees with signed lists" if agree
-               else "network-wide registry (signed lists are the UNL roster)")
-    return (f"  xrpscan cross-check: tracks {n} validators — {verdict} "
-            f"{XRPSCAN_NOTE}")
-
-
-def format_xrpscan_amendment_line(our_voting):
-    """Cross-check line for format_amendments. our_voting: [names]."""
-    names = xrpscan_amendments_voting()
-    if names is None:
-        return None
-    ours, theirs = set(our_voting or []), set(names)
-    if ours == theirs:
-        verdict = "agrees"
-    else:
-        diff = sorted((ours ^ theirs))[:4]
-        verdict = f"differs on: {', '.join(diff)}"
-    return (f"  xrpscan cross-check: {len(names)} in voting ({verdict}) "
-            f"{XRPSCAN_NOTE}")
 
 
 # ---------------------------------------------------------------- DefiLlama

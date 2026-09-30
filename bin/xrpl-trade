@@ -3212,13 +3212,14 @@ def cmd_live(args):
     print("transactions, bound by your policy limits.")
     print("This changes local config only. It never touches keys.")
     print("=" * 60)
-    phrase = args.confirm
-    if phrase is None:
-        try:
-            phrase = input("Type 'go live' to enable signing: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled — staying read-only.")
-            return
+    # The phrase must always be typed at an interactive prompt. There is
+    # deliberately no CLI flag or env var to skip this: a non-interactive
+    # bypass would let any shell process silently enable signing.
+    try:
+        phrase = input("Type 'go live' to enable signing: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled — staying read-only.")
+        return
     if phrase != "go live":
         print("Phrase did not match — staying read-only.")
         return
@@ -3317,9 +3318,8 @@ def main():
     p = sub.add_parser("live",
                        help="leave read-only mode: enable signing via an "
                             "explicit typed ceremony")
-    p.add_argument("--confirm", default=None,
-                   help="type 'go live' here to skip the interactive prompt "
-                        "(still prints the full ceremony text)")
+    # NOTE: no CLI flag to pre-supply the phrase, on purpose. Skipping the
+    # interactive prompt would let any shell process silently enable signing.
     sub.add_parser("read-only",
                    help="enter read-only mode: proposals and reads only, "
                         "signing refused")
