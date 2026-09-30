@@ -539,6 +539,36 @@ def cmd_links(args, cfg, client):
         print(ln)
 
 
+def cmd_flow(args, cfg, client):
+    if xrpl_forensics is None:
+        sys.exit("xrpl_forensics module unavailable")
+    if not C.is_valid_classic_address(args.address):
+        sys.exit("not a valid XRPL classic address")
+    for ln in xrpl_forensics.format_flow(
+            args.address, window=args.window,
+            use_cache=not args.no_cache):
+        print(ln)
+
+
+def cmd_nft_trail(args, cfg, client):
+    if xrpl_forensics is None:
+        sys.exit("xrpl_forensics module unavailable")
+    for ln in xrpl_forensics.format_nft_trail(
+            args.token_id, use_cache=not args.no_cache):
+        print(ln)
+
+
+def cmd_token_trail(args, cfg, client):
+    if xrpl_forensics is None:
+        sys.exit("xrpl_forensics module unavailable")
+    if not C.is_valid_classic_address(args.issuer):
+        sys.exit("not a valid issuer address")
+    for ln in xrpl_forensics.format_token_trail(
+            args.issuer, args.currency, window=args.window,
+            use_cache=not args.no_cache):
+        print(ln)
+
+
 def nft_safety_lines(args, nft_id, ask_xrp):
     """Advisory xrpl.to NFT safety for a buy/bid proposal.
 
@@ -3374,9 +3404,22 @@ def main():
     p.add_argument("address")
     p.add_argument("--depth", type=int, default=2)
     p.add_argument("--no-cache", action="store_true")
-    p = sub.add_parser("links", help="shared counterparties, issuers and control overlap between two accounts (read-only)")
+    p = sub.add_parser("links", help="shared counterparties, issuers, tokens and control overlap between two accounts (read-only)")
     p.add_argument("address_a")
     p.add_argument("address_b")
+    p.add_argument("--window", type=int, default=200)
+    p.add_argument("--no-cache", action="store_true")
+    p = sub.add_parser("flow", help="top counterparties by volume in/out over a recent window (read-only)")
+    p.add_argument("address")
+    p.add_argument("--window", type=int, default=200)
+    p.add_argument("--no-cache", action="store_true")
+    p = sub.add_parser("nft-trail", help="NFT provenance: mint -> transfers/sales -> current holder (read-only)")
+    p.add_argument("token_id")
+    p.add_argument("--no-cache", action="store_true")
+    p = sub.add_parser("token-trail", help="token lens: issuer profile, holder spread, recent flow (read-only)")
+    p.add_argument("--issuer", required=True)
+    p.add_argument("--currency", required=True,
+                   help="3-letter code (USD), short name (RLUSD), or 40-char ledger hex")
     p.add_argument("--window", type=int, default=200)
     p.add_argument("--no-cache", action="store_true")
     p = sub.add_parser("plan-trade", help="estimate fill, impact, max spend (read-only)")
@@ -3789,6 +3832,9 @@ def main():
         "oracle": lambda: cmd_oracle(args, cfg, client),
         "trace": lambda: cmd_trace(args, cfg, client),
         "links": lambda: cmd_links(args, cfg, client),
+        "flow": lambda: cmd_flow(args, cfg, client),
+        "nft-trail": lambda: cmd_nft_trail(args, cfg, client),
+        "token-trail": lambda: cmd_token_trail(args, cfg, client),
         "plan-trade": lambda: cmd_plan_trade(args, cfg, client),
         "reconcile": lambda: cmd_reconcile(args, cfg, client),
         "buy": lambda: cmd_buy(args, cfg, client),

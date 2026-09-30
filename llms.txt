@@ -44,6 +44,9 @@ xrpl-trade oracle XRP USD     # on-ledger XLS-47 prices (Band + DIA)
 xrpl-trade token-safety --help
 xrpl-trade trace rABC... [--depth 2]         # funding-origin chain
 xrpl-trade links rABC... rDEF... [--window 200]  # shared counterparties
+xrpl-trade flow rABC... [--window 200]          # top counterparties by volume
+xrpl-trade nft-trail 00081F...                  # NFT mint -> sale provenance
+xrpl-trade token-trail --issuer r... --currency USD  # issuer + holders + issuer-involved movers
 xrpl-trade <command> --help   # every command documents itself
 ```
 

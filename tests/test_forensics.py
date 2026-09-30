@@ -50,7 +50,16 @@ def pay_tx(sender, dest, drops="25000000", ledger=100, h="H" * 16):
 
 
 def tx_page(txs):
-    return {"transactions": [{"tx": t, "validated": True} for t in txs]}
+    """Live response shape: `meta` is a SIBLING of `tx`, not inside it."""
+    pages = []
+    for t in txs:
+        t = dict(t)
+        meta = t.pop("meta", None)
+        entry = {"tx": t, "validated": True}
+        if isinstance(meta, dict):
+            entry["meta"] = meta
+        pages.append(entry)
+    return {"transactions": pages}
 
 
 class ExtractTest(unittest.TestCase):
@@ -200,6 +209,18 @@ class TraceTest(unittest.TestCase):
             lines = fx.format_trace(A, use_cache=False)  # must not raise
         self.assertIn("unavailable", "\n".join(lines))
 
+    def test_labeled_hop_renders_label(self):
+        with mock.patch.object(fx, "_rpc", make_rpc(self.first)):
+            with mock.patch.object(
+                    fx, "label_of",
+                    side_effect=lambda a: {"label": "Faucet",
+                                           "verification": "verified"}
+                    if a == FUNDER1 else None):
+                lines = fx.format_trace(A, depth=2, use_cache=False)
+        text = "\n".join(lines)
+        self.assertIn(f'LABEL: {FUNDER1} — "Faucet" (verified)', text)
+        self.assertIn("usually plumbing", text)
+
     def test_owner_never_appears(self):
         with mock.patch.object(fx, "_rpc", make_rpc(self.first)):
             lines = fx.format_trace(A, depth=2, use_cache=False)
@@ -238,7 +259,7 @@ class LinksTest(unittest.TestCase):
         with mock.patch.object(fx, "_rpc", self.fake):
             lines = fx.format_links(A, B, window=200, use_cache=False)
         text = "\n".join(lines)
-        self.assertIn(f"LINK: {C} — A: 1 txs, B: 1 txs", text)
+        self.assertIn(f"LINK: {C} — A: 1 tx, B: 1 tx", text)
         self.assertIn(f"LINK: {ISSUER}", text)
         self.assertIn(f"LINK: same RegularKey {REGKEY}", text)
         self.assertIn("exchange hot wallet", text)  # caveat present

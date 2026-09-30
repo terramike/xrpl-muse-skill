@@ -857,11 +857,28 @@ Reading (no seed, no proposals):
   cache, fail-open. Output discipline: `LINK:` = on-ledger fact,
   `NOTE:` = caveat; never claims ownership.
 - `links <addressA> <addressB> [--window N]` — shared counterparties,
-  shared trustline issuers, and control overlap (same RegularKey, shared
+  shared trustline issuers, shared tokens (with issuer transfer-fee /
+  freeze flags), and control overlap (same RegularKey, shared
   signer-list members) from the N most recent validated txs per account
   (default 200, max 500). Exchange hot wallets can appear as shared
-  counterparties — printed as links with a loud caveat, never as proof
-  of common control. See `references/forensic-mode.md`.
+  counterparties — the known-address label registry (`LABEL:` lines,
+  `references/known-labels.json` + your `~/.xrpl/labels.local.json`
+  overrides) marks them, and every command reminds you that links
+  through service wallets are usually plumbing, never proof of common
+  control. See `references/forensic-mode.md`.
+- `flow <address> [--window N]` — top counterparties by volume in/out
+  over the recent window (default 200, max 500): delivered amounts for
+  Payments, executed fills attributed to makers for DEX trades. Ranked
+  by XRP volume; wash-tradable, so it's discovery, not proof.
+- `nft-trail <token-id>` — NFT provenance: mint → offers →
+  transfers/sales → currently held by (via `nft_history`, with a
+  bounded issuer-scan fallback). On-ledger chain only.
+- `token-trail --issuer r… --currency CODE [--window N]` — issuer
+  profile (domain, transfer fee, freeze flags), top holders from a
+  bounded — explicitly partial — trustline scan, and top movers by
+  token volume in the window (issuer-involved flow only — issuance,
+  redemption, rippling through the issuer; ordinary holder-to-holder
+  transfers are invisible to this scan).
 - `nft-inventory [r…]` — every NFT owned by an account (read-only);
   accepts a favorite name too (`nft-inventory lara`)
 - `favorites add|remove|list|rename` — named watchlist of artist wallets
