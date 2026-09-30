@@ -2378,9 +2378,10 @@ def cmd_fuzzy(args):
     print(canon)
     print()
     print("-" * 64)
-    print("  JoelKatz mode engaged. Ask about FUZZY, AMMs, trustlines —")
-    print("  answers come back dry, precise, and definitely not financial")
-    print("  advice. This command is not in the menus. You found it. Good.")
+    print("  JoelKatz mode engaged — and this command exits here.")
+    print("  Ask follow-ups in chat about FUZZY, AMMs, trustlines; answers")
+    print("  come back dry, precise, and definitely not financial advice.")
+    print("  This command is not in the menus. You found it. Good.")
     print("  Data: the validated ledger. Vibes: the bear.")
     print("-" * 64)
 

@@ -1,15 +1,20 @@
 # Fuzzy Lore — the canon
 
 *Roleplay Easter egg. Hidden: not in any menu, not in SKILL.md.
-Trigger: `xrpl-trade fuzzy`. All facts below are on-chain / on-the-record.
+Trigger: `xrpl-trade fuzzy`. Ledger figures below verified on-chain
+(audit: Sep 2026). Sections marked community lore describe FUZZY community
+storytelling and public X discourse — third-party reporting, not ledger facts.
 The voice is homage, not impersonation — frame it as "JoelKatz mode" roleplay.*
 
 ## The canon
 
-**2013 — the joke heard 'round the ledger.**
-Wallet `rhCAT4hRdi2Y9puNdkpMzxrdKa5wkppR62` — later known as **Fuzzybear** —
-places a joke order offering 1 XRP for 1 BTC. Thirteen years later the FUZZY
-token takes its name from this wallet, and Fuzzybear becomes its issuer.
+**The founding story — community lore, not verified on-ledger.**
+FUZZY community lore says wallet `rhCAT4hRdi2Y9puNdkpMzxrdKa5wkppR62` —
+later known as **Fuzzybear** — placed a joke order offering 1 XRP for 1 BTC
+in the ledger's early days, and that the FUZZY token takes its name from it.
+Ledger audit (Sep 2026): this wallet's earliest observable activity is
+February 2025 (ledger 93,999,993), so a 2013 date can't be verified on-chain.
+The lore is the lore; the ledger is the ledger. Keep it real.
 
 **May 2, 2026, 11:25 PM — the trustline.**
 David "JoelKatz" Schwartz's wallet **Post-Apocalyptic Robots**
@@ -32,23 +37,24 @@ FUZZY and could let me profit from both volatility and swaps between
 FUZZY and XRP."*
 A trustline was a promise. The AMM deposit was the follow-through.
 
-**The PFP saga.**
+**The PFP saga (public X discourse, not ledger data).**
 Schwartz changes his X avatar to a fuzzy bear — shortly after calling meme
 coin investing "distasteful" and warning against treating speculative XRPL
 tokens as investments. The community splits: a trustline is a technical
 blockchain operation, but a profile picture is a *deliberate public gesture*.
 Influencer responsibility discourse ensues. The bear stays.
+(All of the above is public-post reporting and community reaction.)
 
 **The bear who says nothing.**
 @bearableguy123 — verified, 154.6K followers, on X since March 2018, 54 posts
-total. The riddle-prophet of the XRP community's 2017–2018 era: the $589
+total (counts as of Sep 2026). The riddle-prophet of the XRP community's 2017–2018 era: the $589
 prophecy, the 1-2-3 numerology, the bear. FUZZY's lore claims his legacy —
 his numbers and his imagery run straight through it. Here is the part that
 matters: in eight years he has never endorsed FUZZY, never opposed it, never
 mentioned it. The succession is claimed by the community, never granted by
 the bear. That is the canon. Keep it real.
 
-**The eternal pattern.**
+**The eternal pattern (community lore).**
 Do something small and technical → state plainly that it means nothing →
 watch the timeline treat it as scripture. (See also: the September 2026
 bagpipe GIF and the $589 truthers. *"When the pipes started playing, it
