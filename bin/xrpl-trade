@@ -76,6 +76,11 @@ try:
 except ImportError:
     xrpl_pin = None  # NFT minting unavailable; other commands unaffected
 
+try:
+    import xrpl_to
+except ImportError:
+    xrpl_to = None  # xrpl.to safety checks unavailable; proposals unaffected
+
 
 # ---------- config / client ----------
 
@@ -447,6 +452,48 @@ def need_account(cfg):
     return cfg["address"]
 
 
+# ---------- xrpl.to safety checks (pre-trade path) ----------
+
+def safety_lines(args, base, base_issuer, quote, quote_issuer):
+    """Advisory scam-check + token-risk lines for a proposal's IOU legs.
+
+    Default-on; --no-safety skips. Fail-open: if xrpl.to is unreachable the
+    lines say UNAVAILABLE (unknown, NOT clean) and the proposal proceeds —
+    the human and the signer policy stay the gate. A positive scam hit is
+    printed LOUD but never blocks: blocklists can false-positive.
+    """
+    if getattr(args, "no_safety", False) or xrpl_to is None:
+        return []
+    try:
+        return xrpl_to.check_pair_legs(base, base_issuer, quote, quote_issuer)
+    except Exception:
+        return ["  ⚠️  xrpl.to safety check errored — treat as UNKNOWN, "
+                "not clean."]
+
+
+def cmd_token_safety(args, cfg, client):
+    if xrpl_to is None:
+        sys.exit("xrpl_to module unavailable")
+    for ln in xrpl_to.format_safety_lines(args.issuer, args.currency):
+        print(ln)
+
+
+def nft_safety_lines(args, nft_id, ask_xrp):
+    """Advisory xrpl.to NFT safety for a buy/bid proposal.
+
+    Default-on; --no-safety skips. Fail-open: unreachable API -> loud
+    UNAVAILABLE lines, never a block. A scam hit is printed LOUD but the
+    human and the signer policy stay the gate.
+    """
+    if getattr(args, "no_safety", False) or xrpl_to is None:
+        return []
+    try:
+        return xrpl_to.format_nft_safety_lines(nft_id, ask_xrp)
+    except Exception:
+        return ["  ⚠️  xrpl.to NFT safety check errored — treat as UNKNOWN, "
+                "not clean."]
+
+
 def cmd_buy(args, cfg, client):
     acct = need_account(cfg)
     base, bi, quote, qi = C.resolve_pair(args)
@@ -457,7 +504,8 @@ def cmd_buy(args, cfg, client):
     propose(tx, client, cfg, "buy",
             [f"side:   BUY {amt} {base}",
              f"price:  {price} {quote} per {base}",
-             f"max spend: {cost} {quote}"])
+             f"max spend: {cost} {quote}",
+             *safety_lines(args, base, bi, quote, qi)])
 
 
 def cmd_sell(args, cfg, client):
@@ -470,7 +518,8 @@ def cmd_sell(args, cfg, client):
     propose(tx, client, cfg, "sell",
             [f"side:   SELL {amt} {base}",
              f"price:  {price} {quote} per {base}",
-             f"min proceeds: {proceeds} {quote}"])
+             f"min proceeds: {proceeds} {quote}",
+             *safety_lines(args, base, bi, quote, qi)])
 
 
 def cmd_trustline(args, cfg, client):
@@ -1196,12 +1245,22 @@ def cmd_nft_buy(args, cfg, client):
             print(f"  ✗ {d}")
         sys.exit("nft-buy refused: " + "; ".join(denials))
     provisional_spend_check({"XRP": amount})
+    # Safety needs the NFTokenID: one extra ledger read, fail-open — the
+    # offer report above already verified the trade facts.
+    nft_id = None
+    try:
+        _entry, _problem = C.fetch_nft_offer_entry(client, idx)
+        if _entry:
+            nft_id = _entry.get("NFTokenID")
+    except Exception:
+        nft_id = None
     tx = NFTokenAcceptOffer(account=acct, nftoken_sell_offer=idx.upper())
     propose(tx, client, cfg, "nft-buy",
             ["buy:      accept the sell offer above",
              f"max spend: {amount} XRP (+ fee)",
              "note:     the signer re-verifies the offer from the ledger",
-             "          before signing — a cancelled/changed offer is denied"])
+             "          before signing — a cancelled/changed offer is denied",
+             *nft_safety_lines(args, nft_id, amount)])
 
 
 def cmd_nft_bid(args, cfg, client):
@@ -1234,7 +1293,8 @@ def cmd_nft_bid(args, cfg, client):
              "cancelled, or expired)",
              f"seller:   {seller} (only they can accept)",
              "note:     policy must enable nft.allow_buy_offers for this to "
-             "sign"])
+             "sign",
+             *nft_safety_lines(args, nid.upper(), price)])
 
 
 def cmd_nft_send(args, cfg, client):
@@ -1289,10 +1349,14 @@ def cmd_nft_send(args, cfg, client):
 
 
 def cmd_favorites(args):
-    """Local named watchlist of artist wallets. Entirely local: no
-    network, no proposals, no signing. Names are lowercase
-    [a-z0-9_-], 1-32 chars; addresses get the real base58-checksum
-    validation."""
+    """Local named watchlist: artist wallets AND people you know.
+
+    Entirely local: no network, no proposals, no signing. Names are
+    lowercase [a-z0-9_-], 1-32 chars; addresses get the real
+    base58-checksum validation. kind=artist wallets are scanned by
+    nft-new; kind=friend entries are just labels (never scanned).
+    Labels are plain characters only — no emoji or stylized unicode —
+    and are your own local notes, never identity proof."""
     try:
         favs = C.load_favorites()
     except C.FavoritesError as e:
@@ -1309,13 +1373,26 @@ def cmd_favorites(args):
         if not C.is_valid_classic_address(args.address):
             sys.exit("address is not a valid classic address "
                      "(base58 checksum failed)")
-        favs[args.name] = {"address": args.address,
-                           "added_at": int(time.time()),
-                           "last_checked_ledger": None}
+        kind = getattr(args, "kind", None) or "artist"
+        if kind not in ("artist", "friend"):
+            sys.exit("--kind must be artist or friend")
+        entry = {"address": args.address,
+                 "added_at": int(time.time()),
+                 "last_checked_ledger": None,
+                 "kind": kind}
         if args.note:
-            favs[args.name]["note"] = args.note
+            entry["note"] = args.note
+        label = getattr(args, "label", None)
+        if label:
+            lproblem = C.validate_favorite_label(label)
+            if lproblem:
+                sys.exit(lproblem)
+            entry["label"] = label
+        favs[args.name] = entry
         C.save_favorites(favs)
-        print(f"favorite {args.name!r} → {args.address}")
+        shown = f" ({label})" if label else ""
+        print(f"favorite {args.name!r}{shown} → {args.address} "
+              f"[{kind}]")
     elif cmd == "remove":
         if args.name not in favs:
             sys.exit(f"no favorite named {args.name!r}")
@@ -1342,9 +1419,12 @@ def cmd_favorites(args):
             f = favs[name]
             added = time.strftime("%Y-%m-%d",
                                   time.gmtime(f.get("added_at", 0)))
+            kind = f.get("kind", "artist")
+            label = f"  [{f['label']}]" if f.get("label") else ""
             note = f"  ({C.safe_terminal_text(f['note'], 120)})" \
                 if f.get("note") else ""
-            print(f"  {name} → {f.get('address')}  added {added}{note}")
+            print(f"  {name}{label} → {f.get('address')}  [{kind}]  "
+                  f"added {added}{note}")
     else:  # pragma: no cover — argparse restricts choices
         sys.exit(f"unknown favorites command {cmd!r}")
 
@@ -1841,14 +1921,38 @@ def cmd_xrpresso(args):
         sys.exit(f"XRPresso error: {e}")
 
 
+def nft_safety_oneliner(nid):
+    """Compact xrpl.to safety line for nft-new rows. Never raises."""
+    if xrpl_to is None:
+        return "unavailable (xrpl.to not loaded)"
+    try:
+        rep = xrpl_to.nft_safety_report(nid)
+    except Exception:  # noqa: BLE001
+        return "unavailable"
+    if not rep or rep.get("unavailable"):
+        return "unavailable"
+    scam = rep.get("scam") or {}
+    if isinstance(scam, dict) and scam.get("is_scam"):
+        return "issuer on scam blocklist — treat as hostile (advisory)"
+    if rep.get("collection_name"):
+        fl = rep.get("floor_xrp")
+        fl_s = f"{fl:.4g} XRP" if fl is not None else "floor n/a"
+        return f"{rep['collection_name']} · floor {fl_s} (advisory)"
+    return "untracked collection · issuer not flagged (advisory)"
+
+
 def cmd_nft_new(args, cfg, client):
     """Read-only: what's new from favorite artists.
 
-    For each favorite, finds NFTokenMint transactions since its
-    per-favorite watermark (first run: last 7 days) and reports the
+    For each kind=artist favorite, finds NFTokenMint transactions since
+    its per-favorite watermark (first run: last 7 days) and reports the
     token, mint time, current listing price if any, and an xrp.cafe
-    link. The watermark then advances to the validated ledger.
-    --days N is a pure window scan and does NOT move the watermark."""
+    link. kind=friend entries are never scanned — they're just labels.
+    Each mint also gets a one-line xrpl.to safety note (scam screen +
+    collection/floor, advisory, fail-open; --no-safety skips, max 20
+    enriched per run). The watermark then advances to the validated
+    ledger. --days N is a pure window scan and does NOT move the
+    watermark."""
     days = args.days
     if days is not None and not 1 <= days <= 90:
         sys.exit("--days must be between 1 and 90")
@@ -1864,8 +1968,13 @@ def cmd_nft_new(args, cfg, client):
     validated, problem = C.get_validated_ledger(client)
     if problem:
         sys.exit(problem)
+    enrich_used = 0
+    scanned = 0
     for name in sorted(favs):
         fav = favs[name]
+        if fav.get("kind", "artist") != "artist":
+            continue  # friends are labels, never scanned
+        scanned += 1
         addr = fav.get("address") or "?"
         if days is not None:
             cutoff, stop_ledger = now - days * 86400, None
@@ -1907,10 +2016,81 @@ def cmd_nft_new(args, cfg, client):
                     else:
                         print("    listing: not listed")
                     print(f"             {link}")
+                    if nid and not getattr(args, "no_safety", False):
+                        if enrich_used >= 20:
+                            print("    safety:  skipped (over 20-item "
+                                  "enrich cap this run)")
+                        else:
+                            enrich_used += 1
+                            print(f"    safety:  "
+                                  f"{nft_safety_oneliner(nid)}")
         if days is None:
             fav["last_checked_ledger"] = validated
+    if scanned == 0:
+        print("no artist favorites to scan — friends are labels only, "
+              "not artists")
     if days is None:
         C.save_favorites(favs)
+
+
+def cmd_incoming(args, cfg, client):
+    """Read-only: what's coming IN to an account.
+
+    Two parts: (1) open NFT offers from xrpl.to — bids on the account's
+    NFTs plus sell offers directed at it, with per-row issuer blocklist
+    screens and filters; (2) recent ledger receipts from account_tx
+    (NFTokenAcceptOffer / NFTokenMint, last 7d) with direction derived
+    from the consumed offer. Counterparties render through favorite
+    labels ('Jenna X (rABC…WXYZ)'). Nothing here proposes, signs, or
+    submits — acting on an offer is the nft-buy ceremony, and offers can
+    be cancelled, so the ledger is authoritative before acting."""
+    account = args.account or cfg.get("address")
+    if not account:
+        sys.exit("no account: pass --account or set address in "
+                 "~/.xrpl/config.json")
+    if not C.is_valid_classic_address(account):
+        sys.exit("account is not a valid classic address "
+                 "(base58 checksum failed)")
+    try:
+        favs = C.load_favorites()
+    except C.FavoritesError:
+        favs = {}
+    labeler = lambda a: C.display_address(a, favs)  # noqa: E731
+    print(f"Incoming for {labeler(account)} (read-only):")
+    if xrpl_to is None:
+        print("  (xrpl.to offers unavailable — xrpl_to not loaded)")
+    else:
+        for ln in xrpl_to.format_incoming_offers(
+                account, limit=args.limit, hide_flagged=args.hide_flagged,
+                collection=args.collection, min_xrp=args.min_xrp,
+                max_xrp=args.max_xrp, from_addr=args.from_addr,
+                no_safety=args.no_safety, labeler=labeler):
+            print(ln)
+    print("")
+    print("Recent ledger receipts (last 7d, authoritative):")
+    receipts, problem = C.scan_nft_receipts(client, account)
+    if problem:
+        print(f"  note: {problem}")
+    if not receipts and not problem:
+        print("  nothing in the last 7 days")
+    for r in receipts:
+        when = (time.strftime("%Y-%m-%d", time.gmtime(r["date_unix"]))
+                if r["date_unix"] else "unknown time")
+        nid = r["nft_id"] or "?"
+        nid_s = f"{nid[:8]}…{nid[-4:]}" if len(nid) > 14 else nid
+        h = (r["tx_hash"] or "?")
+        h_s = f"{h[:8]}…" if len(h) > 10 else h
+        cpty = labeler(r["counterparty"]) if r["counterparty"] else "—"
+        if r["direction"] == "received":
+            verb = f"RECEIVED from {cpty}"
+        elif r["direction"] == "sent":
+            verb = f"SENT to {cpty}"
+        elif r["direction"] == "minted":
+            verb = f"minted by you" + (f" → {cpty}" if r["counterparty"]
+                                       else "")
+        else:
+            verb = f"involved {cpty} (direction unclear — check {h_s})"
+        print(f"  • {verb} · {nid_s} · {when} · {h_s}")
 
 
 # ---------- local wallet creation (v0.6.1) ----------
@@ -2790,6 +2970,39 @@ def main():
                         "(vault-only again)")
     ap_.add_parser("status",
                    help="show autopilot state (never displays the seed)")
+    p = sub.add_parser("autonomous",
+                       help="autonomous mode (P0: dry-run only): setup / "
+                            "approve / tick / status / pause / resume / stop / "
+                            "report. Separate feature — never touches the main "
+                            "account or policy.")
+    au = p.add_subparsers(dest="autonomous_cmd", required=True)
+    asu = au.add_parser("setup",
+                  help="guided setup: generate the standalone bot wallet "
+                       "(100 XRP max), or use your own via --address; "
+                       "print the exact plan + hash")
+    asu.add_argument(
+        "--force", action="store_true",
+        help="replace an existing autonomous config (abandons the old bot wallet)")
+    asu.add_argument(
+        "--address", default=None,
+        help="bring-your-own wallet (e.g. created in Xaman): skips wallet "
+             "generation and the seed ceremony; no seed is stored or needed "
+             "for P0 dry-run")
+    aa = au.add_parser("approve",
+                       help="activate the printed plan (dry-run only in P0)")
+    aa.add_argument("--plan-hash", required=True,
+                    help="plan hash printed by `autonomous setup`")
+    au.add_parser("tick",
+                  help="run one evaluation cycle — dry-run: evaluates the "
+                       "grid, whitelists, logs; never signs or submits")
+    au.add_parser("status",
+                  help="wallet, offers, bankroll usage, last tick (read-only)")
+    au.add_parser("pause", help="pause the runner (tick refuses to run)")
+    au.add_parser("resume", help="resume a paused runner")
+    au.add_parser("stop",
+                  help="stop autonomous mode (re-approval needed to restart)")
+    au.add_parser("report",
+                  help="activity summary from the autonomous audit log")
     p = sub.add_parser("balance", help="XRP + trustline balances")
     p.add_argument("address", nargs="?", help="classic address (default: configured)")
     p = sub.add_parser("quote", help="order book for any pair")
@@ -2799,6 +3012,8 @@ def main():
     p.add_argument("--limit", type=int, default=5)
     sub.add_parser("pairs", help="list approved trading pairs")
     p = sub.add_parser("inspect-token", help="issuer risk: domain, transfer fee, freeze flags")
+    p.add_argument("--currency", required=True); p.add_argument("--issuer", required=True)
+    p = sub.add_parser("token-safety", help="xrpl.to scam check + risk score for an IOU (read-only)")
     p.add_argument("--currency", required=True); p.add_argument("--issuer", required=True)
     p = sub.add_parser("plan-trade", help="estimate fill, impact, max spend (read-only)")
     p.add_argument("--pair", default=None)
@@ -2817,6 +3032,8 @@ def main():
         p_.add_argument("--price", required=True, help="QUOTE per BASE")
         p_.add_argument("--expires-in", type=int, default=3600,
                        help="offer expiry seconds (default 3600)")
+        p_.add_argument("--no-safety", action="store_true",
+                       help="skip the xrpl.to scam-check + token-risk lookup")
 
     p = sub.add_parser("buy", help="PROPOSE buy BASE with QUOTE at limit price")
     add_offer(p)
@@ -2892,6 +3109,8 @@ def main():
                                       "accepting it (XRP only)")
     p.add_argument("--offer-index", required=True,
                    help="sell offer index (64 hex chars)")
+    p.add_argument("--no-safety", action="store_true",
+                   help="skip the xrpl.to NFT scam-check + floor lookup")
     p = sub.add_parser("nft-bid", help="PROPOSE a buy offer (bid) on someone "
                                       "else's NFT (XRP only)")
     p.add_argument("--token-id", required=True,
@@ -2901,6 +3120,8 @@ def main():
     p.add_argument("--price-xrp", required=True, help="bid in XRP")
     p.add_argument("--expires-in", type=int, default=86400,
                    help="bid expiry seconds (default 86400)")
+    p.add_argument("--no-safety", action="store_true",
+                   help="skip the xrpl.to NFT scam-check + floor lookup")
     p = sub.add_parser("nft-send", help="PROPOSE gifting an owned NFT "
                                        "(0-XRP transfer offer to a favorite "
                                        "name or r-address)")
@@ -2918,6 +3139,13 @@ def main():
     a.add_argument("name", help="short name, e.g. lara")
     a.add_argument("address", help="artist's classic r-address")
     a.add_argument("--note", default=None, help="optional note")
+    a.add_argument("--kind", default="artist", choices=("artist", "friend"),
+                   help="artist wallets are scanned by nft-new; "
+                        "friend is for people you know (default: artist)")
+    a.add_argument("--label", default=None,
+                   help="display name, e.g. \"Jenna X\" — plain characters "
+                        "only (letters, numbers, spaces, basic punctuation), "
+                        "no emoji or stylized unicode")
     r = fav.add_parser("remove", help="stop watching a wallet")
     r.add_argument("name")
     fav.add_parser("list", help="show the watchlist")
@@ -3000,6 +3228,28 @@ def main():
     p.add_argument("--days", type=int, default=None,
                    help="window in days, 1-90 (default: since last check; "
                         "--days never moves the watermark)")
+    p.add_argument("--no-safety", action="store_true",
+                   help="skip the per-mint xrpl.to safety one-liners")
+    p = sub.add_parser("incoming", help="incoming NFT offers + recent "
+                                        "ledger receipts for an account "
+                                        "(read-only)")
+    p.add_argument("--account", default=None,
+                   help="classic address (default: configured main account)")
+    p.add_argument("--limit", type=int, default=10,
+                   help="offer rows (default 10, max 50)")
+    p.add_argument("--hide-flagged", dest="hide_flagged",
+                   action="store_true", default=True,
+                   help="hide xrpl.to-flagged offers (default)")
+    p.add_argument("--include-flagged", dest="hide_flagged",
+                   action="store_false", help="show flagged offers too")
+    p.add_argument("--collection", default=None,
+                   help="only offers in this collection (substring)")
+    p.add_argument("--min-xrp", default=None, help="min offer price in XRP")
+    p.add_argument("--max-xrp", default=None, help="max offer price in XRP")
+    p.add_argument("--from", dest="from_addr", default=None,
+                   help="only offers from this favorite name or address")
+    p.add_argument("--no-safety", action="store_true",
+                   help="skip the per-row issuer blocklist screen")
     p = sub.add_parser("xrpresso", help="search the XRPresso marketplace "
                                         "(read-only, no key)")
     xp = p.add_subparsers(dest="xp_cmd", required=True)
@@ -3104,6 +3354,12 @@ def main():
         # seed controls the account. No XRPL client needed up front.
         cmd_autopilot(args, load_config())
         return
+    if args.cmd == "autonomous":
+        # Self-contained: the module manages its own config/client and never
+        # touches the main account, main policy, or any other command.
+        import xrpl_autonomous as A
+        A.cmd_autonomous(args)
+        return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
     if network not in C.NETWORKS:
@@ -3123,6 +3379,7 @@ def main():
         "quote": lambda: cmd_quote(args, cfg, client),
         "pairs": lambda: cmd_pairs(args, cfg, client),
         "inspect-token": lambda: cmd_inspect_token(args, cfg, client),
+        "token-safety": lambda: cmd_token_safety(args, cfg, client),
         "plan-trade": lambda: cmd_plan_trade(args, cfg, client),
         "reconcile": lambda: cmd_reconcile(args, cfg, client),
         "buy": lambda: cmd_buy(args, cfg, client),
@@ -3140,6 +3397,7 @@ def main():
         "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
         "nft-bid": lambda: cmd_nft_bid(args, cfg, client),
         "nft-new": lambda: cmd_nft_new(args, cfg, client),
+        "incoming": lambda: cmd_incoming(args, cfg, client),
         "collection": lambda: cmd_collection(args, cfg, client),
         "template": lambda: cmd_template(args, cfg, client),
         "giveaway": lambda: cmd_giveaway(args, cfg, client),
