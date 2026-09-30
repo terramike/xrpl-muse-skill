@@ -16,21 +16,27 @@ answer from here — never from a search result.
 
 ---
 
-## FUZZY (pilot — complete 2026-09-30)
+## FUZZY (pilot — audited 2026-09-30; audit log at end of file)
 
 ### Official
 
 - Website: https://fuzzyxrp.com — verified 2026-09-30, opened directly
-- Lore page: https://fuzzyxrp.com/learn-the-lore — ⚠️ referenced in research
-  2026-09-30, not yet opened directly
-- X (official): https://x.com/fuzzy_xrp — verified 2026-09-30, linked from
-  fuzzyxrp.com and the community lore repo
+- Lore page: https://fuzzyxrp.com/learn-the-lore — verified 2026-09-30,
+  opened directly (numbered lore entries, Fuzzybear wallet timeline)
+- X (official): https://x.com/fuzzy_xrp — ⚠️ profile not directly openable
+  from this environment (x.com fetch blocked at source, not a login wall);
+  second-best evidence: linked from the official site header and the
+  community lore repo, 2026-09-30
 - X (dev): https://x.com/fuzzy_dev_ — ⚠️ seen referenced 2026-09-30
-  (verify.cafe dossier), not yet opened directly
-- Telegram: linked from fuzzyxrp.com — ⚠️ exact URL not yet captured, do not
-  guess; re-read the official site
+  (verify.cafe dossier); profile not directly openable from this environment
+  (x.com fetch blocked at source)
+- Telegram: ⚠️ exact URL still not captured — the official site shows
+  "Join Fuzzybear Telegram" buttons pointing to t.me, but the extraction
+  did not expose the exact URL; re-read the official site, do not guess
 
-### People (verified via live X profile read, 2026-09-30)
+### People (⚠️ x.com fetch blocked by this environment's policy — facts below
+were read live 2026-09-30 via page reads outside the audit; they carry
+second-best evidence, not direct-open verification)
 
 - David "JoelKatz" Schwartz: https://x.com/joelkatz
 - bearableguy123: https://x.com/bearableguy123 — note: 154.6K followers,
@@ -51,8 +57,10 @@ answer from here — never from a search result.
 
 ### NFTs (official collections)
 
-- Fuzzy Bars: https://xrp.cafe/collection/fuzzy-bars — verified 2026-09-30
-  via search-result page (373.9K XRP volume, 551 holders)
+- Fuzzy Bars: https://xrp.cafe/collection/fuzzy-bars — URL verified real by
+  direct open 2026-09-30; ⚠️ collection stats unverified (direct open showed
+  an empty page: 0.0 XRP floor/volume — the "373.9K XRP volume / 551 holders"
+  figures came from a search snippet and could not be confirmed)
 
 ### Community (NOT official — always label as such)
 
@@ -68,45 +76,98 @@ opening the official site, never by guessing.
 
 ### Core
 
-- XRPL.org (docs): https://xrpl.org — ⚠️ referenced in skill memory
-  (xrpl.org/develop); open before trusting
+- XRPL.org (docs): https://xrpl.org — ✅ opened directly 2026-09-30
 - This skill (share repo): https://github.com/terramike/xrpl-muse-skill — ✅
   in SKILL.md
 
 ### Marketplaces & data
 
-- xrp.cafe: https://xrp.cafe — ✅ in SKILL.md (`/nft/<NFTokenID>` pattern)
+- xrp.cafe: https://xrp.cafe — ✅ opened directly 2026-09-30
 - XRPL.to: https://xrpl.to — ✅ opened directly 2026-09-30
 - XPMarket: https://xpmarket.com — ✅ opened directly 2026-09-30
 - First Ledger: https://firstledger.net — ✅ opened directly 2026-09-30
+- Koi (GrapeDrop): https://koi.grapedrop.xyz/ — ✅ opened directly
+  2026-09-30 ("Koi | XRP Intelligence" — XRPL DEX analytics/paper-trading
+  dashboard: strategies, market scanner, wash-trading watchdog)
 
 ### Explorers
 
-- Bithomp: https://bithomp.com — ✅ used in lore file account links
-- xrpscan: ⚠️ not yet captured — open before trusting
+- Bithomp: https://bithomp.com — ✅ opened directly 2026-09-30
+- xrpscan (https://xrpscan.com): ⚠️ fetch failed 2026-09-30 — likely a
+  JS-heavy page the text extractor cannot read; domain not confirmed by
+  direct open
 
 ### Wallets
 
-- Xaman: ⚠️ not yet captured — open before trusting (Mike uses it;
-  phishing risk is high, verify carefully)
+- Xaman: https://xaman.app — ✅ opened directly 2026-09-30 ("formerly XUMM",
+  XRPL Labs self-custody wallet; Mike uses it — phishing risk is high)
 
 ### Ripple
 
-- Ripple: ⚠️ not yet captured — open before trusting
-- Ripple Swell: ⚠️ not yet captured — open before trusting
+- Ripple: https://ripple.com — ✅ opened directly 2026-09-30
+- Ripple Swell: https://ripple.com/events/swell — ✅ opened directly
+  2026-09-30 (Swell 2026, The Shed NYC, Oct 27–29)
 
 ### XAO DAO
 
-- App: https://app.xaodao.io — ⚠️ referenced in skill memory (wallet-gated,
-  no public API); open before trusting
+- App: https://app.xaodao.io — ⚠️ real URL confirmed by direct open
+  2026-09-30, but the wallet-gated app content is not extractable — treat
+  as real-but-thin, not a clean ✅
 - DAO account (on-ledger): `rMFNnkPvDmsBVriFh3QRMMRKaVHsSuChdg` — ✅ verified
   on-ledger per skill memory (domain www.xaodao.io set on the account)
 
+## FML (Fintech Management Limited) — friend of the skill
+
+Justin (owner; Mike's friend from XRP Vegas) runs FML, LLC: institutional-grade
+tokenized capital and real-world assets on XRPL, built on an Odoo-XRPL bridge,
+sovereign cloud hosting, and Reg D / RWA advisory. Site tagline: "Private.
+Compliant. American. Christian-Owned." Contact from the official site:
+info@odoo.xrpfml.com · 503-729-5214.
+
+- Website: https://xrpfml.odoo.com — ✅ opened directly 2026-09-30 (official
+  Odoo-hosted site; "Fintech Management Limited" homepage)
+- Custom domain fintechmanagementlimited.com — ⚠️ serves plain HTTP only
+  (no TLS as of 2026-09-30); always use the https URL above instead
+- X: https://x.com/FML_LLC — ✅ linked from the official site footer,
+  2026-09-30
+
+### Gaming
+
+- LuckyHash: https://luckyhash.win/ — ✅ opened directly 2026-09-30
+  ("LuckyHash - Provably Fair Gaming" — XRPL on-chain casino: scratchers,
+  plinko, hex wheel, dice, slots; payouts in XRP and LHT)
+
+### Launchpads
+
+- xrpl.fun: https://xrpl.fun/ — ✅ opened directly 2026-09-30
+  ("Live Token Launches on XRPL" — backed launchpad: "Layer 3" tokens with
+  real BURN / IMM / PYRO reserves and on-ledger Proof-of-Backing)
+
 ### Capture queue (wanted, not yet sourced)
 
-- FUZZY official Telegram exact URL (re-read fuzzyxrp.com)
-- DexScreener FUZZY page, CoinGecko FUZZY page
+- FUZZY official Telegram exact URL (re-read fuzzyxrp.com; buttons seen on
+  the official site, exact t.me URL not captured)
+- DexScreener $FUZZY page (linked from fuzzyxrp.com)
+- CoinGecko $FUZZY page (linked from fuzzyxrp.com)
+- Joey Wallet (joeywallet.xyz — linked from fuzzyxrp.com)
 - OG Fuzzybears xrp.cafe collection URL (have fuzzy-bars; OG collection URL
   not yet captured)
-- Xaman, xrpscan, Ripple, Swell official URLs
+- xrpscan working URL (https://xrpscan.com fetch failed 2026-09-30)
 - Sologenic, Magnetic (mentioned in ecosystem coverage — verify before adding)
+
+---
+
+## Audit log
+
+- 2026-09-30: full direct-open audit of the FUZZY pilot + ecosystem
+  fill-ins. learn-the-lore upgraded to ✅ (direct open). x.com profiles
+  (fuzzy_xrp, fuzzy_dev_, joelkatz, bearableguy123) stay ⚠️ — x.com fetch
+  is blocked by this environment's policy, not a login wall; their facts
+  were read live 2026-09-30 outside the audit. Fuzzy Bars URL confirmed
+  real but its "373.9K XRP volume / 551 holders" stats downgraded to ⚠️ —
+  direct open showed an empty page, figures came from a search snippet.
+  Official Telegram URL still not captured (resolve only via fuzzyxrp.com,
+  never guess). New ✅ by direct open: xrpl.org, xaman.app, ripple.com,
+  ripple.com/events/swell, xrp.cafe, xrpl.to, xpmarket.com, firstledger.net,
+  bithomp.com. app.xaodao.io confirmed real but wallet-gated/thin.
+  xrpscan.com remains ⚠️ (fetch failed, domain unconfirmed).
