@@ -441,7 +441,7 @@ xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
 - Names are lowercase `[a-z0-9_-]`, 1–32 chars; addresses get the real
   base58-checksum validation. Stored in `~/.xrpl/favorites.json`
   (owner-only `0600`, covered by the signer's protected-file check).
-- Favorites have a `kind`: `artist` (default) or `friend`, plus an
+- Favorites have a `kind`: `artist` (default), `friend`, or `watch`, plus an
   optional `label` — the plain display name shown next to the address
   ("Jenna X (rABC…WXYZ)"). Labels accept plain letters, numbers,
   spaces, and basic punctuation only; emoji and stylized Unicode are
@@ -457,7 +457,8 @@ xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
   safety note (issuer scam-blocklist screen + collection/floor,
   advisory, fail-open; max 20 enriched per run, later rows say so;
   `--no-safety` skips). "Data by xrpl.to" credit on every run.
-- `xrpl-trade incoming [--account r…] [--limit 10] [--collection text]
+- `xrpl-trade incoming [--account r…] [--watch name] [--all-watched]
+  [--limit 10] [--collection text]
   [--min-xrp N] [--max-xrp N] [--from name-or-address] [--include-flagged]
   [--no-safety]` — what's coming IN, read-only: (1) open NFT offers —
   bids on your NFTs plus sell/gift offers directed at you, with a
@@ -471,6 +472,21 @@ xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
   can be cancelled, so the ledger is authoritative before you act.
   Zero-XRP offers from wallets you don't recognize print a loud
   caution: only accept those from people you know.
+  `--watch name` / `--all-watched` read from the watched-wallet list below.
+- **Watched wallets + offer reminders** (read-only, addresses only — a
+  seed can never pass the address checksum, so one can never be stored):
+  ```bash
+  xrpl-trade watch add studio-vault r… --label "Studio Vault"
+  xrpl-trade watch list
+  xrpl-trade watch remove studio-vault
+  xrpl-trade watch check        # sweep for NEW open offers, offers only
+  ```
+  `watch check` queries the xrpl.to offers API per watched wallet, diffs
+  offer indices against a local watermark
+  (`~/.xrpl/hidden_files/watch-seen.json`, `0600`), and prints only NEW
+  offers — the first run per wallet seeds the baseline silently. An
+  hourly reminder job runs `watch check` and pings chat only when new
+  offers appear; acting on one is still the manual `nft-buy` ceremony.
 - Favorite names also work wherever a read command takes an address
   (`nft-inventory lara`). Among writes, only `nft-send --to` accepts a
   name — it resolves against the local favorites file (case-insensitive)
