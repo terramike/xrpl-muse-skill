@@ -86,6 +86,11 @@ try:
 except ImportError:
     xrpl_eco = None  # ecosystem connectors unavailable; other commands unaffected
 
+try:
+    import xrpl_forensics
+except ImportError:
+    xrpl_forensics = None  # forensic tools unavailable; other commands unaffected
+
 
 # ---------- config / client ----------
 
@@ -508,6 +513,29 @@ def cmd_oracle(args, cfg, client):
     if xrpl_eco is None:
         sys.exit("xrpl_eco module unavailable")
     for ln in xrpl_eco.format_oracle(args.base, args.quote):
+        print(ln)
+
+
+def cmd_trace(args, cfg, client):
+    if xrpl_forensics is None:
+        sys.exit("xrpl_forensics module unavailable")
+    if not C.is_valid_classic_address(args.address):
+        sys.exit("not a valid XRPL classic address")
+    for ln in xrpl_forensics.format_trace(
+            args.address, depth=args.depth,
+            use_cache=not args.no_cache):
+        print(ln)
+
+
+def cmd_links(args, cfg, client):
+    if xrpl_forensics is None:
+        sys.exit("xrpl_forensics module unavailable")
+    if not C.is_valid_classic_address(args.address_a) \
+            or not C.is_valid_classic_address(args.address_b):
+        sys.exit("both arguments must be valid XRPL classic addresses")
+    for ln in xrpl_forensics.format_links(
+            args.address_a, args.address_b, window=args.window,
+            use_cache=not args.no_cache):
         print(ln)
 
 
@@ -3342,6 +3370,15 @@ def main():
     p = sub.add_parser("oracle", help="on-ledger XLS-47 oracle prices: per-publisher + aggregate median (read-only)")
     p.add_argument("base", nargs="?", default="XRP")
     p.add_argument("quote", nargs="?", default="USD")
+    p = sub.add_parser("trace", help="funding-origin trace: who funded this account, up to N hops back (read-only)")
+    p.add_argument("address")
+    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--no-cache", action="store_true")
+    p = sub.add_parser("links", help="shared counterparties, issuers and control overlap between two accounts (read-only)")
+    p.add_argument("address_a")
+    p.add_argument("address_b")
+    p.add_argument("--window", type=int, default=200)
+    p.add_argument("--no-cache", action="store_true")
     p = sub.add_parser("plan-trade", help="estimate fill, impact, max spend (read-only)")
     p.add_argument("--pair", default=None)
     p.add_argument("--base", default="XRP"); p.add_argument("--quote", default="RLUSD")
@@ -3750,6 +3787,8 @@ def main():
         "amendments": lambda: cmd_amendments(args, cfg, client),
         "stablecoin": lambda: cmd_stablecoin(args, cfg, client),
         "oracle": lambda: cmd_oracle(args, cfg, client),
+        "trace": lambda: cmd_trace(args, cfg, client),
+        "links": lambda: cmd_links(args, cfg, client),
         "plan-trade": lambda: cmd_plan_trade(args, cfg, client),
         "reconcile": lambda: cmd_reconcile(args, cfg, client),
         "buy": lambda: cmd_buy(args, cfg, client),

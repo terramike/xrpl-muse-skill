@@ -42,6 +42,8 @@ xrpl-trade amendments         # amendment votes + majority countdown
 xrpl-trade stablecoin RLUSD   # supply by chain + price
 xrpl-trade oracle XRP USD     # on-ledger XLS-47 prices (Band + DIA)
 xrpl-trade token-safety --help
+xrpl-trade trace rABC... [--depth 2]         # funding-origin chain
+xrpl-trade links rABC... rDEF... [--window 200]  # shared counterparties
 xrpl-trade <command> --help   # every command documents itself
 ```
 

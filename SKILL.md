@@ -850,6 +850,18 @@ Reading (no seed, no proposals):
 - `plan-trade --pair ARMY/XRP --side buy --amount 1000 --price 0.005` —
   estimated fill, price impact vs mid, max spend (read-only)
 - `reconcile --hash …` — validated outcome of a submitted transaction
+- `trace <address> [--depth N]` — funding-origin trace: who funded this
+  account, and who funded them (default 2 hops, max 3). Prints first-seen
+  ledger, funder, amount, tx hash, plus control signals (RegularKey,
+  signer list, domain). Light by design: hard RPC-call budget, 1h local
+  cache, fail-open. Output discipline: `LINK:` = on-ledger fact,
+  `NOTE:` = caveat; never claims ownership.
+- `links <addressA> <addressB> [--window N]` — shared counterparties,
+  shared trustline issuers, and control overlap (same RegularKey, shared
+  signer-list members) from the N most recent validated txs per account
+  (default 200, max 500). Exchange hot wallets can appear as shared
+  counterparties — printed as links with a loud caveat, never as proof
+  of common control. See `references/forensic-mode.md`.
 - `nft-inventory [r…]` — every NFT owned by an account (read-only);
   accepts a favorite name too (`nft-inventory lara`)
 - `favorites add|remove|list|rename` — named watchlist of artist wallets
