@@ -17,12 +17,12 @@ SKILL = os.path.join(REPO, "SKILL.md")
 
 STEP_IDS = [
     "install", "setup", "init_policy", "profile", "first_read",
-    "onchain", "watch_offers", "nft_minting", "xrplto_key", "fiat_onramp",
-    "autopilot", "autonomous", "giveaway",
+    "onchain", "watch_offers", "nft_minting", "nft_buying", "xrplto_key",
+    "fiat_onramp", "autopilot", "autonomous", "giveaway",
 ]
 
-QUESTION_IDS = ["onchain", "watch_offers", "nft_minting", "xrplto_key",
-                "fiat_onramp"]
+QUESTION_IDS = ["onchain", "watch_offers", "nft_minting", "nft_buying",
+                "xrplto_key", "fiat_onramp"]
 
 
 def read_spec():
@@ -59,6 +59,7 @@ class TestWizardSpec(unittest.TestCase):
             "onchain": ["onchain"],
             "watch_offers": ["watch_offers", "watch add"],
             "nft_minting": ["nft_minting"],
+            "nft_buying": ["nft_buying", "nft-buy"],
             "xrplto_key": ["xrplto_key"],
             "fiat_onramp": ["fiat_onramp"],
             "autopilot": ["autopilot"],
@@ -77,7 +78,7 @@ class TestWizardSpec(unittest.TestCase):
             # find the question block: from its step id mention to the next Q header
             idx = text.find(qid)
             self.assertGreater(idx, -1)
-            block = text[idx:idx + 2500]
+            block = text[idx:idx + 4500]
             self.assertRegex(block, r"\*\*Yes\*\*",
                              f"question {qid!r} has no documented Yes branch")
             self.assertRegex(block, r"\*\*(No|Skip)\*\*",
@@ -109,6 +110,30 @@ class TestWizardSpec(unittest.TestCase):
                          "Q2 (offer watch) must say no keys needed")
         self.assertIn("watch add", q2,
                       "Q2 must show the watch add command")
+
+    def test_q1_covers_pairs_and_allowlist(self):
+        text = read_spec()
+        q1 = text[text.find("**Q1"):text.find("**Q2")]
+        self.assertIn("approved.json", q1,
+                      "Q1 yes-path must cover trade-pair setup")
+        self.assertIn("allowlist", q1.lower(),
+                      "Q1 yes-path must cover the destination allowlist")
+
+    def test_buy_nfts_question_exists(self):
+        text = read_spec()
+        self.assertIn("**Q4", text)
+        q4 = text[text.find("**Q4"):text.find("**Q4") + 1500]
+        self.assertIn("allow_buy_offers", q4,
+                      "Q4 must cover the allow_buy_offers policy flip")
+        self.assertIn("nft-bid", q4, "Q4 must cover bidding")
+
+    def test_phase0_power_reads(self):
+        text = read_spec()
+        phase0 = text[text.find("## Phase 0"):text.find("## Phase 1")]
+        for cmd in ["tx-explain", "whale-watch", "token-safety",
+                    "top-collections", "xrpresso", "trusted-links"]:
+            self.assertIn(cmd, phase0,
+                          f"Phase 0 try-list missing: {cmd}")
 
     def test_nice_to_have_marked(self):
         text = read_spec()

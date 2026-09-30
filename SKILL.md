@@ -564,11 +564,14 @@ script is `references/onboarding-wizard.md`; the shape:
    first read. Zero keys; say so out loud.
 2. **Phase 1 — the important question:** "Want to do anything on-chain?"
    Yes → the `xrpl-trade live` typed ceremony, signing profiles,
-   exact-diff policy review, testnet trial trade before mainnet is ever
+   exact-diff policy review, trade-pair setup (`approved.json`),
+   destination allowlist, testnet trial trade before mainnet is ever
    discussed. No → read-only is a complete install.
 3. **Phase 2 — the optionals, one yes/no each:** offer watching
-   (read-only, no keys), NFT minting (Pinata JWT walkthrough), xrpl.to
-   key (nice-to-have — most endpoints work keyless), fiat on-ramp
+   (read-only, no keys), NFT minting (Pinata JWT walkthrough, plus
+   collections/templates/list/send power tools), NFT buying (offer
+   acceptance + bidding, `allow_buy_offers` policy), xrpl.to key
+   (nice-to-have — most endpoints work keyless), fiat on-ramp
    (changelly_buy handoff), then an advanced gate hiding
    human-in-the-loop bot signing, the autonomous bot, and giveaway
    setup.

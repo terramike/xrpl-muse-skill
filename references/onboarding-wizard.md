@@ -33,6 +33,7 @@ State lives in `~/.xrpl/onboarding.json` (owner-only `0600`,
     "onchain": "pending",
     "watch_offers": "pending",
     "nft_minting": "pending",
+    "nft_buying": "pending",
     "xrplto_key": "pending",
     "fiat_onramp": "pending",
     "autopilot": "pending",
@@ -63,6 +64,13 @@ Walk them through these in order; everything here needs zero keys:
 Then say it plainly: "Everything you just did needed zero keys. Reads,
 risk scores, whale-watching, the watchlist — all free forever."
 
+Power reads to try next: `tx-explain --hash …` (what happened on-ledger),
+`whale-watch --issuer r… --currency …` (who's trading a token),
+`token-safety` (scam screen + risk score), `top-collections` (ranked NFT
+collections), `xrpresso listings --q …` (the XRPresso marketplace). And
+the trusted-links registry (`references/trusted-links.md`) is the answer
+for "is this link legit" — never a search result.
+
 Mark each `done` as completed.
 
 ## Phase 1 — the important question
@@ -81,7 +89,15 @@ Buttons: `[Yes, set it up]` `[No, I'm good reading]`
      operation at a time — never pasted into chat, never stored by us.
   4. Show the exact policy diff for any mainnet/spend-limit change and
      get an explicit yes (standing rule — never silent policy edits).
-  5. **Testnet first:** fund via `xrpl-trade faucet --network testnet`,
+  5. **Trade pairs:** `buy`/`sell` resolve through
+     `~/.xrpl/approved.json` — empty by default. Copy
+     `approved.example.json` there and add one vetted issuer. Say it
+     plainly: tickers mean nothing on XRPL; issuers are the identity.
+  6. **Destination allowlist:** `send`/payments only go to allowlisted
+     (address, destination_tag) entries. Explain the 24h NEW DESTINATION
+     ceremony warning — a payment to a destination added within the last
+     24h gets flagged loud at signing time, and that's the point.
+  7. **Testnet first:** fund via `xrpl-trade faucet --network testnet`,
      run one tiny trade through propose → approve → sign, verify on
      the validated ledger. Mainnet only when they say the words.
 - **No** → `onchain: skipped`. "Staying read-only is a perfectly good
@@ -104,6 +120,9 @@ Buttons: `[Yes]` `[No]`
   3. An hourly reminder pings chat only when new offers appear.
   4. Say it plainly: the watch never proposes, signs, or submits —
      acting on an offer is still the manual `nft-buy` ceremony.
+  5. Bonus, same zero-key family: `xrpl-trade favorites add <name> r…`
+     follows an artist wallet; `xrpl-trade nft-new` shows their new mints
+     since your last check, with listing prices and xrp.cafe links.
 - **No** → `watch_offers: skipped`.
 
 **Q3: "Mint NFTs?"**
@@ -118,9 +137,31 @@ Buttons: `[Yes]` `[No]`
      pin-and-propose. Show the exact policy diff enabling the `nft`
      section and get an explicit yes.
   4. Point at `references/nft-pinata.md` for the full flow.
+  5. Power tools, same ceremony: `collection create` + `template create`
+     for reusable drops, `nft-list` to sell an owned NFT, `nft-send` to
+     gift one (a 0-XRP transfer offer — the recipient must accept).
 - **No** → `nft_minting: skipped`. Never mention minting again.
 
-**Q4: "Want higher XRPL.to rate limits?"** — marked *nice-to-have*:
+**Q4: "Buy NFTs — accept offers, place bids?"**
+Buttons: `[Yes]` `[No]`
+
+- **Yes** → the buy-side walkthrough:
+  1. Show the exact policy diff setting `nft.allow_buy_offers` to `true`
+     and get an explicit yes — accepting a sell offer spends XRP
+     immediately, and a bid locks XRP until it is accepted, cancelled,
+     or expires.
+  2. `xrpl-trade nft-buy --offer-index <64-hex>` verifies the SELL offer
+     from the ledger (seller, issuer, URI, taxon) before proposing;
+     `xrpl-trade nft-bid --token-id <64-hex> --seller r… --price-xrp 5`
+     places a bid (capped by `nft.max_bid_xrp`).
+  3. Every buy/bid proposal carries the advisory xrpl.to safety section
+     (issuer screen, collection floor, asking × floor multiple, approx
+     last sale) — advisory only; the on-ledger verification stays the
+     authority. Anyone can mint the same artwork: check the issuer is
+     the artist you expect.
+- **No** → `nft_buying: skipped`.
+
+**Q5: "Want higher XRPL.to rate limits?"** — marked *nice-to-have*:
 most endpoints work fine with no key.
 Buttons: `[Yes]` `[No]`
 
@@ -130,7 +171,7 @@ Buttons: `[Yes]` `[No]`
   terms. Mention `keys list` / `keys revoke` for rotation.
 - **No** → `xrplto_key: skipped`.
 
-**Q5: "Want to buy XRP with a card?"**
+**Q6: "Want to buy XRP with a card?"**
 Buttons: `[Yes]` `[No]`
 
 - **Yes** → hand off to the companion `changelly_buy` skill: it quotes
@@ -139,7 +180,7 @@ Buttons: `[Yes]` `[No]`
   Full flow: `references/fiat-onramp.md`.
 - **No** → `fiat_onramp: skipped`.
 
-**Q6 (advanced gate): "Show advanced setup — autopilot, trading bot, giveaways?"**
+**Q7 (advanced gate): "Show advanced setup — autopilot, trading bot, giveaways?"**
 Buttons: `[Show advanced]` `[Skip]`
 
 - **Skip** → mark `autopilot`, `autonomous`, `giveaway` all `skipped`.
@@ -176,7 +217,7 @@ To finish:
   ○ Going live — run: xrpl-trade live
   ○ NFT minting — next: create a free Pinata account
 Skipped (say the word anytime to revisit):
-  – offer watch, xrpl.to key, fiat on-ramp, autopilot, bot, giveaways
+  – offer watch, nft buying, xrpl.to key, fiat on-ramp, autopilot, bot, giveaways
 ```
 
 Save the state file. Remind them: "Say 'finish my setup' anytime to
