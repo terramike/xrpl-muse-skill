@@ -31,6 +31,7 @@ State lives in `~/.xrpl/onboarding.json` (owner-only `0600`,
     "profile": "done",
     "first_read": "done",
     "onchain": "pending",
+    "watch_offers": "pending",
     "nft_minting": "pending",
     "xrplto_key": "pending",
     "fiat_onramp": "pending",
@@ -88,7 +89,24 @@ Buttons: `[Yes, set it up]` `[No, I'm good reading]`
 
 ## Phase 2 — the optionals (one question each)
 
-**Q2: "Mint NFTs?"**
+**Q2: "Watch for NFT offers on any wallet?"** — marked *read-only, no
+keys*: some people install the skill just for this.
+Buttons: `[Yes]` `[No]`
+
+- **Yes** → the watch walkthrough:
+  1. `xrpl-trade watch add <name> <r-address> --label "Studio Vault"` —
+     addresses only. A seed can never pass the address checksum, so one
+     can never be stored here.
+  2. `xrpl-trade watch list` to review; `xrpl-trade watch check` sweeps
+     for NEW open offers — it diffs against a local watermark and prints
+     only what's new (the first run per wallet seeds the baseline
+     silently).
+  3. An hourly reminder pings chat only when new offers appear.
+  4. Say it plainly: the watch never proposes, signs, or submits —
+     acting on an offer is still the manual `nft-buy` ceremony.
+- **No** → `watch_offers: skipped`.
+
+**Q3: "Mint NFTs?"**
 Buttons: `[Yes]` `[No]`
 
 - **Yes** → Pinata walkthrough:
@@ -102,7 +120,7 @@ Buttons: `[Yes]` `[No]`
   4. Point at `references/nft-pinata.md` for the full flow.
 - **No** → `nft_minting: skipped`. Never mention minting again.
 
-**Q3: "Want higher XRPL.to rate limits?"** — marked *nice-to-have*:
+**Q4: "Want higher XRPL.to rate limits?"** — marked *nice-to-have*:
 most endpoints work fine with no key.
 Buttons: `[Yes]` `[No]`
 
@@ -112,7 +130,7 @@ Buttons: `[Yes]` `[No]`
   terms. Mention `keys list` / `keys revoke` for rotation.
 - **No** → `xrplto_key: skipped`.
 
-**Q4: "Want to buy XRP with a card?"**
+**Q5: "Want to buy XRP with a card?"**
 Buttons: `[Yes]` `[No]`
 
 - **Yes** → hand off to the companion `changelly_buy` skill: it quotes
@@ -121,7 +139,7 @@ Buttons: `[Yes]` `[No]`
   Full flow: `references/fiat-onramp.md`.
 - **No** → `fiat_onramp: skipped`.
 
-**Q5 (advanced gate): "Show advanced setup — autopilot, trading bot, giveaways?"**
+**Q6 (advanced gate): "Show advanced setup — autopilot, trading bot, giveaways?"**
 Buttons: `[Show advanced]` `[Skip]`
 
 - **Skip** → mark `autopilot`, `autonomous`, `giveaway` all `skipped`.
@@ -158,7 +176,7 @@ To finish:
   ○ Going live — run: xrpl-trade live
   ○ NFT minting — next: create a free Pinata account
 Skipped (say the word anytime to revisit):
-  – xrpl.to key, fiat on-ramp, autopilot, bot, giveaways
+  – offer watch, xrpl.to key, fiat on-ramp, autopilot, bot, giveaways
 ```
 
 Save the state file. Remind them: "Say 'finish my setup' anytime to

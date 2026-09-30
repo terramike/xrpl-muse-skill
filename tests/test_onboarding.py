@@ -17,11 +17,12 @@ SKILL = os.path.join(REPO, "SKILL.md")
 
 STEP_IDS = [
     "install", "setup", "init_policy", "profile", "first_read",
-    "onchain", "nft_minting", "xrplto_key", "fiat_onramp",
+    "onchain", "watch_offers", "nft_minting", "xrplto_key", "fiat_onramp",
     "autopilot", "autonomous", "giveaway",
 ]
 
-QUESTION_IDS = ["onchain", "nft_minting", "xrplto_key", "fiat_onramp"]
+QUESTION_IDS = ["onchain", "watch_offers", "nft_minting", "xrplto_key",
+                "fiat_onramp"]
 
 
 def read_spec():
@@ -56,6 +57,7 @@ class TestWizardSpec(unittest.TestCase):
             "profile": ["profile"],
             "first_read": ["first_read", "First read"],
             "onchain": ["onchain"],
+            "watch_offers": ["watch_offers", "watch add"],
             "nft_minting": ["nft_minting"],
             "xrplto_key": ["xrplto_key"],
             "fiat_onramp": ["fiat_onramp"],
@@ -97,6 +99,16 @@ class TestWizardSpec(unittest.TestCase):
         self.assertIn("human in the loop", text.lower(),
                       "wizard must frame autopilot as human-in-the-loop "
                       "bot signing, not just 'autopilot'")
+
+    def test_watch_question_is_read_only(self):
+        text = read_spec()
+        q2 = text[text.find("**Q2"):text.find("**Q2") + 1200]
+        self.assertRegex(q2, r"(?i)read-only",
+                         "Q2 (offer watch) must be marked read-only")
+        self.assertRegex(q2, r"(?i)no\s+keys",
+                         "Q2 (offer watch) must say no keys needed")
+        self.assertIn("watch add", q2,
+                      "Q2 must show the watch add command")
 
     def test_nice_to_have_marked(self):
         text = read_spec()
