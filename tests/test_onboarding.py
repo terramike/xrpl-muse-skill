@@ -92,6 +92,12 @@ class TestWizardSpec(unittest.TestCase):
         self.assertIn("IMPORTANT", onchain,
                       "Q1 (on-chain) must be marked IMPORTANT")
 
+    def test_bot_signing_wording(self):
+        text = read_spec()
+        self.assertIn("human in the loop", text.lower(),
+                      "wizard must frame autopilot as human-in-the-loop "
+                      "bot signing, not just 'autopilot'")
+
     def test_nice_to_have_marked(self):
         text = read_spec()
         self.assertIn("nice-to-have", text,
@@ -106,7 +112,7 @@ class TestWizardSpec(unittest.TestCase):
 
     def test_no_seed_collection_path(self):
         text = read_spec()
-        self.assertRegex(text, r"never in chat",
+        self.assertRegex(text, r"never\s+in chat",
                          "spec must state credentials are never in chat")
 
     def test_skill_md_references_wizard(self):

@@ -569,7 +569,8 @@ script is `references/onboarding-wizard.md`; the shape:
 3. **Phase 2 — the optionals, one yes/no each:** NFT minting (Pinata
    JWT walkthrough), xrpl.to key (nice-to-have — most endpoints work
    keyless), fiat on-ramp (changelly_buy handoff), then an advanced gate
-   hiding autopilot, the autonomous bot, and giveaway setup.
+   hiding human-in-the-loop bot signing, the autonomous bot, and
+   giveaway setup.
 4. **Phase 3 — your install:** a personalized checklist with only what
    they said yes to and the exact commands; saved resumable state.
 

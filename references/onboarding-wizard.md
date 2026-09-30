@@ -127,11 +127,16 @@ Buttons: `[Show advanced]` `[Skip]`
 - **Skip** → mark `autopilot`, `autonomous`, `giveaway` all `skipped`.
   Normies never see these.
 - **Show** → one question each, each with its honest framing:
-  - **Autopilot** (local-seed convenience): plain-language risk
-    disclosure first — it bounds our *mistakes*, not our *compromise*
-    (same-user install). Dedicated limited-funds wallet only.
-    Enable: `xrpl-trade autopilot enable`, typing `ENABLE AUTOPILOT`.
-    Seed at a hidden terminal prompt, never in chat.
+  - **Bot signing with a human in the loop** (local-seed convenience):
+    question: "Enable bot signing with a human in the loop?"
+    Plain-language risk disclosure first — it bounds our *mistakes*,
+    not our *compromise* (same-user install). Your wallet's seed stays
+    on this machine (owner-only file) so signing doesn't need the vault
+    each time — but every transaction still needs your explicit approval
+    of the exact proposal hash. Dedicated limited-funds wallet only,
+    never the main vault wallet. Enable: `xrpl-trade autopilot enable`,
+    typing `ENABLE AUTOPILOT`. Seed at a hidden terminal prompt, never
+    in chat.
   - **Autonomous bot**: separate wallet, dry-run only until P1,
     approval is per-plan not per-trade. `xrpl-trade autonomous setup`
     (they run it themselves), then the plan-hash approval ceremony.
