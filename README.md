@@ -94,6 +94,16 @@ all seven are fixed, with focused regression tests
   separately, with a resale warning when they differ.
 - **Delivered-value flows only** — forensic value flows count only
   `tesSUCCESS` transactions' `delivered_amount`, never requested amounts.
+- **nft-trail holder fix** — a both-offers direct sale no longer
+  misattributes the holder; the reported holder is verified against the
+  validated ledger (unverified trails say so instead of naming the wrong
+  account).
+
+Also bundled: the **Farm Helper** (`xrpl-trade farm` — read-only Farmers
+Union add-in: explainer, links, qualification check, treasury, dustings),
+the **nft-new crash fix** (unreadable sell-offer amounts no longer crash the
+scan) with a trimmed default window (7d→3d) and `--limit`, and
+trusted-links registry updates.
 
 ## What's new in v0.12.0
 
