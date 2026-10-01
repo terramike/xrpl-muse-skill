@@ -1,4 +1,4 @@
-# NFT artwork + IPFS pinning (v0.5)
+# NFT artwork + IPFS pinning (v0.14.1)
 
 `xrpl-trade nft-mint` pins artwork to IPFS through Pinata, then mints an
 `NFTokenMint` whose `URI` points at the pinned metadata. This page explains
@@ -13,10 +13,13 @@ host, pay for, or see anyone else's files.
 
 The JWT never belongs in the repository, in a proposal, in chat output, or
 in the audit log. Treat it like a seed: the vault injects it into the
-environment at pin time, and only the pinner's environment holds it.
+environment at pin time — it is never exported into a shell by hand —
+and only the pinner's environment holds it. Pinning happens inside
+the approved action, never before it: nothing is uploaded until the
+human has approved the exact stage digest.
 
 ```bash
-export PINATA_JWT="eyJhbGciOi..."
+# PINATA_JWT is injected by the vault at pin time; do NOT export it here.
 xrpl-trade nft-mint --file art.png --name "Neon Drift" \
     --description "Series 1, piece 3" --royalty-bps 1000
 ```

@@ -59,7 +59,7 @@ try:
     from xrpl.models.currencies import IssuedCurrency, XRP
     from xrpl.models.requests import (
         AccountInfo, AccountLines, AccountOffers, BookOffers, ServerInfo, Tx,
-        AccountNFTs,
+        AccountNFTs, AMMInfo,
     )
     from xrpl.models.transactions import OfferCancel, OfferCreate, Payment, TrustSet
     from xrpl.models.transactions import (NFTokenAcceptOffer,
@@ -754,7 +754,8 @@ def _validate_stage_fields(fields):
 
 def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
                   account=None, network="testnet", *, issuer=None,
-                  attribution=True, fields=None, collection=None):
+                  attribution=True, fields=None, collection=None,
+                  media_dir=None):
     """Validate artwork and write a stage record. Zero network calls.
 
     Returns the stage record dict. The record carries a stage digest
@@ -765,6 +766,8 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
 
     Artwork must live inside the protected NFT media directory
     (xrpl_pin.protected_media_dir()); anything outside is refused.
+    media_dir overrides that default (tests); production callers leave
+    it None.
 
     issuer: the collection issuer for the authorized-minter flow (None =
     self-issued; the NFTokenMint's Account is the minter). attribution:
@@ -793,7 +796,7 @@ def stage_artwork(file, name, description="", royalty_bps=1000, taxon=0,
     if problem:
         sys.exit(problem)
     fields = dict(fields or {})
-    mdir = xrpl_pin.protected_media_dir()
+    mdir = media_dir or xrpl_pin.protected_media_dir()
     data, info = xrpl_pin.read_validated_source(file, media_dir=mdir)
     file_sha256 = hashlib.sha256(data).hexdigest()
     if file_sha256 != info["sha256"]:
@@ -1241,21 +1244,27 @@ def provisional_spend_check(spends):
         print("  note: no policy file — spend limits enforced by xrpl-sign")
         return
     try:
-        pol = json.loads(pol_path.read_text())
+        raw = json.loads(pol_path.read_text())
     except json.JSONDecodeError:
         print("  note: unreadable policy file — spend limits enforced by "
               "xrpl-sign")
         return
-    if pol.get("policy_version") != C.POLICY_VERSION:
+    if raw.get("policy_version") != C.POLICY_VERSION:
         print("  note: policy version mismatch — spend limits enforced by "
               "xrpl-sign")
         return
-    # Best-effort: merge over defaults. The signer validates the schema
-    # strictly and will refuse a violating policy — say so now, cleanly.
-    pol = {**C.DEFAULT_POLICY, **pol}
+    # Best-effort: never do limit math on a schema-violating policy.
+    # The signer hard-refuses via load_policy — say so now, cleanly.
+    try:
+        C.validate_policy(raw)
+    except C.PolicyError as e:
+        print("  note: policy file fails schema validation — spend limits "
+              "enforced by xrpl-sign")
+        return
+    pol = {**C.DEFAULT_POLICY, **raw}
     try:
         denials = C.SpentTracker().check(spends, pol)
-    except C.StateCorruptError as e:
+    except C.SpentTracker.StateError as e:
         # Fail closed at proposal time too: never propose against unknown
         # limits. The signer would refuse anyway; say so now, cleanly.
         sys.exit(str(e))
@@ -1993,6 +2002,23 @@ def run_profile_init(prof, _input=input, cfg=None, client=None):
         if problem:
             print(f"  ({problem} — skipped)")
 
+    # Farmers Union opt-in. Entirely local, default no: answering yes just
+    # tags the interest and points at the read-only explainer.
+    ans = _profile_input(
+        "\nResearch Farmers Union ($FARM)? Weekly crop dustings reward "
+        "holders — the skill can explain the system and check your "
+        "qualification. (y/N): ",
+        default="", _input=_input)
+    if ans is None:
+        print("onboarding stopped — nothing was saved")
+        return
+    if ans.strip().lower() in C.PROFILE_BOOL_TRUE:
+        problem = C.add_profile_list_item(prof, "interests", "farmers-union")
+        if problem:
+            print(f"  ({problem} — skipped)")
+        else:
+            print("  Start here: xrpl-trade farm about")
+
     ans = _profile_input(
         "\nPrice-move alerts when XRP swings? (y/N): ",
         default="", _input=_input)
@@ -2180,17 +2206,22 @@ def cmd_nft_new(args, cfg, client):
     """Read-only: what's new from favorite artists.
 
     For each kind=artist favorite, finds NFTokenMint transactions since
-    its per-favorite watermark (first run: last 7 days) and reports the
+    its per-favorite watermark (first run: last 3 days) and reports the
     token, mint time, current listing price if any, and an xrp.cafe
     link. kind=friend entries are never scanned — they're just labels.
     Each mint also gets a one-line xrpl.to safety note (scam screen +
     collection/floor, advisory, fail-open; --no-safety skips, max 20
-    enriched per run). The watermark then advances to the validated
+    enriched per run). --limit N caps the mints shown per artist
+    (newest first, default 25, 0 = no cap); older mints beyond the cap
+    are counted, not listed. The watermark then advances to the validated
     ledger. --days N is a pure window scan and does NOT move the
     watermark."""
     days = args.days
     if days is not None and not 1 <= days <= 90:
         sys.exit("--days must be between 1 and 90")
+    limit = getattr(args, "limit", 25)
+    if limit is not None and limit < 0:
+        sys.exit("--limit must be 0 (no cap) or a positive number")
     try:
         favs = C.load_favorites()
     except C.FavoritesError as e:
@@ -2217,8 +2248,8 @@ def cmd_nft_new(args, cfg, client):
         else:
             wm = fav.get("last_checked_ledger")
             if wm is None:
-                cutoff, stop_ledger = now - 7 * 86400, None
-                window = "last 7d (first check)"
+                cutoff, stop_ledger = now - 3 * 86400, None
+                window = "last 3d (first check)"
             else:
                 cutoff, stop_ledger = None, wm
                 window = f"since ledger {wm}"
@@ -2231,8 +2262,16 @@ def cmd_nft_new(args, cfg, client):
         if not mints:
             print(f"{tag} — nothing new ({window})")
         else:
-            print(f"{tag} — {len(mints)} new ({window}):")
-            for m in mints:
+            ordered = sorted(mints, key=lambda m: m.get("date_unix") or 0,
+                             reverse=True)
+            total = len(ordered)
+            shown = ordered if not limit else ordered[:limit]
+            hidden = total - len(shown)
+            print(f"{tag} — {total} new ({window}):")
+            if hidden:
+                print(f"    (showing newest {len(shown)}; {hidden} older "
+                      f"not shown — raise with --limit N)")
+            for m in shown:
                 tids = m["token_ids"]
                 nid = tids[0] if tids else None
                 when = (time.strftime("%Y-%m-%d %H:%M UTC",
@@ -2476,6 +2515,446 @@ def cmd_fuzzy(args):
     print("  This command is not in the menus. You found it. Good.")
     print("  Data: the validated ledger. Vibes: the bear.")
     print("-" * 64)
+
+
+# ---------------------------------------------------------------------------
+# Farmers Union ($FARM) helper — PUBLIC, read-only command family.
+# `farm about` / `farm links` are static (references/farm.md, no network).
+# `farm qualify` / `farm treasury` read the validated ledger (keyless).
+# `farm dustings` mirrors the Union's cropdusting table via a lazy local
+# cache (~/.xrpl/farm-dustings.json). Nothing here builds proposals, signs,
+# touches seeds, or requests secret input — ever.
+# ---------------------------------------------------------------------------
+
+FARM_ISSUER = "rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU"
+FARM_CURRENCY_HEX = "4641524D00000000000000000000000000000000"
+FARM_QUALIFY_THRESHOLD = Decimal("123000")
+FARM_SITE = "http://farmerunion.meme"  # plain http — the site serves no https
+FARM_BARN = "https://barn.farmerunion.meme"
+FARM_XRPLTO_TOKEN = ("https://xrpl.to/token/" + FARM_ISSUER + "-"
+                     + FARM_CURRENCY_HEX)
+FARM_XRPLTO_ANIMALFAM = "https://xrpl.to/nfts/animal-fam"
+FARM_TRUSTLINE_SET = ("https://xrpl.services/?issuer=" + FARM_ISSUER
+                      + "&currency=" + FARM_CURRENCY_HEX
+                      + "&limit=99999999999999")
+FARM_TREASURY_WALLETS = (
+    ("Dev Team (5/9 multisig)", "rMT8ybWLuDdYytJzXWtZHPumwR5Tp7otBk"),
+    ("Dev Team 2", "r32hxpPbwrjDTUc85vL8nYC3vuecMi42db"),
+    ("Dev Team 3", "rKVHPrcDs87JNGJ5AxkjLE26ZcAsqAE5x"),
+    ("Treasury (main vault)", "rfufarm4vwdDvAUu4bWwpmkvRxEvkAE9YQ"),
+)
+FARM_PUBLISHED_TREASURY = ("~$148,150 across XRPL / Coreum / Solana "
+                           "(site figure, 2026-09-30)")
+FARM_DUSTINGS_CACHE_DAYS = 7
+
+
+def _farm_ref_path():
+    return Path(__file__).resolve().parent.parent / "references" / "farm.md"
+
+
+def _farm_ref_text():
+    try:
+        return _farm_ref_path().read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _farm_ref_section(name):
+    """Extract a `## <name>` section from references/farm.md."""
+    import re
+    text = _farm_ref_text()
+    m = re.search(r"^## " + re.escape(name) + r"\s*\n(.*?)(?=^## |\Z)",
+                  text, re.DOTALL | re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _farm_fmt(d):
+    s = f"{Decimal(d):,.2f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _farm_is_farm_line(line):
+    return (line.get("currency") in ("FARM", FARM_CURRENCY_HEX)
+            and line.get("account") == FARM_ISSUER)
+
+
+def _farm_is_lp_currency(cur):
+    return (isinstance(cur, str) and len(cur) == 40
+            and all(c in "0123456789abcdefABCDEF" for c in cur))
+
+
+def _farm_shareable_about():
+    return ("Farmers Union ($FARM) on XRPL — hold 123,000 FARM (issuer "
+            "rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU) to qualify for weekly "
+            "crop-dusting airdrops. Details: http://farmerunion.meme")
+
+
+def cmd_farm_about():
+    """Static explainer from references/farm.md. No network."""
+    import re
+    text = _farm_ref_text()
+    if not text:
+        print("farm reference missing — references/farm.md not found")
+        print()
+        print("Shareable: " + _farm_shareable_about())
+        return
+    m = re.search(r"(^## About — the explainer.*?)(?=^## Links)",
+                  text, re.DOTALL | re.MULTILINE)
+    body = m.group(1).strip() if m else text.strip()
+    print(body)
+    print()
+    print("Shareable: " + _farm_shareable_about())
+
+
+def cmd_farm_links():
+    """Clean link bundle. Static — no network."""
+    section = _farm_ref_section("Links")
+    if section:
+        print(section)
+    else:
+        # Fallback if the reference file is missing: constants, not guesses.
+        print(f"- Official site: {FARM_SITE}")
+        print(f"- Trustline checker: {FARM_BARN}")
+        print(f"- $FARM token page: {FARM_XRPLTO_TOKEN}")
+        print(f"- One-click $FARM trustline: {FARM_TRUSTLINE_SET}")
+        print(f"- Animal Fam NFTs: {FARM_XRPLTO_ANIMALFAM}")
+        print(f"- $FARM issuer: {FARM_ISSUER}")
+    print()
+    print("Shareable: Farmers Union links — site http://farmerunion.meme · "
+          "trustline checker https://barn.farmerunion.meme · $FARM token page "
+          + FARM_XRPLTO_TOKEN + " · Animal Fam NFTs " + FARM_XRPLTO_ANIMALFAM)
+
+
+def _farm_default_wallet(args, cfg):
+    if args.wallet:
+        return args.wallet
+    try:
+        prof = C.normalize_profile(C.load_profile())
+        addrs = prof.get("xrpl_addresses") or []
+    except Exception:
+        addrs = []
+    if addrs:
+        return addrs[0]
+    return (cfg or {}).get("address")
+
+
+def _farm_pool_farm_equiv(client, amm_account, lp_balance):
+    """Value an LP-token balance in FARM via amm_info. Fail-open: returns
+    (Decimal, note). A note means the valuation was skipped, never guessed."""
+    try:
+        # NB: this xrpl-py AMMInfo takes no ledger_index (validated is the
+        # server default for amm_info).
+        r = client.request(AMMInfo(amm_account=amm_account))
+    except Exception:
+        return Decimal(0), "amm_info unreachable"
+    if not r.is_successful():
+        return Decimal(0), "amm_info failed"
+    amm = (r.result or {}).get("amm") or {}
+    try:
+        outstanding = Decimal((amm.get("lp_token") or {}).get("value") or "0")
+    except Exception:
+        return Decimal(0), "amm lp_token unreadable"
+    if outstanding <= 0:
+        return Decimal(0), "amm has no LP outstanding"
+    pool_farm = Decimal(0)
+    for amt in (amm.get("amount"), amm.get("amount2")):
+        if isinstance(amt, dict) and amt.get("currency") in ("FARM",
+                                                             FARM_CURRENCY_HEX) \
+                and amt.get("issuer") == FARM_ISSUER:
+            try:
+                pool_farm += Decimal(amt.get("value") or "0")
+            except Exception:
+                pass
+    if pool_farm <= 0:
+        return Decimal(0), "no FARM in this pool"
+    try:
+        share = Decimal(lp_balance) / outstanding
+    except Exception:
+        return Decimal(0), "LP balance unreadable"
+    return share * pool_farm, ""
+
+
+def _farm_dustings_cache_path():
+    return C.XRPL_DIR / "farm-dustings.json"
+
+
+def _farm_load_dustings():
+    """Read the cached cropdusting board. Returns dict or None."""
+    try:
+        data = json.loads(
+            _farm_dustings_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("rows"):
+        return None
+    return data
+
+
+def _farm_cache_age_days(data):
+    try:
+        return (time.time() - float(data.get("fetched_at", 0))) / 86400
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _farm_parse_dustings_js(js):
+    """Parse the cropdusting table out of farmerunion.meme's JS bundle.
+    Returns [{token, issuer, status, trustline?}] or None when unusable —
+    never garbage."""
+    import re
+    rows = []
+    for m in re.finditer(
+            r'\{name:"([^"]+)",issuerAddress:"(r[A-Za-z0-9]{25,34})",'
+            r'status:"([^"]+)"\}', js):
+        name, issuer, status = m.groups()
+        rows.append({
+            "token": name,
+            "issuer": issuer,
+            "status": ("completed" if status.startswith("Completed")
+                       else "upcoming"),
+        })
+    if len(rows) < 5:
+        return None
+    # One-click trustline links, in the exact format the Union's own table uses.
+    links = {}
+    for m in re.finditer(r'\$([A-Za-z0-9]+):'
+                         r'"(https://xrpl\.services/[^"]+)"', js):
+        links["$" + m.group(1)] = m.group(2)
+    for row in rows:
+        if row["token"] in links:
+            row["trustline"] = links[row["token"]]
+    return rows
+
+
+def _farm_fetch_dustings():
+    """Fetch the live cropdusting table. Two HTTP GETs (page, then its JS
+    bundle), 15s timeouts. Returns rows or None on any failure."""
+    import re
+    import urllib.request
+
+    def get(url):
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "xrpl-muse-skill farm-dustings/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.read().decode("utf-8", "replace")
+
+    try:
+        html = get("https://farmerunion.meme/")
+    except Exception:
+        return None
+    m = re.search(r'src="(/assets/index-[A-Za-z0-9]+\.js)"', html)
+    if not m:
+        return None
+    try:
+        js = get("https://farmerunion.meme" + m.group(1))
+    except Exception:
+        return None
+    return _farm_parse_dustings_js(js)
+
+
+def cmd_farm_qualify(args, cfg, client):
+    """123,000 FARM qualification check. Ledger reads only (keyless)."""
+    wallet = _farm_default_wallet(args, cfg)
+    if not wallet:
+        sys.exit("No wallet. Pass one: xrpl-trade farm qualify <r-address>")
+    try:
+        r = client.request(AccountLines(account=wallet,
+                                        ledger_index="validated"))
+    except Exception:
+        r = None
+    if r is None or not r.is_successful():
+        print(f"AccountLines unavailable for {wallet} — cannot check "
+              "qualification right now.")
+        return
+    lines = (r.result or {}).get("lines", [])
+    farm_bal = Decimal(0)
+    lp_equiv = Decimal(0)
+    lp_notes = []
+    issuers = set()
+    for line in lines:
+        issuers.add(line.get("account"))
+        if _farm_is_farm_line(line):
+            try:
+                farm_bal += Decimal(line.get("balance") or "0")
+            except Exception:
+                pass
+        elif _farm_is_lp_currency(line.get("currency")):
+            try:
+                bal = Decimal(line.get("balance") or "0")
+            except Exception:
+                continue
+            if bal <= 0:
+                continue
+            equiv, note = _farm_pool_farm_equiv(client, line.get("account"),
+                                               bal)
+            lp_equiv += equiv
+            if note:
+                lp_notes.append(f"LP {line.get('currency')[:8]}…: {note}")
+    total = farm_bal + lp_equiv
+    gap = FARM_QUALIFY_THRESHOLD - total
+    print(f"FARM qualification — {wallet}")
+    print(f"  FARM held:          {_farm_fmt(farm_bal)}")
+    print(f"  LP FARM-equivalent: {_farm_fmt(lp_equiv)}")
+    for note in lp_notes:
+        print(f"    ({note})")
+    print(f"  Total:              {_farm_fmt(total)} / "
+          f"{_farm_fmt(FARM_QUALIFY_THRESHOLD)} required")
+    if gap <= 0:
+        print("  QUALIFIED for Farmers Union crop dustings.")
+    else:
+        print(f"  NOT QUALIFIED — short by {_farm_fmt(gap)} FARM.")
+    print("  Threshold is the Union's published figure (123,000 FARM or LP "
+          "equivalent); re-checked on-ledger just now.")
+    dust = _farm_load_dustings()
+    if dust:
+        asof = time.strftime("%Y-%m-%d",
+                             time.gmtime(dust.get("fetched_at", 0)))
+        upcoming = [row for row in dust["rows"]
+                    if row.get("status") == "upcoming"]
+        ready = [u for u in upcoming if u.get("issuer") in issuers]
+        missing = [u for u in upcoming if u.get("issuer") not in issuers]
+        print(f"  Dusting readiness (board data as of {asof}):")
+        if not upcoming:
+            print("    no upcoming dustings on the board")
+        for u in ready:
+            print(f"    READY   {u.get('token')} — issuer {u.get('issuer')}")
+        for u in missing:
+            print(f"    MISSING {u.get('token')} — issuer {u.get('issuer')} "
+                  "(no trustline)")
+        if missing:
+            print("  Missing trustlines mean missed dustings. The Union's "
+                  "list is not an endorsement — screen any issuer with "
+                  "`xrpl-trade token-safety --currency … --issuer …` before "
+                  "trusting it.")
+    else:
+        print("  Dusting readiness: board data unavailable — run "
+              "`xrpl-trade farm dustings` to load it.")
+    print()
+    verdict = "QUALIFIED" if gap <= 0 else "NOT QUALIFIED"
+    print(f"Shareable: Wallet {wallet} holds {_farm_fmt(total)} FARM "
+          f"({_farm_fmt(farm_bal)} + {_farm_fmt(lp_equiv)} LP-equiv) — "
+          f"{verdict} for Farmers Union crop dustings (123,000 FARM "
+          f"threshold, issuer {FARM_ISSUER}).")
+
+
+def cmd_farm_treasury(args, cfg, client):
+    """Live read of the 4 published treasury wallets. Keyless; fail-open per
+    wallet — one unreachable wallet never blocks the other three."""
+    total_xrp = Decimal(0)
+    total_farm = Decimal(0)
+    ok = 0
+    for label, addr in FARM_TREASURY_WALLETS:
+        try:
+            info = client.request(AccountInfo(account=addr,
+                                              ledger_index="validated"))
+            lines = client.request(AccountLines(account=addr,
+                                                ledger_index="validated"))
+        except Exception:
+            info = None
+            lines = None
+        if info is None or not info.is_successful():
+            print(f"{label} ({addr}): unavailable")
+            continue
+        try:
+            xrp = drops_to_xrp(info.result["account_data"]["Balance"])
+        except Exception:
+            print(f"{label} ({addr}): XRP balance unreadable")
+            continue
+        farm = Decimal(0)
+        if lines is not None and lines.is_successful():
+            for line in (lines.result or {}).get("lines", []):
+                if _farm_is_farm_line(line):
+                    try:
+                        farm += Decimal(line.get("balance") or "0")
+                    except Exception:
+                        pass
+        else:
+            print(f"  (trustlines unreadable for {addr} — FARM may be "
+                  "understated)")
+        total_xrp += xrp
+        total_farm += farm
+        ok += 1
+        print(f"{label}\n  {addr}\n  XRP: {_farm_fmt(xrp)} | "
+              f"FARM: {_farm_fmt(farm)}")
+    print(f"Totals across {ok}/{len(FARM_TREASURY_WALLETS)} wallets (XRPL "
+          f"only): {_farm_fmt(total_xrp)} XRP + {_farm_fmt(total_farm)} FARM")
+    print(f"Published figure: {FARM_PUBLISHED_TREASURY}")
+    print("Note: the live USD total needs a FARM/XRP price — not computed "
+          "here; the published figure is the Union's own, not ledger truth.")
+    print()
+    print(f"Shareable: Farmers Union on-chain treasury — {_farm_fmt(total_xrp)} "
+          f"XRP + {_farm_fmt(total_farm)} FARM across {ok} published wallets "
+          f"(published figure {FARM_PUBLISHED_TREASURY}).")
+
+
+def cmd_farm_dustings(args, cfg, client):
+    """Cropdusting board: upcoming vs completed. Lazy local cache
+    (~/.xrpl/farm-dustings.json), refreshed when older than 7 days or with
+    --refresh. Every render prints its data-as-of date."""
+    data = _farm_load_dustings()
+    stale = data is None or \
+        _farm_cache_age_days(data) > FARM_DUSTINGS_CACHE_DAYS
+    if args.refresh or stale:
+        fresh = _farm_fetch_dustings()
+        if fresh:
+            data = {"fetched_at": time.time(), "rows": fresh}
+            try:
+                _farm_dustings_cache_path().write_text(
+                    json.dumps(data, indent=2), encoding="utf-8")
+            except OSError:
+                pass  # cache write failure is non-fatal
+            print("board refreshed from farmerunion.meme")
+        elif data:
+            print("refresh failed or table unparsable — showing cached board")
+        else:
+            print("cropdusting board unavailable — could not fetch "
+                  "farmerunion.meme and no cache exists.")
+            return
+    rows = data["rows"]
+    asof = time.strftime("%Y-%m-%d", time.gmtime(data.get("fetched_at", 0)))
+    upcoming = [r for r in rows if r.get("status") == "upcoming"]
+    completed = [r for r in rows if r.get("status") == "completed"]
+    print(f"Farmers Union cropdusting board — data as of {asof} "
+          "(source: farmerunion.meme)")
+    print(f"Upcoming — set your trustlines ({len(upcoming)}):")
+    for r in upcoming:
+        print(f"  {r.get('token')} — issuer {r.get('issuer')}")
+        if r.get("trustline"):
+            print(f"    trustline: {r.get('trustline')}")
+    print(f"Completed ({len(completed)}):")
+    for r in completed[-5:]:
+        print(f"  {r.get('token')} — issuer {r.get('issuer')}")
+    if len(completed) > 5:
+        print(f"  …and {len(completed) - 5} earlier")
+    print("The Union's own disclaimer: inclusion on this list is not an "
+          "endorsement. Screen any issuer with `xrpl-trade token-safety "
+          "--currency … --issuer …` before setting a trustline.")
+    print()
+    names = ", ".join(r.get("token") for r in upcoming) or "none listed"
+    print(f"Shareable: Farmers Union crop-dusting board (data as of {asof}): "
+          f"{len(upcoming)} upcoming ({names}); {len(completed)} completed "
+          f"since May 2025. 123,000 $FARM (issuer {FARM_ISSUER}) qualifies. "
+          f"{FARM_SITE}")
+
+
+def cmd_farm(args, cfg, client):
+    """Farmers Union ($FARM) helper — PUBLIC, read-only. Never proposes,
+    never signs, never touches seeds."""
+    cmd = args.farm_cmd
+    if cmd == "about":
+        # Local-only: no network needed.
+        cmd_farm_about()
+    elif cmd == "links":
+        # Local-only: no network needed.
+        cmd_farm_links()
+    elif cmd == "qualify":
+        cmd_farm_qualify(args, cfg, client)
+    elif cmd == "treasury":
+        cmd_farm_treasury(args, cfg, client)
+    elif cmd == "dustings":
+        cmd_farm_dustings(args, cfg, client)
+    else:
+        sys.exit(f"unknown farm command {cmd!r}")
 
 
 def cmd_wallet(args, cfg):
@@ -3577,6 +4056,24 @@ def main():
     wr.add_argument("name")
     wc.add_parser("check", help="sweep watched wallets for NEW open NFT "
                                 "offers (offers only, read-only)")
+    p = sub.add_parser("farm", help="Farmers Union ($FARM): explainer, "
+                                    "links, qualification, treasury, "
+                                    "dustings board (read-only)")
+    farm_p = p.add_subparsers(dest="farm_cmd", required=True)
+    farm_p.add_parser("about", help="what Farmers Union is (static "
+                                   "explainer, no network)")
+    farm_p.add_parser("links", help="clean link bundle: site, trustline "
+                                    "checker, token, NFTs (no network)")
+    fq = farm_p.add_parser("qualify", help="123,000 FARM qualification check "
+                                          "for a wallet (read-only)")
+    fq.add_argument("wallet", nargs="?", default=None,
+                    help="r-address (default: first profile address)")
+    farm_p.add_parser("treasury", help="live read of the 4 published "
+                                      "treasury wallets (read-only)")
+    fd = farm_p.add_parser("dustings", help="cropdusting board: upcoming vs "
+                                           "completed (read-only)")
+    fd.add_argument("--refresh", action="store_true",
+                    help="force re-fetch of the Union's table")
     p = sub.add_parser("collection", help="local NFT collection registry: "
                                           "name -> issuer + NFTokenTaxon "
                                           "(local bookkeeping only — "
@@ -3653,6 +4150,9 @@ def main():
     p.add_argument("--days", type=int, default=None,
                    help="window in days, 1-90 (default: since last check; "
                         "--days never moves the watermark)")
+    p.add_argument("--limit", type=int, default=25,
+                   help="max mints shown per artist, newest first "
+                        "(default 25; 0 = no cap)")
     p.add_argument("--no-safety", action="store_true",
                    help="skip the per-mint xrpl.to safety one-liners")
     p = sub.add_parser("incoming", help="incoming NFT offers + recent "
@@ -3856,6 +4356,7 @@ def main():
         "collection": lambda: cmd_collection(args, cfg, client),
         "template": lambda: cmd_template(args, cfg, client),
         "giveaway": lambda: cmd_giveaway(args, cfg, client),
+        "farm": lambda: cmd_farm(args, cfg, client),
     }[args.cmd]()
 
 

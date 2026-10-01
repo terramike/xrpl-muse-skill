@@ -213,13 +213,31 @@ def _normalize_entry(entry):
         return {}
 
 
+def _validated_ledger_index(use_cache=True, cache_dir=None):
+    """Pin the current validated ledger index for history queries.
+
+    History scans must bound their range explicitly: a bare
+    ``ledger_index: "validated"`` on account_tx selects ONE ledger, not
+    history. Returns int or None (caller fails open).
+    """
+    try:
+        res = rpc_cached("ledger", {"ledger_index": "validated"},
+                         use_cache=use_cache, cache_dir=cache_dir)
+        return int(res.get("ledger_index", 0)) or None
+    except Exception:  # noqa: BLE001 — fail-open
+        return None
+
+
 def first_tx(account, use_cache=True, cache_dir=None):
     """Oldest validated tx affecting `account`. Dict or None. Never raises."""
     try:
+        hi = _validated_ledger_index(use_cache, cache_dir)
+        if not hi:
+            return None
         res = rpc_cached("account_tx",
                          {"account": account, "limit": 1, "forward": True,
                           "ledger_index_min": GENESIS_LEDGER,
-                          "ledger_index": "validated"},
+                          "ledger_index_max": hi},
                          use_cache=use_cache, cache_dir=cache_dir)
         txs = res.get("transactions", [])
         if txs and isinstance(txs[0], dict) and "tx" in txs[0]:
@@ -392,13 +410,18 @@ def recent_txs(account, window, use_cache=True, cache_dir=None):
     global _LAST_TX_RANGE
     txs = []
     try:
+        # Pin the upper bound once: every page scans real history
+        # (newest-first) instead of a single "validated" ledger.
+        hi = _validated_ledger_index(use_cache, cache_dir)
+        if not hi:
+            return []
         remaining = max(1, min(int(window), LINKS_MAX_WINDOW))
         marker = None
         first_page = True
         while remaining > 0:
             params = {"account": account,
                       "limit": min(remaining, 200),
-                      "ledger_index": "validated"}
+                      "ledger_index_max": hi}
             if marker:
                 params["marker"] = marker
             res = rpc_cached("account_tx", params, use_cache=use_cache,
@@ -908,9 +931,11 @@ def tx_value_flows(tx, me):
     """Value movement in one tx, from `me`'s perspective.
 
     Returns {counterparty: {"in": {ccy: Decimal}, "out": {ccy: Decimal},
-    "txs": int}}. Payments use delivered amounts; OfferCreates use
-    executed fills from AffectedNodes. NFT and non-value txs contribute
-    nothing. Never raises.
+    "txs": int}}. Only tesSUCCESS transactions count; Payments use ONLY
+    the delivered amount (never the requested Amount); OfferCreates use
+    executed fills from AffectedNodes. Failed txs and txs with missing
+    metadata contribute nothing — unavailable evidence is unknown, not
+    movement. NFT and non-value txs contribute nothing. Never raises.
     """
     flows = {}
 
@@ -930,10 +955,19 @@ def tx_value_flows(tx, me):
             return flows
         tt = tx.get("TransactionType")
         acct, dest = tx.get("Account"), tx.get("Destination")
+        meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
+        # Only successful transactions MOVE value. A failed Payment
+        # (tecPATH_DRY, tecUNFUNDED_OFFER, ...) changes nothing except
+        # the fee — counting its requested Amount would fabricate flows.
+        if meta.get("TransactionResult") != "tesSUCCESS":
+            return flows
         if tt == "Payment":
-            meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
-            ccy, dec = _parse_amount(meta.get("delivered_amount",
-                                             tx.get("Amount")))
+            # The delivered amount is the ONLY honest measure of a
+            # Payment's movement. Never fall back to the requested
+            # Amount: on a partial payment or missing metadata that
+            # would overstate what moved. Absent evidence is reported
+            # as unknown (no flow), not guessed.
+            ccy, dec = _parse_amount(meta.get("delivered_amount"))
             if not ccy or dec is None:
                 return flows
             if acct == me and dest and dest != me:
@@ -1291,10 +1325,16 @@ def _nft_trail_fallback(token_id, use_cache, cache_dir, lines):
         return lines
     found = None
     try:
+        # Scan real history (oldest-first from genesis) for the mint —
+        # a single "validated" ledger would only ever see yesterday.
+        hi = _validated_ledger_index(use_cache, cache_dir)
+        if not hi:
+            return lines
         marker = None
         for _ in range(NFT_HISTORY_MAX_PAGES):
-            params = {"account": issuer, "limit": 100,
-                      "ledger_index": "validated"}
+            params = {"account": issuer, "limit": 100, "forward": True,
+                      "ledger_index_min": GENESIS_LEDGER,
+                      "ledger_index_max": hi}
             if marker:
                 params["marker"] = marker
             res = rpc_cached("account_tx", params, use_cache=use_cache,

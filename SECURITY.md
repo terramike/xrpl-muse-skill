@@ -80,12 +80,17 @@ and enforces:
   state, lock, or audit files are not owner-only (this catches accidental
   exposure; it is not a substitute for the privileged boundary below).
 
-### Safety model additions (v0.6.0, unreleased)
+### Safety model additions (hardened v0.14.1 per third-party audit)
 
 - **Fail-closed spend state.** A corrupt `state.json` aborts signing with
   printed recovery steps — it is never treated as an empty ledger (which
-  would silently reset rolling limits). Unbound spend/mint reservations
-  are always released; only bound ones survive for reconciliation.
+  would silently reset rolling limits). `xrpl-sign recover-state` rebuilds
+  accounting from the audit log (latest outcome per transaction wins;
+  failed transactions keep only their consumed fee, matching the live
+  path); when nothing trustworthy can be rebuilt, signing stays **blocked**
+  until the operator reconciles manually and attests — the attestation is
+  audit-logged. Unbound spend/mint reservations are always released; only
+  bound ones survive for reconciliation.
 - **Validated-ledger NFT reads.** Offer entries and ownership checks pin
   to one validated ledger index and refuse unvalidated data.
 - **Terminal sanitization.** All human-supplied or ledger-supplied text

@@ -456,6 +456,7 @@ xrpl-trade favorites remove larva
 
 xrpl-trade nft-new              # new mints since the last check
 xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the watermark
+xrpl-trade nft-new --limit 10   # show newest 10 per artist (default 25; 0 = no cap)
 xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
 ```
 
@@ -468,10 +469,12 @@ xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
   spaces, and basic punctuation only; emoji and stylized Unicode are
   rejected. Labels are local notes — not proof of who owns a wallet.
 - `nft-new` walks each **artist** favorite's `account_tx` for
-  `NFTokenMint`s since its per-favorite watermark (first run: last 7
+  `NFTokenMint`s since its per-favorite watermark (first run: last 3
   days), then advances the watermark to the validated ledger. Friend
   favorites are never scanned — they're just labels. `--days` is a
-  pure window scan.
+  pure window scan. `--limit N` shows only the newest N mints per artist
+  (default 25, 0 = no cap); older mints beyond the cap are counted, not
+  listed, and the watermark still advances past them.
 - Each new piece shows the token ID, mint time, taxon, decoded URI, the
   cheapest current listing price if any ("not listed" otherwise), an
   `https://xrp.cafe/nft/<NFTokenID>` link, and a one-line xrpl.to
@@ -537,7 +540,10 @@ xrpl-trade profile clear                # start over
 What to ask: what to call them; watch-only XRPL addresses; DAO
 memberships (open list — `xaodao`, whatever they hold); what they use
 the skill for (`trading`, `nfts`, `dao-governance`, `discovery`, …);
-whether they want price-move alerts and at what threshold.
+whether they want to research Farmers Union ($FARM) — a yes tags the
+`farmers-union` interest and points at `xrpl-trade farm about` (default
+no, entirely local); whether they want price-move alerts and at what
+threshold.
 
 **The seed rule (non-negotiable):** NEVER ask for a seed, secret key,
 or passphrase — ask for the watch-only classic address (starts with
@@ -750,6 +756,41 @@ Hard rules, from the file's own header — never weakened:
   confirm it from an official source or describe the association as
   unverified.
 
+## Farmers Union ($FARM) helper
+
+`xrpl-trade farm` is the skill's Farmers Union add-in — built so farmers can
+research the system, check their standing, and draft posts from real numbers.
+**Read-only, keyless, public** (in `--help`, unlike hidden commands). It never
+builds proposals, never signs, never touches seeds.
+
+- `references/farm.md` is the single source of truth for the explainer and
+  the link bundle (`farm about`, `farm links` print it — no network).
+- The trust anchor is the $FARM issuer `rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU`
+  — tickers mean nothing; the address is the identity.
+- Qualification threshold: **123,000 FARM** or LP equivalent (the Union's
+  published figure — `farm qualify` re-checks it on-ledger, never trusts it).
+- `farm dustings` mirrors the Union's cropdusting table with a lazy cache;
+  every render prints "data as of". Their disclaimer stands: inclusion on the
+  list is not an endorsement — the skill never recommends a dusting trustline
+  without the `token-safety` screen, and trustline creation itself stays in
+  the propose → approve → sign ceremony (a later phase, not this one).
+- Attribute everything: site figures are labeled "site figure, <date>";
+  aggregator numbers carry their source; live ledger reads say so.
+
+## LuckyHash (reference)
+
+`references/luckyhash.md` covers LuckyHash (luckyhash.win), the provably-fair
+XRPL gaming platform in the trusted-links registry (Gaming): game list with
+verified deep links, bet lifecycle, accepted tokens, and the gift system.
+When the user says "luckyhash menu", reply with the labeled link menu from
+that file.
+
+Hard boundary, from the file's own header — never weakened: the assistant
+cannot buy or play on the user's behalf. There is no public API; every bet
+and every gift purchase is a payment the user signs in their own wallet
+(Xaman/Joey). Never claim to have placed a bet, and never construct a
+payment pretending it is a LuckyHash bet.
+
 ## Menu presentation (standard)
 
 When presenting this skill in chat, **always use clickable button menus
@@ -766,11 +807,31 @@ not by typing commands.
 - Coffee & Crypto
 - xBoost
 
-**XRPL Actions submenu** (tappable; also as `xrpl_to.py` CLI):
-- 📈 Markets → Market Movers (`movers --view gainers|losers|volume|trending`),
-  Token Lookup (`token-lookup --issuer … --currency …`), Explain a
+**XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI):
+- 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),
+  🔍 Token Lookup (`token-lookup --issuer … --currency …`), 🧾 Explain a
   Transaction (`tx-explain --hash …`), 🐋 Whale Watch
   (`whale-watch --issuer r… --currency … [--limit 10]`)
+- 🔎 Forensics (read-only, keyless, budgeted; `references/forensic-mode.md`):
+  - 🧬 Trace (`xrpl-trade trace r… [--depth N]` — funding-origin chain)
+  - 🔗 Links (`xrpl-trade links r… r… [--window N]` — shared counterparties,
+    issuers, tokens, control overlap)
+  - 🌊 Flow (`xrpl-trade flow r… [--window N]` — top counterparties by volume)
+  - 🖼️ NFT Trail (`xrpl-trade nft-trail <token-id>` — mint → offers → held by)
+  - 🪙 Token Trail (`xrpl-trade token-trail --issuer r… --currency CODE` —
+    issuer profile, holders, issuer-involved movers)
+  - Output discipline: `LINK:` = on-ledger fact, `NOTE:` = caveat; never
+    claims common ownership without control overlap. Known addresses render
+    `LABEL: r… — "Name" (verified)`; service-wallet links get the loud
+    false-positive caveat.
+
+**Coffee & Crypto submenu:**
+- 🎰 LuckyHash (`references/luckyhash.md`; trigger "luckyhash menu") —
+  labeled deep links for Dice, Plinko, Slots, Scratchcards, Moonshot,
+  Fireworks, Hex Wheel, ODJ jackpot, Gifts (buy/redeem), Leaderboard,
+  How it works. Hard boundary: the assistant cannot buy or play — no public
+  API; every bet and gift purchase is a payment the user signs in their own
+  wallet (Xaman/Joey). Never claim to have placed a bet.
 
 **NFT submenu** adds:
 - Top Collections (`top-collections [--sort vol24h|trendingScore]`)
@@ -849,6 +910,27 @@ Reading (no seed, no proposals):
   so revoke-then-create rotates).
 - `plan-trade --pair ARMY/XRP --side buy --amount 1000 --price 0.005` —
   estimated fill, price impact vs mid, max spend (read-only)
+- `farm about` — Farmers Union ($FARM) explainer: harvesting, crop
+  dusting, the Farm Assured Guarantee, how to qualify (static,
+  `references/farm.md`, no network)
+- `farm links` — clean link bundle: farmerunion.meme, the barn trustline
+  checker, the $FARM token page, the Animal Fam NFT collection, issuer +
+  treasury addresses (static, no network)
+- `farm qualify [address]` — 123,000 FARM qualification check: FARM
+  balance + LP-token FARM-equivalent (each AMM valued individually via
+  `amm_info`, fail-open) vs the threshold, plus a trustline audit against
+  the cropdusting board. Defaults to the first profile address. Read-only.
+- `farm treasury` — live read of the 4 published Farmers Union wallets
+  (XRP + FARM each, fail-open per wallet) vs their published ~$148,150
+  site figure (2026-09-30). Read-only.
+- `farm dustings [--refresh]` — the cropdusting board: upcoming ("set
+  your trustlines") vs completed, from a lazy local cache
+  (`~/.xrpl/farm-dustings.json`, refreshed when older than 7 days).
+  Every render prints its data-as-of date. The Union's own disclaimer —
+  inclusion is not an endorsement — is printed too; screen any issuer
+  with `token-safety` before trusting it. Read-only.
+- Every `farm` command ends with a one-paragraph shareable summary
+  (farmers research *and* post with this skill).
 - `reconcile --hash …` — validated outcome of a submitted transaction
 - `trace <address> [--depth N]` — funding-origin trace: who funded this
   account, and who funded them (default 2 hops, max 3). Prints first-seen

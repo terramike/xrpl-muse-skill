@@ -17,7 +17,7 @@ Repo: https://github.com/terramike/xrpl-muse-skill
   to touch
 - `references/` — deep docs per topic: `onboarding-wizard.md`,
   `ecosystem-connectors.md`, `trusted-links.md` (verified-link registry),
-  `fuzzy-lore.md`
+  `fuzzy-lore.md`, `farm.md` (Farmers Union explainer + link bundle)
 - `bin/xrpl-trade` — the proposer CLI (builds txs, never signs)
 - `bin/xrpl-sign` — the policy-gated signer (only program that sees a seed)
 - `bin/xrpl_eco.py` — ecosystem read modules (validators, amendments,
@@ -49,6 +49,14 @@ xrpl-trade nft-trail 00081F...                  # NFT mint -> sale provenance
 xrpl-trade token-trail --issuer r... --currency USD  # issuer + holders + issuer-involved movers
 xrpl-trade <command> --help   # every command documents itself
 ```
+
+Say "menu" for the button menus: XRPL Actions (Markets + 🔎 Forensics:
+🧬 Trace, 🔗 Links, 🌊 Flow, 🖼️ NFT Trail, 🪙 Token Trail), NFT, Artists,
+Wallets, XRP News, XRPLF, Coffee & Crypto (🎰 LuckyHash), xBoost.
+
+Say "luckyhash menu" for the LuckyHash gaming deep links (reference only —
+the assistant cannot place bets; every bet is signed in the user's wallet).
+See `references/luckyhash.md`.
 
 ## Propose → approve → sign (needs human approval)
 

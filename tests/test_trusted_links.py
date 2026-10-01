@@ -25,9 +25,23 @@ def check(name, cond):
 text = LINKS.read_text() if LINKS.exists() else ""
 urls = re.findall(r"https?://[^\s)\"'<>]+", text)
 
+# Plain-http is only acceptable when the line documents it (e.g. a site that
+# genuinely serves no https, like farmerunion.meme).
+plain_http_ok = set()
+for line in text.splitlines():
+    if "plain http" in line.lower():
+        for u in re.findall(r"https?://[^\s)\"'<>]+", line):
+            if u.startswith("http://"):
+                plain_http_ok.add(u)
+
 check("registry file exists", LINKS.exists())
 check("file is non-empty", len(text) > 500)
-check("every URL is https", all(u.startswith("https://") for u in urls))
+check("every URL is https (documented plain-http exceptions allowed)",
+      all(u.startswith("https://") or u in plain_http_ok for u in urls))
+check("plain-http exceptions carry their documentation",
+      all(any("plain http" in line.lower() and u in line
+              for line in text.splitlines())
+          for u in plain_http_ok))
 check("no URL has whitespace or obvious breakage",
       all(" " not in u and "\n" not in u for u in urls))
 

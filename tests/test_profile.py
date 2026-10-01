@@ -230,6 +230,7 @@ script = iter([
     "",                # done with addresses
     "xaodao",          # memberships
     "trading, nfts",   # interests
+    "",                # farm research opt-in: skip
     "y",               # price alerts yes
     "5",               # threshold
     "",                # giveaway opt-in: skip

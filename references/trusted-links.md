@@ -69,6 +69,63 @@ second-best evidence, not direct-open verification)
 
 ---
 
+## Farmers Union ($FARM) — audited 2026-09-30
+
+### Official
+
+- Website: http://farmerunion.meme (plain http — the site serves no https) —
+  ✅ opened directly 2026-09-30
+- Trustline checker ("FARM Barn"): https://barn.farmerunion.meme — ✅
+  opened directly 2026-09-30 ("Trustlines & Socials — connect your wallet
+  to check your trustlines and manage your social profile")
+- Farmcade ("Help Sweep the Barn Floor"): https://farmcade.farmerunion.meme
+  — ✅ opened directly 2026-09-30 (casual HTML5 harvest game with Animal
+  Fam characters; score points, link an Animal Fam NFT for seasonal
+  community challenges, spend points on raffle tickets)
+
+### On-ledger (canonical — addresses, not links, are the trust anchor)
+
+- $FARM issuer: `rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU`
+  → token/trustline hub:
+  https://xrpl.to/token/rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU-4641524D00000000000000000000000000000000
+  — ✅ opened directly 2026-09-30 (929 holders / 1,451 trustlines /
+  995.08M supply when read; ⚠️ NOT verified on xrpl.to — always check the
+  issuer address, never the ticker)
+- One-click $FARM trustline setter (xrpl.services — same link format the
+  Union uses in its own cropdusting table; the user confirms in their wallet):
+  https://xrpl.services/?issuer=rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU&currency=4641524D00000000000000000000000000000000&limit=99999999999999
+- Dev Team (5/9 multisig): `rMT8ybWLuDdYytJzXWtZHPumwR5Tp7otBk`
+- Dev Team 2: `r32hxpPbwrjDTUc85vL8nYC3vuecMi42db`
+- Dev Team 3: `rKVHPrcDs87JNGJ5AxkjLE26ZcAsqAE5x`
+- Main treasury: `rfufarm4vwdDvAUu4bWwpmkvRxEvkAE9YQ`
+- (treasury/dev addresses read live off farmerunion.meme 2026-09-30;
+  re-verify on-ledger before any transaction)
+
+### NFTs (official collections)
+
+- Animal Fam (Farmer's Union x Syn3rgy Art Lab collab):
+  https://xrpl.to/nfts/animal-fam — ✅ opened directly 2026-09-30
+  (1,589 items / 302 holders when read, 79 XRP floor; ⚠️ NOT verified on
+  xrpl.to — check issuer/taxon before buying)
+
+---
+
+## Corn — friend of the skill
+
+- X: https://x.com/cornxrpl — ⚠️ profile not directly openable from this
+  environment (x.com fetch blocked at source, not a login wall); URL
+  supplied by Mike 2026-09-30 — Corn is a friend
+- Show: "Corn Sprouts" 𝕏 Space — every Monday and Wednesday, 8:15 EST
+  (AM/PM unconfirmed — verify before publishing; Mike-supplied 2026-09-30.
+  Mike plans to ask Corn about appearing on the show to talk about the
+  skill)
+- Newsletter ("One Minute Newsletter"):
+  https://cornxrpls-newsletter.beehiiv.com/ — ✅ opened directly
+  2026-09-30 (by Corn XRPL; quick reads on life, faith, growth; latest
+  post Sep 29, 2026)
+
+---
+
 ## XRPL ecosystem (hub — in progress)
 
 Status per link. `✅` directly verified, `⚠️` not yet. Fill `⚠️` entries by
@@ -171,3 +228,13 @@ info@odoo.xrpfml.com · 503-729-5214.
   ripple.com/events/swell, xrp.cafe, xrpl.to, xpmarket.com, firstledger.net,
   bithomp.com. app.xaodao.io confirmed real but wallet-gated/thin.
   xrpscan.com remains ⚠️ (fetch failed, domain unconfirmed).
+- 2026-09-30: Farmers Union ($FARM) audit — farmerunion.meme (http),
+  barn.farmerunion.meme, xrpl.to $FARM token page, and xrpl.to Animal Fam
+  NFT page all opened directly. $FARM issuer rPrAEfVATUNDTJm9CUa8tYeD7oJrVdEGhU
+  confirmed as trust anchor; neither $FARM nor Animal Fam is verified on
+  xrpl.to (recorded as ⚠️, not as failures).
+- 2026-09-30: Corn (friend of the skill) — newsletter
+  https://cornxrpls-newsletter.beehiiv.com/ opened directly ("One Minute
+  Newsletter" by Corn XRPL). x.com/cornxrpl stays ⚠️ (x.com fetch blocked
+  by this environment's policy; URL supplied by Mike). "Corn Sprouts" 𝕏
+  Space Mon/Wed 8:15 EST per Mike — AM/PM unconfirmed.

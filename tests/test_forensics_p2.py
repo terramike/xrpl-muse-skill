@@ -49,7 +49,8 @@ def pay_tx(sender, dest, amount="25000000", ledger=100, h="H" * 16):
     return {"Account": sender, "Destination": dest,
             "TransactionType": "Payment", "Amount": amount,
             "ledger_index": ledger, "hash": h,
-            "meta": {"delivered_amount": amount}}
+            "meta": {"delivered_amount": amount,
+                     "TransactionResult": "tesSUCCESS"}}
 
 
 def iou_tx(sender, dest, ccy, issuer, value, ledger=100):
@@ -57,7 +58,8 @@ def iou_tx(sender, dest, ccy, issuer, value, ledger=100):
     return {"Account": sender, "Destination": dest,
             "TransactionType": "Payment", "Amount": amt,
             "ledger_index": ledger, "hash": "H" * 16,
-            "meta": {"delivered_amount": amt}}
+            "meta": {"delivered_amount": amt,
+                     "TransactionResult": "tesSUCCESS"}}
 
 
 def offer_fill_tx(me, cp, gets_consumed, pays_consumed, partial=True):
@@ -79,7 +81,8 @@ def offer_fill_tx(me, cp, gets_consumed, pays_consumed, partial=True):
         node["PreviousFields"]["TakerPays"] = str(9000000 + pays_consumed)
     return {"Account": me, "TransactionType": "OfferCreate",
             "ledger_index": 100, "hash": "H" * 16,
-            "meta": {"AffectedNodes": [wrap,
+            "meta": {"TransactionResult": "tesSUCCESS",
+                     "AffectedNodes": [wrap,
                                        {"ModifiedNode":
                                         {"LedgerEntryType": "Offer",
                                          "FinalFields": {"Account": me}}}]}}
@@ -209,6 +212,73 @@ class ValueFlowTest(unittest.TestCase):
         self.assertIn(f"USD.{ISSUER}", flows[B]["in"])
         self.assertIn("XRP", flows[B]["out"])
 
+    # --- v0.14.1 regression: only successful, delivered value counts ---
+    def test_failed_payment_records_no_flow(self):
+        tx = pay_tx(B, A, amount="10000000")
+        tx["meta"]["TransactionResult"] = "tecPATH_DRY"
+        self.assertEqual(fx.tx_value_flows(tx, A), {})
+
+    def test_failed_offer_create_ignored(self):
+        tx = offer_fill_tx(A, B, 10, 1000000, partial=True)
+        tx["meta"]["TransactionResult"] = "tecUNFUNDED_OFFER"
+        self.assertEqual(fx.tx_value_flows(tx, A), {})
+
+    def test_missing_delivered_amount_no_flow(self):
+        tx = pay_tx(B, A, amount="10000000")
+        del tx["meta"]["delivered_amount"]  # no evidence → unknown, not 10
+        self.assertEqual(fx.tx_value_flows(tx, A), {})
+
+    def test_requested_amount_never_used(self):
+        # partial payment: requested 10, delivered 9 — the 10 must not
+        # leak in anywhere
+        tx = pay_tx(B, A, amount="10000000")
+        tx["meta"]["delivered_amount"] = "9000000"
+        flows = fx.tx_value_flows(tx, A)
+        self.assertEqual(flows[B]["in"], {"XRP": Decimal("9")})
+
+
+# ---------------------------------------------------------------- pinned ranges
+# v0.14.1 regression: history scans pin ONE validated ledger and use
+# explicit ledger ranges (a bare ledger_index="validated" on account_tx
+# selects a single ledger, not history).
+
+class PinnedRangeTest(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+        def fake(method, params):
+            self.calls.append((method, dict(params)))
+            if method == "ledger":
+                return {"ledger_index": 107331581}
+            if method == "account_tx":
+                return tx_page([])
+            raise AssertionError(f"unexpected {method}")
+        self.fake = fake
+
+    def test_first_tx_scans_genesis_to_pinned(self):
+        with mock.patch.object(fx, "_rpc", self.fake):
+            fx.first_tx(A, use_cache=False)
+        tx_calls = [p for m, p in self.calls if m == "account_tx"]
+        self.assertEqual(len(tx_calls), 1)
+        p = tx_calls[0]
+        self.assertEqual(p["ledger_index_min"], fx.GENESIS_LEDGER)
+        self.assertEqual(p["ledger_index_max"], 107331581)
+        self.assertTrue(p.get("forward"))  # oldest-first
+        self.assertNotIn("ledger_index", p)  # no bare "validated" misuse
+
+    def test_recent_txs_pins_one_upper_ledger(self):
+        with mock.patch.object(fx, "_rpc", self.fake):
+            fx.recent_txs(A, 50, use_cache=False)
+        tx_calls = [p for m, p in self.calls if m == "account_tx"]
+        self.assertEqual(len(tx_calls), 1)
+        p = tx_calls[0]
+        self.assertEqual(p["ledger_index_max"], 107331581)
+        self.assertNotIn("ledger_index", p)
+        # the pin itself is exactly one ledger RPC call
+        ledger_calls = [p for m, p in self.calls if m == "ledger"]
+        self.assertEqual(len(ledger_calls), 1)
+        self.assertEqual(ledger_calls[0]["ledger_index"], "validated")
+
 
 # ---------------------------------------------------------------- labels
 
@@ -272,6 +342,9 @@ class LabelsTest(unittest.TestCase):
 
 def make_flow_rpc(pages):
     def fake(method, params):
+        if method == "ledger":
+            # _validated_ledger_index pins the scan's upper bound
+            return {"ledger_index": 107331581}
         if method == "account_tx":
             return tx_page(pages.get(params["account"], []))
         raise AssertionError(f"unexpected {method}")
@@ -313,7 +386,9 @@ class FlowTest(unittest.TestCase):
 
     def test_thin_node_history_note(self):
         def fake(method, params):
-            self.assertEqual(method, "account_tx")
+            self.assertIn(method, ("ledger", "account_tx"))
+            if method == "ledger":
+                return {"ledger_index": 107331581}
             return {"transactions": [], "ledger_index_min": 107331581,
                     "ledger_index_max": 107331581}
         with mock.patch.object(fx, "_rpc", fake):
@@ -324,6 +399,8 @@ class FlowTest(unittest.TestCase):
 
     def test_full_history_no_note(self):
         def fake(method, params):
+            if method == "ledger":
+                return {"ledger_index": 107331581}
             return {"transactions": [], "ledger_index_min": 32570,
                     "ledger_index_max": 107331581}
         with mock.patch.object(fx, "_rpc", fake):
@@ -335,8 +412,9 @@ class FlowTest(unittest.TestCase):
 
 # ---------------------------------------------------------------- nft-trail
 
-def make_nft_rpc(history, offers=None, fail_history=False):
+def make_nft_rpc(history, offers=None, fail_history=False, holders=None):
     offers = offers or {}
+    holders = holders or {}
 
     def fake(method, params):
         if method == "nft_history":
@@ -428,6 +506,9 @@ class NftTrailTest(unittest.TestCase):
         def fake(method, params):
             if method == "nft_history":
                 raise RuntimeError("unknown method")
+            if method == "ledger":
+                # _nft_trail_fallback pins one validated upper ledger
+                return {"ledger_index": 107331581}
             if method == "account_tx" and params["account"] == issuer:
                 return tx_page([mint_tx(A)])
             if method in ("nft_sell_offers", "nft_buy_offers"):
@@ -553,7 +634,8 @@ def make_links_rpc():
             return {"lines": [{"account": ISSUER, "currency": "USD",
                                 "balance": "10"}]}
         if method == "ledger":
-            return {"ledger": {"close_time": 800000000}}
+            return {"ledger_index": 107331581,
+                    "ledger": {"close_time": 800000000}}
         if method == "ledger_entry":
             return {"node": {}}
         raise AssertionError(f"unexpected {method}")

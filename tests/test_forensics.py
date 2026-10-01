@@ -152,7 +152,10 @@ def make_rpc(first_map, info_map=None, objs_map=None):
         if method == "account_objects":
             return {"account_objects": objs_map.get(params["account"], [])}
         if method == "ledger":
-            return {"ledger": {"close_time": 800000000}}
+            # Real `ledger` responses carry the validated index at top
+            # level — first_tx/recent_txs pin history ranges to it.
+            return {"ledger_index": 1000,
+                    "ledger": {"close_time": 800000000}}
         if method == "account_lines":
             return {"lines": []}
         if method == "ledger_entry":
@@ -252,6 +255,9 @@ class LinksTest(unittest.TestCase):
                 return {"account_objects": []}
             if method == "account_lines":
                 return {"lines": [{"account": ISSUER}]}
+            if method == "ledger":
+                return {"ledger_index": 1000,
+                        "ledger": {"close_time": 800000000}}
             raise AssertionError(method)
         self.fake = fake
 

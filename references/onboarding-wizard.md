@@ -57,7 +57,7 @@ Walk them through these in order; everything here needs zero keys:
 3. **Policy** — `xrpl-sign init-policy`: writes `~/.xrpl/policy.json`,
    testnet-locked.
 4. **Profile** — `xrpl-trade profile init`: the questionnaire
-   (name, watch addresses, interests, alerts).
+   (name, watch addresses, interests, the Farmers Union opt-in, alerts).
 5. **First read** — pick one: `xrpl-trade movers`, `xrpl-trade balance`,
    or `xrpl-trade token-lookup --issuer r… --currency …`.
 

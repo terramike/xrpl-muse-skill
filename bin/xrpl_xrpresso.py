@@ -237,11 +237,36 @@ def get_nft_auctions(limit=12):
 # ---------- display ----------
 
 def _text(v):
-    """Coerce an API string field to safe display text."""
+    """Coerce an API string field to safe display text.
+
+    Same escaping contract as xrpl_common.safe_terminal_text: hostile
+    bytes render as visible \\x / \\u escapes so they can neither act
+    on the terminal nor hide invisibly. Kept local so this module has
+    no import-time dependency on xrpl_common.
+    """
     if v is None:
         return ""
-    s = str(v)
-    return s if len(s) <= 300 else s[:297] + "..."
+    import unicodedata as _ud
+    out = []
+    for ch in str(v):
+        if _ud.category(ch) in ("Cc", "Cf", "Cs", "Zl", "Zp"):
+            o = ord(ch)
+            if ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            elif o < 0x20 or o == 0x7F:
+                out.append(f"\\x{o:02x}")
+            elif o < 0x10000:
+                out.append(f"\\u{o:04x}")
+            else:
+                out.append(f"\\U{o:08x}")
+        else:
+            out.append(ch)
+    t = "".join(out)
+    return t if len(t) <= 300 else t[:297] + "..."
 
 
 def _price(item):

@@ -410,12 +410,22 @@ with tempfile.TemporaryDirectory() as td:
                   "outside the NFT media directory" in str(e))
     del os.environ["PINATA_JWT"]
     P._post = real_post  # real transport: must fail on the missing key
+    # hermetic "no credential anywhere": the vault-surrogate fallback must
+    # also be unavailable, otherwise this box's authd would satisfy it.
+    import types as _types
+    _fake_dc = _types.ModuleType("dynamic_credentials")
+    def _no_vault(req, *a, **k):
+        raise RuntimeError("no custom.pinata connector")
+    _fake_dc.add_surrogate_to_request = _no_vault
+    sys.modules["dynamic_credentials"] = _fake_dc
     try:
         P.pin_file(art_path, media_dir=tmedia)
         check("missing PINATA_JWT fails cleanly", False)
     except SystemExit as e:
         check("missing PINATA_JWT fails cleanly",
               "PINATA_JWT" in str(e))
+    finally:
+        del sys.modules["dynamic_credentials"]
     # (module is reloaded fresh on every test run; no restore needed)
 
     # --- 13. derived ceremony text for the new types ---
@@ -449,10 +459,14 @@ with tempfile.TemporaryDirectory() as td:
           od["Flags"] == 1 and od["Amount"] == "2500000")
 
     # --- 15. nft-buy / nft-bid (stub ledger, no network) ---
-    from xrpl.models.requests import AccountNFTs, LedgerEntry
+    from xrpl.models.requests import AccountNFTs, LedgerEntry, Ledger
 
     OFFER_IDX = "AB" * 32
     TOKEN = "CD" * 32
+    # v0.14.1: reads pin to ONE validated ledger. The stub serves every
+    # read from this ledger; provenance mismatches are simulated below.
+    PINNED = 107331581
+    MINTER = Wallet.create().classic_address  # != ACCT: a resale
 
     def sell_entry(**kw):
         e = {"LedgerEntryType": "NFTokenOffer", "Flags": 1,
@@ -469,22 +483,38 @@ with tempfile.TemporaryDirectory() as td:
             return self._ok
 
     class StubClient:
-        """Ledger double: one offer entry + the seller's NFT page."""
-        def __init__(self, offer, nfts):
+        """Ledger double: one offer entry + the seller's NFT page.
+
+        Serves every read from PINNED (one validated ledger). Pass
+        ledger_skew=True to simulate a node answering from a different
+        ledger, or unvalidated=True for an explicit validated:false."""
+        def __init__(self, offer, nfts, ledger_skew=False,
+                     unvalidated=False):
             self.offer = offer
             self.nfts = nfts
+            self.ledger_skew = ledger_skew
+            self.unvalidated = unvalidated
+
+        def _result(self, payload):
+            r = dict(payload)
+            r["ledger_index"] = (PINNED + 1) if self.ledger_skew else PINNED
+            r["validated"] = not self.unvalidated
+            return StubResp(True, r)
 
         def request(self, req):
+            if isinstance(req, Ledger):
+                return StubResp(True, {"ledger_index": PINNED,
+                                       "validated": True})
             if isinstance(req, LedgerEntry):
                 if self.offer is None:
                     return StubResp(False, {"error": "entryNotFound"})
-                return StubResp(True, {"node": self.offer})
+                return self._result({"node": self.offer})
             if isinstance(req, AccountNFTs):
-                return StubResp(True, {"account_nfts": self.nfts})
+                return self._result({"account_nfts": self.nfts})
             raise AssertionError("unexpected request type")
 
     seller_nfts = [{"NFTokenID": TOKEN, "URI": GOOD_URI,
-                    "NFTokenTaxon": 7, "Flags": 9}]
+                    "NFTokenTaxon": 7, "Flags": 9, "Issuer": MINTER}]
     good_client = StubClient(sell_entry(), seller_nfts)
     pol_on = json.loads(json.dumps(base_policy))
     pol_on["nft"]["allow_buy_offers"] = True
@@ -546,6 +576,28 @@ with tempfile.TemporaryDirectory() as td:
     check("verification shows seller + token + price + uri + taxon",
           ACCT in report and TOKEN in report and "2.000000 XRP" in report
           and "ipfs://" in report and "7" in report)
+    # v0.14.1: issuer (minter) is a separate identity from the seller
+    check("report shows seller and issuer as separate lines",
+          f"seller:   {ACCT} (current owner)" in report
+          and f"issuer:   {MINTER} (minter)" in report)
+    check("resale flagged when seller is not the minter",
+          "seller is NOT the minter" in report)
+    lines_m, d_m, amt_m = C.nft_sell_offer_report(
+        StubClient(sell_entry(Owner=MINTER),
+                   [{"NFTokenID": TOKEN, "URI": GOOD_URI,
+                     "NFTokenTaxon": 7, "Flags": 9, "Issuer": MINTER}]),
+        OFFER_IDX)
+    check("minter selling direct shows no resale note",
+          not d_m and "seller is NOT the minter"
+          not in "\n".join(lines_m))
+    _, d, _ = C.nft_sell_offer_report(
+        StubClient(sell_entry(), seller_nfts, ledger_skew=True), OFFER_IDX)
+    check("ledger provenance mismatch refused",
+          any("not the pinned validated ledger" in x for x in d))
+    _, d, _ = C.nft_sell_offer_report(
+        StubClient(sell_entry(), seller_nfts, unvalidated=True), OFFER_IDX)
+    check("explicit unvalidated data refused",
+          any("unvalidated data" in x for x in d))
 
     # nft-bid (buy offer) policy
     def bid_tx(owner=DEST, amount="1000000", flags=0):

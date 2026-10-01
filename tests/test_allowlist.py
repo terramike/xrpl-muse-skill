@@ -46,7 +46,10 @@ C.AUDIT_PATH = tmp / "audit.log"
 
 
 def write_policy(entries):
+    # NB: strict policy validation (v0.14.1) requires spend_limits, valid
+    # checksum addresses, and integer added_at — write a real policy.
     pol = {"policy_version": C.POLICY_VERSION,
+           "spend_limits": {"XRP": {"per_tx": "25", "per_day": "100"}},
            "destination_allowlist": entries}
     C.POLICY_PATH.write_text(json.dumps(pol))
     os.chmod(C.POLICY_PATH, 0o600)
@@ -63,10 +66,13 @@ def audit_entries():
             if l.strip()]
 
 
-ADDR_NEW = "rNewDestination11111111111111111111"
-ADDR_OLD = "rOldDestination22222222222222222222"
-ADDR_GRANDFATHERED = "rGrandfathered3333333333333333333"
-ADDR_ABSENT = "rAbsent44444444444444444444444444"
+# Valid classic addresses (checksum-verified; generated for fixtures only —
+# strict policy validation rejects fake addresses, so rFoo… placeholders
+# can no longer be used here).
+ADDR_NEW = "rLsz9V4MhwHVtaGFCZs7qimrbdHFWFMuBC"
+ADDR_OLD = "r34yeMRhaYTF5P56bmCiygZGJGkzyNkrFs"
+ADDR_GRANDFATHERED = "rUQBDUAPtrZHYnoVS2h43owaG26SURnrYc"
+ADDR_ABSENT = "rpfGjiK4wNTD7mUZ3JB7sdLdXRB9SZUFnP"
 
 # ---------- add: timestamp + audit ----------
 

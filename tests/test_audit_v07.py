@@ -348,21 +348,28 @@ check("P1-3 sweep on validated failure retains fee",
       entries[0]["asset"] == "XRP" and
       "tecPATH_DRY" in entries[0].get("note", ""))
 
-# recover-state: quarantines invalid, keeps pending obligations.
+# recover-state: quarantines invalid as pending holds, keeps pending
+# obligations. (v0.14.1: a quarantined record keeps counting toward limits
+# — it must never silently vanish from accounting. A corrupt *amount* is
+# unrecoverable locally, so the whole state rebuilds from the audit log
+# instead; see test_recovery.py.)
 C.STATE_PATH.write_text(json.dumps({"entries": [
     {"rid": "good", "ts": int(time.time()), "asset": "XRP", "amount": "2",
      "status": "pending", "tx_hash": None, "last_ledger": None,
      "submit_ledger": None},
     {"rid": "bad", "ts": int(time.time()), "asset": "XRP",
-     "amount": "-99", "status": "confirmed"},
+     "amount": "3", "status": "bogus"},
 ]}))
 import io as _io, contextlib as _cl
 with _cl.redirect_stdout(_io.StringIO()):
     S.cmd_recover_state(type("A", (), {})())
 rec = tr._load()["entries"]
-check("P2-6 recover-state keeps valid pending, quarantines invalid",
-      len(rec) == 1 and rec[0]["rid"] == "good" and
-      rec[0]["status"] == "pending")
+good = [e for e in rec if e.get("rid") == "good"]
+hold = [e for e in rec if e.get("quarantined")]
+check("P2-6 recover-state keeps valid pending, quarantines invalid as hold",
+      len(rec) == 2 and len(good) == 1 and good[0]["status"] == "pending"
+      and len(hold) == 1 and hold[0]["status"] == "pending"
+      and hold[0]["amount"] == "3")
 
 n_fail = sum(1 for _, ok in PASS if not ok)
 print(f"\n{len(PASS) - n_fail}/{len(PASS)} passed")

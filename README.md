@@ -1,10 +1,10 @@
-# xrpl-muse-skill v0.12.0
+# xrpl-muse-skill v0.14.1
 
 Trade the XRP Ledger from the terminal — any token pair — with a hard safety
 boundary between **proposing** a trade and **signing** it.
 
 Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
-terminal), but safe for humans too.
+terminal).
 
 ## The idea
 
@@ -63,6 +63,38 @@ xrpl-trade stablecoin RLUSD  # supply by chain + price (via DefiLlama)
 xrpl-trade oracle XRP USD    # on-ledger XLS-47 price feeds (Band + DIA)
 ```
 
+## What's new in v0.14.1
+
+**Security release** — a third-party audit of v0.14.0 raised seven findings;
+all seven are fixed, with focused regression tests
+(`tests/test_recovery.py`, `test_sanitize_display.py`,
+`test_policy_strict.py`, `test_hash_approval.py`,
+`test_cmd_sign_cleanup.py`):
+
+- **Spend-state recovery** — a corrupt spend-state file fails closed as
+  before, and `xrpl-sign recover-state` now rebuilds accounting from the
+  audit log (latest outcome per transaction wins; failed transactions keep
+  only their consumed fee, matching the live path). When nothing
+  trustworthy can be rebuilt, signing stays **blocked** until the operator
+  reconciles manually and attests — the attestation is audit-logged.
+- **Approval-display sanitization** — every untrusted field on the ceremony
+  screen is escaped to visible sequences (ANSI/OSC, control chars, bidi
+  overrides can neither act on the terminal nor hide invisibly).
+- **Strict policy validation** — `load_policy()` rejects unknown keys,
+  wrong types (the string `"false"` is truthy), non-finite limits, bad
+  addresses/tags, and invalid ranges before the policy is used;
+  `spend_limits` is required.
+- **Exact full proposal hashes** — `--approve` requires the complete
+  64-hex hash matching the verified envelope; prefixes are
+  inspection-only and can never select a signing target.
+- **Forensic ledger ranges** — account-history scans use real pinned
+  ledger ranges instead of bare `ledger_index: "validated"`.
+- **Pinned NFT verification** — NFT reads pin to one validated ledger and
+  the report shows **seller** (current owner) vs **issuer** (minter)
+  separately, with a resale warning when they differ.
+- **Delivered-value flows only** — forensic value flows count only
+  `tesSUCCESS` transactions' `delivered_amount`, never requested amounts.
+
 ## What's new in v0.12.0
 
 - **`validators` / `amendments`** — watch the network upgrade itself:
@@ -111,6 +143,24 @@ Start with [`llms.txt`](llms.txt) — the curated entry point: what this is,
 the files that matter, the safety invariants. [`AGENTS.md`](AGENTS.md) has
 contributor guidance (tests, conventions, what never to touch).
 [`SKILL.md`](SKILL.md) is the full operator manual (971 lines).
+
+## Deployment profiles
+
+Testnet-safe by default. Three profiles, pick one deliberately:
+
+- **Muse vault signer** — the recommended mainnet path. The seed lives in
+  the Muse vault and is injected into `xrpl-sign` only after genuine human
+  approval of the exact proposal hash. Never exported, never pasted.
+- **Xaman-human** — the human signs in Xaman; the agent only proposes.
+- **Autonomous-experimental** — local-only, dry-run-only experiments.
+  Excluded from public releases.
+
+## What this does not do
+
+The NFT safety checks verify on-ledger facts (issuer, seller, offer
+terms). That layer does **not** protect market value, and says nothing
+about who owns the underlying art — a token can be authentic
+on-ledger and still be worthless or infringing.
 
 ## Security
 

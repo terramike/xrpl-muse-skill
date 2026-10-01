@@ -317,6 +317,8 @@ check("allowlist add fails closed with no policy",
 
 fresh()
 C.POLICY_PATH.write_text(json.dumps({"policy_version": C.POLICY_VERSION,
+                                     "spend_limits": {"XRP": {"per_tx": "25",
+                                                              "per_day": "100"}},
                                      "destination_allowlist": []}))
 os.chmod(C.POLICY_PATH, 0o600)
 check("allowlist add works", C.add_destination_allowlist_entry(DW, 777) is None)
@@ -336,6 +338,8 @@ check("policy file is 0600 after edit", mode(C.POLICY_PATH) == "0o600")
 
 fresh()
 C.POLICY_PATH.write_text(json.dumps({"policy_version": C.POLICY_VERSION,
+                                     "spend_limits": {"XRP": {"per_tx": "25",
+                                                              "per_day": "100"}},
                                      "destination_allowlist": []}))
 os.chmod(C.POLICY_PATH, 0o600)
 prof = C.default_profile()
@@ -357,6 +361,8 @@ check("confirmed opt-in persisted 0600",
 
 fresh()
 C.POLICY_PATH.write_text(json.dumps({"policy_version": C.POLICY_VERSION,
+                                     "spend_limits": {"XRP": {"per_tx": "25",
+                                                              "per_day": "100"}},
                                      "destination_allowlist": []}))
 os.chmod(C.POLICY_PATH, 0o600)
 prof = C.default_profile()

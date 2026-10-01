@@ -538,9 +538,9 @@ def load_seed(seed_src=("env", "XRPL_SEED")):
             sys.exit("autopilot seed unavailable (disabled, wrong account, "
                      "or bad file permissions) — run "
                      "`xrpl-trade autopilot status` to inspect.")
-        sys.exit(f"No seed from {kind}:{ref} — the vault injects it after "
-                 f"genuine human approval. It is never exported by hand or "
-                 f"read from a chat log (see SECURITY.md).")
+        sys.exit(f"No seed: the vault did not inject {ref} after genuine "
+                 f"human approval — it is never exported by hand or pasted "
+                 f"from a chat log (see SECURITY.md).")
     return seed
 
 
@@ -639,7 +639,13 @@ def cmd_sign(args):
                 "read_only_refused",
                 "approve attempted while read_only=true")
         sys.exit(1)
-    prop, path = C.load_proposal(args.hash)
+    # Proposal selection: approval binds to ONE exact proposal — the complete
+    # 64-hex hash is required to sign. Prefix matching is inspection-only
+    # (review without --approve) and can never select a signing target.
+    if args.approve:
+        prop, path = C.load_proposal_exact(args.hash)
+    else:
+        prop, path = C.load_proposal(args.hash)
 
     # envelope verification: tamper evidence for everything the human reviewed
     try:
@@ -650,6 +656,17 @@ def cmd_sign(args):
                 prop.get("network", "?"), prop.get("account", "?"),
                 "proposal_rejected", str(e))
         sys.exit(f"Proposal rejected: {e}")
+    if args.approve:
+        try:
+            C.require_full_hash_for_approve(args.hash, prop)
+        except SystemExit as e:
+            # verify_proposal already binds filename == proposal_hash; this
+            # is the explicit approval-to-envelope comparison the ceremony
+            # needs.
+            C.audit("?", prop.get("proposal_hash", "?"), None,
+                    prop.get("network", "?"), prop.get("account", "?"),
+                    "proposal_rejected", str(e))
+            raise
 
     # P1-1: the signing context (policy + credential + account + network +
     # state) is resolved from the bound profile BEFORE any credential access.
@@ -684,12 +701,14 @@ def cmd_sign(args):
 
     # ---- the ceremony: everything below is DERIVED from the tx ----
     print("=" * 60)
-    print(f"PROPOSAL {prop['proposal_hash'][:16]}… "
+    print(f"PROPOSAL {prop['proposal_hash']} "
           f"({age // 60}m old, {prop['network']})")
     print(f"  account:  {tx['Account']}")
     print("=" * 60)
     for ln in C.describe_tx(tx, prop.get("action", "?")):
-        print("  " + ln)
+        # Defense in depth: the ceremony screen never prints raw
+        # proposal/ledger text — sanitize every line at display time.
+        print("  " + C.safe_terminal_text(ln))
     if tx.get("TransactionType") == "NFTokenAcceptOffer":
         # The buy ceremony: re-verify the sell offer from the ledger AT
         # SIGNING time and show the authoritative facts. If the offer
@@ -698,14 +717,15 @@ def cmd_sign(args):
         rlines, rdenials, _ = C.nft_sell_offer_report(
             client, tx.get("NFTokenSellOffer", ""))
         print("  --- sell offer re-verified from the ledger at signing ---")
-        print("  VERIFY the seller below is the minter you expect; anyone "
-              "can mint the same artwork.")
+        print("  VERIFY the issuer below is the artist you expect; anyone "
+              "can mint the same artwork. On a resale the seller is only "
+              "the current owner.")
         for ln in rlines:
-            print("  " + ln)
+            print("  " + C.safe_terminal_text(ln))
         if rdenials:
             print("  ✗ the offer changed since the proposal:")
             for d in rdenials:
-                print(f"    ✗ {d}")
+                print(f"    ✗ {C.safe_terminal_text(d)}")
             C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
                     prop["network"], tx["Account"], "policy_denied",
                     "offer changed at signing: " + "; ".join(rdenials),
@@ -717,7 +737,7 @@ def cmd_sign(args):
     if denials:
         print("POLICY DENIED:")
         for d in denials:
-            print(f"  ✗ {d}")
+            print(f"  ✗ {C.safe_terminal_text(d)}")
         C.audit(prop.get("action", "?"), prop["proposal_hash"], None,
                 prop["network"], tx["Account"], "policy_denied",
                 "; ".join(denials), spends)
@@ -731,7 +751,8 @@ def cmd_sign(args):
             print(f"The vault releases {C.GIVEAWAY_SEED_ENV} only on that "
                   "genuine human approval.")
         else:
-            print(f"  xrpl-sign --hash {prop['proposal_hash'][:16]} --approve")
+            # Approval demands the COMPLETE hash — never a prefix.
+            print(f"  xrpl-sign --hash {prop['proposal_hash']} --approve")
             print("The vault releases the seed only on that genuine human approval.")
         return
 
@@ -763,7 +784,15 @@ def cmd_sign(args):
                     "atomic mint reserve: " + msg, spends)
             sys.exit(f"Mint-quota reservation failed: {msg}")
 
-    seed = load_seed(seed_src)
+    try:
+        seed = load_seed(seed_src)
+    except SystemExit:
+        # A missing/unreadable seed must not leak the reservation: the
+        # headline v0.6.0 regression. Nothing was signed, so the budget
+        # hold is released before the abort propagates.
+        tracker.release_reservation(rid)
+        tracker.release_reservation(mrid)
+        raise
     try:
         wallet = Wallet.from_seed(seed)
     except Exception:
@@ -793,8 +822,17 @@ def cmd_sign(args):
 
     from xrpl.models.transactions import Transaction
     tx_obj = Transaction.from_xrpl(tx)  # tx stored in PascalCase wire format
-    signed = sign_tx(tx_obj, wallet)
-    thash = signed.get_hash()
+    try:
+        signed = sign_tx(tx_obj, wallet)
+        thash = signed.get_hash()
+    except BaseException:
+        # The signature never existed: nothing could have reached the
+        # ledger, so the budget reservations are released here — a
+        # sign-time crash must not leave a pending reservation that
+        # sweep_pending could never resolve (no tx hash to look up).
+        tracker.release_reservation(rid)
+        tracker.release_reservation(mrid)
+        raise
     last_ledger = tx.get("LastLedgerSequence")
 
     # Bind the reservation(s) to the signed tx, then persist BEFORE submitting:
@@ -839,14 +877,25 @@ def cmd_sign(args):
     print(f"result:    {tres}")
 
     ok = validated and tres == "tesSUCCESS"
-    C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
-            prop["network"], tx["Account"],
-            "applied" if ok else f"failed:{tres}", "", spends)
     if ok:
+        C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
+                prop["network"], tx["Account"], "applied", "", spends)
         tracker.confirm(thash)
         path.unlink()  # proposal consumed
     else:
-        # P1-3: the failed tx still consumed its fee — retain it.
+        # P1-3: the failed tx still consumed its fee — retain it, and
+        # record the audit entry fee-only so state recovery reconstructs
+        # exactly what the live path kept (never the released trade
+        # amounts). The attempted spends stay in the note for forensics.
+        from xrpl.utils import drops_to_xrp
+        from decimal import Decimal as _D
+        fee_xrp = _D(drops_to_xrp(str(tx.get("Fee", "0"))))
+        fee_spends = {"XRP": str(fee_xrp)} if fee_xrp > 0 else {}
+        C.audit(prop.get("action", "?"), prop["proposal_hash"], thash,
+                prop["network"], tx["Account"], f"failed:{tres}",
+                f"fee-retained: attempted spends {spends} released, "
+                f"consumed fee {fee_xrp} XRP kept",
+                fee_spends)
         tracker.release_tx(thash, fee_drops=tx.get("Fee", "0"))
         sys.exit(f"Not applied: {tres}")
 
@@ -922,13 +971,108 @@ def cmd_sync_profile(args):
           f"({pf['policy_sha256'][:16]}…)")
 
 
-def cmd_recover_state(args):
-    """Reconcile corrupt spend state WITHOUT resetting limits (P2-6).
+def _reconstruct_entries_from_audit_log(now):
+    """Rebuild spend entries from the audit log's spend records.
 
-    Backs up the damaged file, keeps every valid entry (including PENDING
-    obligations — they are never silently dropped), quarantines invalid
-    records for operator review, and writes a clean state file. The
-    operator reviews the quarantine list; nothing is auto-forgiven.
+    The audit log records every signing's spends (action "signed", later
+    updated to "applied" / "failed:…" / "submit_error" for the same
+    tx_hash). The latest action per tx_hash wins:
+      - "applied"            -> confirmed (ages out of the rolling window)
+      - "signed"/"submit_error" -> pending (sweep_pending() resolves it
+        against the ledger; pending entries never age out, so limits
+        stay conservative)
+      - "failed:…" (fee-retained) -> confirmed: the live path keeps the
+        consumed fee as a confirmed XRP spend, and the failed entry's
+        spends ARE that fee (recorded fee-only). Pre-v0.14.1 failed
+        entries (no fee-retained marker, full trade amounts) are skipped:
+        their fee cannot be determined, and counting the released trade
+        amounts would over-count.
+
+    Returns (entries, n_tx) or (None, reason) when the audit log cannot
+    be read — in which case signing must stay blocked.
+    """
+    import re
+    try:
+        lines = C.AUDIT_PATH.read_text().splitlines()
+    except OSError as ex:
+        return None, f"audit log unreadable ({ex})"
+    latest = {}
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            a = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        th = a.get("tx_hash")
+        if not th or not isinstance(a.get("spends"), dict):
+            continue
+        try:
+            ts = int(a.get("ts", 0))
+        except (TypeError, ValueError):
+            continue
+        prev = latest.get(th)
+        if prev is None or ts >= prev[0]:
+            latest[th] = (ts, a)
+    if not latest:
+        return None, "audit log has no spend records to rebuild from"
+    entries = []
+    for th, (ts, a) in latest.items():
+        result = a.get("result", "")
+        if result.startswith("failed"):
+            # Pre-v0.14.1 failed entries recorded full trade amounts in
+            # spends (no fee-retained marker): the fee they consumed is
+            # unknowable, and the trade amounts were released by the live
+            # path — counting them would over-count. Skip; current
+            # entries are fee-only (see the marker) and are treated as
+            # confirmed below, matching the live path.
+            if not str(a.get("note", "")).startswith("fee-retained:"):
+                continue
+            result = "applied"  # fee-only spends -> confirmed, like live
+        if result == "applied" and now - ts >= C.ROLLING_WINDOW:
+            continue  # aged out of the rolling window
+        for asset, amt_s in (a.get("spends") or {}).items():
+            try:
+                amt = Decimal(str(amt_s))
+            except Exception:  # noqa: BLE001 — unparseable: skip, stay safe
+                continue
+            if not amt.is_finite() or amt < 0:
+                continue
+            status = "confirmed" if result == "applied" else "pending"
+            e = {"rid": f"audit-{th[:16]}", "ts": ts, "asset": asset,
+                 "amount": str(amt), "status": status, "tx_hash": th,
+                 "reconstructed": True}
+            if status == "pending":
+                m = re.search(r"last_ledger=(\d+)", str(a.get("note", "")))
+                if m:
+                    e["last_ledger"] = int(m.group(1))
+            entries.append(e)
+    return entries, len(latest)
+
+
+def _safe_entry_amount(e):
+    """Finite non-negative Decimal for a state's amount, or None."""
+    try:
+        amt = Decimal(str(e.get("amount"))) if isinstance(e, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+    if amt is None or not amt.is_finite() or amt < 0:
+        return None
+    return amt
+
+
+def cmd_recover_state(args):
+    """Reconcile spend state WITHOUT ever silently resetting limits.
+
+    - Unreadable file: rebuild entries from the audit log (latest outcome
+      per tx_hash). If the audit log is unusable, signing stays BLOCKED
+      until the operator reconciles manually and attests.
+    - Readable file: valid entries are kept; invalid ("quarantined")
+      records keep counting toward limits as pending holds — an invalid
+      record must never silently disappear from accounting. A corrupt
+      AMOUNT is unrecoverable locally, so the whole state is rebuilt
+      from the audit log instead.
     """
     import shutil
     tracker = C.SpentTracker()
@@ -936,34 +1080,115 @@ def cmd_recover_state(args):
     if not sp.exists():
         print("no state file — nothing to recover.")
         return
-    bak = sp.with_name(sp.name + f".corrupt-{int(__import__('time').time())}.bak")
-    shutil.copy2(sp, bak)
-    print(f"backed up damaged state to {bak}")
     try:
         raw = json.loads(sp.read_text())
         raw_entries = raw.get("entries", [])
+        unreadable = False
+        read_error = None
     except (json.JSONDecodeError, OSError) as ex:
-        raw_entries = []
-        print(f"state file unreadable ({ex}); rebuilding from ledger sweep")
-    valid, quarantined = [], []
+        raw, raw_entries, unreadable, read_error = {}, None, True, ex
+
+    # Audited manual override: only meaningful on a blocked state, and the
+    # attestation itself is written to the audit log — a silent bypass
+    # always leaves a record.
+    if getattr(args, "attest", None):
+        if not unreadable and not (isinstance(raw, dict) and raw.get("blocked")):
+            print("state is healthy — nothing to attest. No changes made.")
+            return
+        with tracker._locked():
+            tracker._save({"entries": []})
+        C.audit("recover_state", None, None, "local", "-",
+                "attested",
+                f"operator attested manual ledger review and restarted "
+                f"limits from zero: {args.attest[:200]}")
+        print("Block cleared by operator attestation (recorded in audit log).")
+        print("Spend limits restarted from zero — that was YOUR explicit, "
+              "logged decision.")
+        return
+
+    bak = sp.with_name(sp.name + f".corrupt-{int(time.time())}.bak")
+    shutil.copy2(sp, bak)
+    print(f"backed up damaged state to {bak}")
+    now = int(time.time())
+
+    def _rebuild(reason):
+        entries, info = _reconstruct_entries_from_audit_log(now)
+        if entries is None:
+            with tracker._locked():
+                tracker._save({"entries": [], "blocked": True,
+                               "blocked_reason": info,
+                               "blocked_at": now})
+            print(f"CANNOT reconstruct spend accounting: {info}.")
+            print("Signing is BLOCKED — limits cannot be verified.")
+            print("After manually reviewing the ledger, run:")
+            print('  xrpl-sign recover-state --attest "reviewed <ledger '
+                  'range>, <N> spends found"')
+            C.audit("recover_state", None, None, "local", "-",
+                    "blocked", f"{reason}; {info}")
+            return
+        with tracker._locked():
+            tracker._save({"entries": entries})
+        n_pending = sum(1 for e in entries if e.get("status") == "pending")
+        print(f"reconstructed {len(entries)} entries from the audit log "
+              f"({info} txs; {n_pending} pending).")
+        print("Pending entries keep counting toward limits until "
+              "sweep_pending() resolves them against the ledger.")
+        C.audit("recover_state", None, None, "local", "-",
+                "reconstructed",
+                f"{reason}; rebuilt {len(entries)} entries from audit log")
+
+    if unreadable or not isinstance(raw_entries, list):
+        _rebuild(f"state file unreadable ({read_error})"
+                 if unreadable else "state has unknown shape")
+        return
+
+    valid, quarantined, amount_corrupt = [], [], False
     for e in raw_entries:
         try:
             tracker._validate_entry(e)
             valid.append(e)
         except C.SpentTracker.StateError as ex:
-            quarantined.append((e, str(ex)))
-    # Pending obligations are reconstructed as pending — never reset.
+            amt = _safe_entry_amount(e)
+            if amt is None:
+                amount_corrupt = True
+            quarantined.append((e, str(ex), amt))
+    if amount_corrupt:
+        # A corrupt amount cannot be accounted for — rebuild everything
+        # from the audit log rather than guessing.
+        _rebuild("a quarantined record has a corrupt amount")
+        return
+    for e, why, amt in quarantined:
+        hold = {
+            "rid": (e.get("rid") if isinstance(e.get("rid"), str) else None)
+                   or f"quarantine-{now}-{len(valid)}",
+            "ts": now,
+            "asset": e.get("asset") if isinstance(e.get("asset"), str)
+                     else "UNKNOWN",
+            "amount": str(amt),
+            "status": "pending",
+            "tx_hash": e.get("tx_hash")
+                       if isinstance(e.get("tx_hash"), str) else None,
+            "last_ledger": e.get("last_ledger"),
+            "quarantined": True,
+            "quarantine_reason": why,
+        }
+        valid.append(hold)
     n_pending = sum(1 for e in valid if e.get("status") == "pending")
     with tracker._locked():
-        tracker._save({"entries": valid})
-    print(f"recovered {len(valid)} valid entries ({n_pending} still pending).")
+        tracker._save({"entries": valid,
+                       "quarantined": [{"record": e, "reason": why}
+                                       for e, why, _ in quarantined]})
+    print(f"recovered {len(valid)} entries "
+          f"({n_pending} pending, "
+          f"{len(quarantined)} quarantined).")
     if quarantined:
-        print(f"\nQUARANTINED {len(quarantined)} invalid records "
-              f"(NOT counted toward limits — review manually):")
-        for e, why in quarantined:
+        print("\nQUARANTINED records are HELD as pending — they still count")
+        print("toward limits until proven otherwise. Review them:")
+        for _, why, _ in quarantined:
             print(f"  - {why}")
-        print("\nIf any quarantined record represents real spending, add it")
-        print("back manually; when in doubt, keep limits tight.")
+        print("\nIf a quarantined record is proven bogus, delete it from the")
+        print("state file's \"quarantined\" list AND its pending hold entry,")
+        print("then re-run the signing command.")
     else:
         print("no invalid records found.")
     print("\nNext: re-run the signing command; sweep_pending() will resolve")
@@ -987,7 +1212,9 @@ def cmd_list(_args):
 def main():
     ap = argparse.ArgumentParser(prog="xrpl-sign",
                                  description="Policy-gated XRPL signer.")
-    ap.add_argument("--hash", default=None, help="proposal hash (prefix ok)")
+    ap.add_argument("--hash", default=None,
+                    help="proposal hash: full 64-hex to approve; "
+                         "a prefix is enough for keyless review only")
     ap.add_argument("--approve", action="store_true",
                     help="HUMAN approval of this exact hash: sign & submit")
     ap.add_argument("--profile", default=None,
@@ -1002,6 +1229,8 @@ def main():
                          "gifts use ~/.xrpl/giveaway_policy.json; "
                          "testnet adhoc only — rejected on mainnet)")
     ap.add_argument("--list", action="store_true", help="pending proposals")
+    ap.add_argument("--attest", default=None, help=argparse.SUPPRESS,
+                    )  # recover-state only: audited manual override
     ap.add_argument("cmd", nargs="?", choices=["init-policy", "migrate-policy",
                                      "init-profiles", "sync-profile",
                                      "recover-state"],
