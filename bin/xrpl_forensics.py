@@ -50,6 +50,7 @@ TOKEN_ISSUER_INFO_CAP = 3    # account_info calls enriching links tokens
 TOKEN_HOLDER_PAGES = 2       # account_lines pages scanned for holder spread
 CACHE_TTL_SECS = 3600
 NFT_OWNER_LOOKUPS_PER_ACCOUNT = 5  # ledger_entry calls, links only
+NFT_HOLDER_VERIFY_CAP = 6    # account_nfts candidate checks, nft-trail only
 GENESIS_LEDGER = 32570
 
 CACHE_DIR = Path.home() / ".xrpl" / "forensics-cache"
@@ -1104,6 +1105,32 @@ def _nft_id_valid(tid):
     return bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(tid or "").strip()))
 
 
+def _nft_holder_verified(token_id, account, use_cache=True, cache_dir=None):
+    """Does `account` actually hold `token_id` at the validated ledger?
+
+    Ground truth for the trail's derived holder — transfer history can
+    miss or misattribute a hop, so we never assert a holder we haven't
+    checked. Never raises."""
+    try:
+        marker = None
+        for _ in range(3):  # cap pagination; most holders fit in one page
+            params = {"account": account, "ledger_index": "validated",
+                      "limit": 400}
+            if marker:
+                params["marker"] = marker
+            res = rpc_cached("account_nfts", params, use_cache=use_cache,
+                             cache_dir=cache_dir, quiet=True)
+            for nft in res.get("account_nfts", []):
+                if nft.get("NFTokenID") == token_id:
+                    return True
+            marker = res.get("marker")
+            if not marker:
+                break
+    except Exception:  # noqa: BLE001 — fail-open (unverified, not assumed)
+        pass
+    return False
+
+
 def nft_offer_detail(offer_index, use_cache=True, cache_dir=None):
     """(owner_address, amount) for an NFTokenOffer index. (None, None) if
     the offer is gone or unreadable. Never raises."""
@@ -1164,7 +1191,7 @@ def _format_nft_trail_inner(token_id, use_cache, cache_dir, lines):
     if not _nft_id_valid(token_id):
         return ["  ⚠️  not a valid NFTokenID (64 hex characters)."]
     lines.append(f"NFT-TRAIL {token_id[:16]}… (light mode: nft_history, "
-                 f"≤{NFT_HISTORY_MAX_PAGES + NFT_OFFER_RESOLVE_CAP + 2} "
+                 f"≤{NFT_HISTORY_MAX_PAGES + NFT_OFFER_RESOLVE_CAP + 2 + NFT_HOLDER_VERIFY_CAP} "
                  f"RPC calls)")
 
     history = None
@@ -1224,21 +1251,31 @@ def _format_nft_trail_inner(token_id, use_cache, cache_dir, lines):
         elif tt == "NFTokenAcceptOffer":
             sell_idx = tx.get("NFTokenSellOffer")
             buy_idx = tx.get("NFTokenBuyOffer")
-            idx = sell_idx or buy_idx
-            owner, amount = (None, None)
-            if idx and resolves < NFT_OFFER_RESOLVE_CAP:
-                owner, amount = nft_offer_detail(
-                    idx, use_cache=use_cache, cache_dir=cache_dir)
+            sell_owner, sell_amt = (None, None)
+            buy_owner, buy_amt = (None, None)
+            if sell_idx and resolves < NFT_OFFER_RESOLVE_CAP:
+                sell_owner, sell_amt = nft_offer_detail(
+                    sell_idx, use_cache=use_cache, cache_dir=cache_dir)
                 resolves += 1
-            price = _fmt_amount(amount) if amount else "price unknown"
-            if sell_idx:
-                # accepter buys from the offer owner
-                buyer, seller = acct, owner
-                holder = buyer
+            if buy_idx and resolves < NFT_OFFER_RESOLVE_CAP:
+                buy_owner, buy_amt = nft_offer_detail(
+                    buy_idx, use_cache=use_cache, cache_dir=cache_dir)
+                resolves += 1
+            if buy_idx:
+                # A buy offer names the buyer: the accepter sells into
+                # the buy-offer owner's bid. When a sell offer is ALSO
+                # present it's a direct sale — the accepter is the
+                # seller and the buy-offer owner is the buyer. (Getting
+                # this backwards reports the seller as the holder.)
+                buyer, seller = buy_owner, acct
+                amount = buy_amt
             else:
-                # accepter sells into the offer owner's bid
-                buyer, seller = owner, acct
-                holder = buyer
+                # Sell offer only: the accepter buys from the
+                # sell-offer owner.
+                buyer, seller = acct, sell_owner
+                amount = sell_amt
+            holder = buyer
+            price = _fmt_amount(amount) if amount else "price unknown"
             hops += 1
             if seller and buyer:
                 lines.append(
@@ -1265,9 +1302,43 @@ def _format_nft_trail_inner(token_id, use_cache, cache_dir, lines):
 
     if not minted and not txs:
         lines.append("  (no on-ledger history found for this token)")
+    # Holder verification: transfer history can miss or misattribute a
+    # hop (e.g. a both-offers direct sale whose offers are already
+    # consumed), so never assert a holder we haven't checked against
+    # the validated ledger. Candidates are the derived holder first,
+    # then trail counterparties most-recent-first.
+    candidates = []
+    seen = set()
     if holder:
-        lines.append(f"  currently held by {fmt_labeled(holder)} "
-                     f"(derived from the last on-ledger transfer)")
+        candidates.append(holder)
+        seen.add(holder)
+    for tx in reversed(txs):
+        acct = tx.get("Account")
+        if acct and acct not in seen:
+            seen.add(acct)
+            candidates.append(acct)
+        if len(candidates) >= NFT_HOLDER_VERIFY_CAP:
+            break
+    verified = None
+    for acct in candidates:
+        if _nft_holder_verified(token_id, acct, use_cache=use_cache,
+                                cache_dir=cache_dir):
+            verified = acct
+            break
+    if verified:
+        lines.append(f"  currently held by {fmt_labeled(verified)} "
+                     f"(verified at validated ledger)")
+        if holder and verified != holder:
+            lines.append(f"    NOTE: transfer history suggested "
+                         f"{fmt_labeled(holder)} — the on-ledger holder "
+                         f"differs; the history above is incomplete.")
+    elif holder:
+        lines.append(f"  current holder UNVERIFIED — transfer history "
+                     f"suggests {fmt_labeled(holder)}, but that account "
+                     f"does not hold the token at the validated ledger.")
+    elif txs:
+        lines.append(f"  current holder unknown — the transfer history "
+                     f"above does not resolve to a verified holder.")
     sell_n, buy_n = nft_open_offers(token_id, use_cache=use_cache,
                                     cache_dir=cache_dir)
     lines.append(f"  open offers now: {sell_n} sell / {buy_n} buy")

@@ -439,6 +439,10 @@ def make_nft_rpc(history, offers=None, fail_history=False, holders=None):
             return {"node": {}}
         if method in ("nft_sell_offers", "nft_buy_offers"):
             return {"offers": []}
+        if method == "account_nfts":
+            acct = params.get("account")
+            nfts = [{"NFTokenID": tid} for tid in holders.get(acct, [])]
+            return {"account_nfts": nfts}
         if method == "account_tx":
             return {"transactions": []}
         raise AssertionError(f"unexpected {method}")
@@ -488,7 +492,8 @@ class NftTrailTest(unittest.TestCase):
         history = [accept_tx(C, "IDX1"), mint_tx(A)]  # newest first
         offers = {"IDX1": (B, "5000000")}  # B sold to C for 5 XRP
         with mock.patch.object(fx, "_rpc",
-                               make_nft_rpc(history, offers)):
+                               make_nft_rpc(history, offers,
+                                            holders={C: [TOKEN_ID]})):
             lines = fx.format_nft_trail(TOKEN_ID, use_cache=False)
         text = "\n".join(lines)
         self.assertIn("minted by", text)
@@ -498,7 +503,46 @@ class NftTrailTest(unittest.TestCase):
         self.assertIn(C, text)
         self.assertIn("5 XRP", text)
         self.assertIn("currently held by", text)
+        self.assertIn("verified at validated ledger", text)
         self.assertIn("open offers now", text)
+
+    def test_both_offers_direct_sale_holder(self):
+        # Regression (v0.14.1): an NFTokenAcceptOffer carrying BOTH a
+        # sell offer and a buy offer is a direct sale — the accepter is
+        # the SELLER and the buy-offer owner is the buyer. The old code
+        # treated any accept with NFTokenSellOffer set as "accepter
+        # buys", reporting the seller as the current holder. Here the
+        # buy offer is already consumed (unresolvable via ledger_entry),
+        # so the holder must come from ledger verification, not from
+        # derivation — and it must be C (the buyer), never B (seller).
+        accept = {"Account": B, "TransactionType": "NFTokenAcceptOffer",
+                  "NFTokenSellOffer": "SELLIDX", "NFTokenBuyOffer": "BUYIDX",
+                  "ledger_index": 30, "hash": "T" * 64, "date": 800000200}
+        buy_offer = {"Account": C, "TransactionType": "NFTokenCreateOffer",
+                     "Amount": "904142", "ledger_index": 25,
+                     "hash": "O" * 64, "date": 800000150}
+        history = [accept, buy_offer, mint_tx(A)]  # newest first
+        with mock.patch.object(fx, "_rpc",
+                               make_nft_rpc(history,
+                                            holders={C: [TOKEN_ID]})):
+            lines = fx.format_nft_trail(TOKEN_ID, use_cache=False)
+        text = "\n".join(lines)
+        self.assertIn("currently held by", text)
+        self.assertIn(C, text)
+        self.assertIn("verified at validated ledger", text)
+        self.assertNotIn(f"currently held by {B}", text)
+
+    def test_unverified_holder_not_asserted(self):
+        # If nobody in the trail holds the token at the validated
+        # ledger, the trail must not assert a holder.
+        history = [accept_tx(C, "IDX1"), mint_tx(A)]  # newest first
+        offers = {"IDX1": (B, "5000000")}
+        with mock.patch.object(fx, "_rpc",
+                               make_nft_rpc(history, offers)):
+            lines = fx.format_nft_trail(TOKEN_ID, use_cache=False)
+        text = "\n".join(lines)
+        self.assertNotIn("currently held by", text)
+        self.assertIn("UNVERIFIED", text)
 
     def test_fallback_when_no_nft_history(self):
         issuer = fx.nft_issuer_of(TOKEN_ID)
@@ -686,7 +730,8 @@ class LanguageTest(unittest.TestCase):
 
     def test_nft_uses_held_by(self):
         with mock.patch.object(fx, "_rpc",
-                               make_nft_rpc([mint_tx(A)])):
+                               make_nft_rpc([mint_tx(A)],
+                                            holders={A: [TOKEN_ID]})):
             text = "\n".join(fx.format_nft_trail(TOKEN_ID,
                                                  use_cache=False))
         self.assertIn("held by", text)
