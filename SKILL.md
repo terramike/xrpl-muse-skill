@@ -24,6 +24,34 @@ checks the flag independently and refuses (audit-logged) while read-only.
 Existing installs that predate the flag are grandfathered — an upgrade never
 silently changes signing behavior.
 
+## Clavi5 beta: phone-signed payments (v0.12)
+
+For Clavi5 beta users, payments work differently: the agent proposes via the
+Clavi5 approval API, and the human signs with Face ID on their phone. The
+agent **never sees a seed** — there is no local signing path in beta mode.
+
+```
+clavi5-beta init
+# → approval API URL + agent token → ~/.clavi5/beta.json (owner-only 0600)
+
+clavi5-beta propose --to rDEST --amount-xrp 1 --from-account rSRC --network testnet
+# → prints exact terms + a sign URL. NOTHING is submitted.
+
+# Human opens the sign URL on their phone, reviews, Face IDs.
+
+clavi5-beta confirm --request req_...
+# → verifies the ledger result: confirmed, expired, or failed.
+```
+
+Rules:
+- `propose` fetches the live sequence and ledger from the network, sets a
+  60-ledger expiry, and prints every term before calling the API.
+- `confirm` never retries. An `expired` payment releases its sequence; propose
+  fresh if still wanted.
+- `clavi5-beta status` shows the killswitch state.
+- The agent token is scoped to its owner. One user's token cannot read
+  another user's requests, wallets, or policy.
+
 ## Architecture: propose → approve → sign (v0.7)
 
 Two programs. The agent only ever runs the first.
@@ -818,11 +846,19 @@ not by typing commands.
 **Main menu buttons:**
 - XRPL Actions
 - NFT
+- 🐻 Fuzzy
+- Artists
+- Wallets
 - XRP News
-- 🤝 Community
+- XRPLF
+- Coffee & Crypto
+- xBoost
 
-**XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI), in ABC order:
-- 💰 Balances (`balance [address]` — XRP + trustline balances)
+**XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI):
+- 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),
+  🔍 Token Lookup (`token-lookup --issuer … --currency …`), 🧾 Explain a
+  Transaction (`tx-explain --hash …`), 🐋 Whale Watch
+  (`whale-watch --issuer r… --currency … [--limit 10]`)
 - 🔎 Forensics (read-only, keyless, budgeted; `references/forensic-mode.md`):
   - 🧬 Trace (`xrpl-trade trace r… [--depth N]` — funding-origin chain)
   - 🔗 Links (`xrpl-trade links r… r… [--window N]` — shared counterparties,
@@ -835,35 +871,6 @@ not by typing commands.
     claims common ownership without control overlap. Known addresses render
     `LABEL: r… — "Name" (verified)`; service-wallet links get the loud
     false-positive caveat.
-- 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),
-  🔍 Token Lookup (`token-lookup --issuer … --currency …`), 🧾 Explain a
-  Transaction (`tx-explain --hash …`), 🐋 Whale Watch
-  (`whale-watch --issuer r… --currency … [--limit 10]`)
-- 👛 Wallets (local-only, explicit opt-in):
-  - `wallet create` — generate a fresh wallet; seed stored 0600, never displayed
-  - `wallet backup` — ONE-TIME seed display for write-down
-  - `setup` — onboarding: new wallet or address+network
-
-**🤝 Community submenu** (in ABC order; each opens its own focused submenu):
-- 🎨 Artists — following artists (`favorites` add/list/rename/remove,
-  `nft-new` — new mints from followed artists; entirely read-only).
-  📡 NFT Radar (`xrpl-trade nft-radar [--days N] [--limit N] [--json]` —
-  new mints across all 307 curated artists, signal-only; read-only).
-  Curated reference: `references/artist-directory.json` (307 artists —
-  Mike's xrp.cafe follow list, 2026-10-05) and
-  `references/xrpcafe-collections.json` (39 xrp.cafe collections
-  with slugs, URLs, and cover images)
-- ☕ Coffee & Crypto (see **Coffee & Crypto submenu** below)
-- 🎙️ Dip a Toe — Melissa's XRP community YouTube show (@dipatoe;
-  X @worldbefree888)
-- 🌾 Farmers Union (`xrpl-trade farm` — $FARM community helper: about, links,
-  qualification check, treasury, cropdusting board; read-only)
-- 🐻 Fuzzy (see **🐻 Fuzzy submenu** below)
-- 🔭 ShadowWatch (https://shadowwatch.xyz/ — XRP Man's XRPL whale-tracking
-  dashboard: live ledger stream, wallet graph, bubble map, HVT watchlist,
-  wallet identity resolver)
-- ⚡ xBoost (X Spaces tipping and engagement layer on XRPL)
-- 🏛️ XRPLF (XRPL Foundation)
 
 **Coffee & Crypto submenu:**
 - 🎰 LuckyHash (`references/luckyhash.md`; trigger "luckyhash menu") —
