@@ -458,7 +458,25 @@ xrpl-trade nft-new              # new mints since the last check
 xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the watermark
 xrpl-trade nft-new --limit 10   # show newest 10 per artist (default 25; 0 = no cap)
 xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
+
+xrpl-trade fuzzy-deals            # FUZZY NFTs below the sample median ask
+xrpl-trade fuzzy-deals --threshold 30  # flag asks 30%+ below median (1-90)
+xrpl-trade fuzzy-deals --json    # machine-readable output
 ```
+- `fuzzy-deals` is read-only: it scans the FUZZY community collections
+  (`fuzzybears` — the official project issuer Mike confirmed — plus
+  `fuzzy-bars`), pulls listed tokens and each token's live sell offers via
+  xrpl.to, and flags asks at least `--threshold` percent below the
+  collection's trimmed median ask (top/bottom quartiles chopped so whale
+  listings can't drag the reference). Each deal also shows its percentile
+  rank ("cheaper than N% of asks") — the honest signal when discounts look
+  dramatic. Stats are per-collection samples — never full-collection
+  facts, never "worth." Acting on a deal is the separate
+  `nft-buy --offer-index` ceremony; the scanner never buys, bids, or moves
+  funds. Market data carries the "Data by xrpl.to" credit. Every XRP figure
+  also shows its USD equivalent at the current Bitstamp XRP/USD rate
+  (XRP-denominated asks mean different dollars as XRP moves; XRP stays
+  primary, USD is parenthetical context).
 
 - Names are lowercase `[a-z0-9_-]`, 1–32 chars; addresses get the real
   base58-checksum validation. Stored in `~/.xrpl/favorites.json`
@@ -800,6 +818,7 @@ not by typing commands.
 **Main menu buttons:**
 - XRPL Actions
 - NFT
+- 🐻 Fuzzy
 - Artists
 - Wallets
 - XRP News
@@ -833,8 +852,23 @@ not by typing commands.
   API; every bet and gift purchase is a payment the user signs in their own
   wallet (Xaman/Joey). Never claim to have placed a bet.
 
+**🐻 Fuzzy submenu:**
+- 🔍 FUZZY Deals (`xrpl-trade fuzzy-deals [--threshold 20]` — FUZZY NFTs
+  listed below the trimmed median ask across the fuzzybears + fuzzy-bars
+  collections; read-only, buying stays the separate `nft-buy` ceremony)
+- 📖 FUZZY Lore (https://fuzzylore.com/ — community-built lore site)
+- 🃏 FUZZY TCG Club (https://fuzzytcg.club/ — free-to-play community
+  trading card game: multiplayer duels, tower climbs, tournaments)
+- 🏪 $FUZZY Card Shop (https://fuzzycardshop.com/ — community-run shop,
+  hosts the TCG club)
+- 🛒 XRPresso physicals (`xrpl-trade xrpresso listings --q fuzzy
+  --sort price_asc` — FUZZY physicals on XRPresso, cheapest first)
+
 **NFT submenu** adds:
 - Top Collections (`top-collections [--sort vol24h|trendingScore]`)
+- 🐻 FUZZY Deals (`xrpl-trade fuzzy-deals [--threshold 20]` — FUZZY NFTs
+  listed below the sample median ask; read-only, buying stays the
+  separate `nft-buy` ceremony)
 - 📥 Incoming (`xrpl-trade incoming` — bids on your NFTs, sell/gift
   offers to you, recent ledger receipts; per-row issuer screens;
   flagged offers hidden by default; friend labels on counterparties)
@@ -901,6 +935,25 @@ Reading (no seed, no proposals):
   offers hidden by default (count shown). `xrpl-trade incoming` wraps
   this with recent ledger receipts and your favorite labels.
   Read-only; "Data by xrpl.to" credit.
+- `xrpl-check url <url> [--no-live] [--json]` — TrustLink phishing check,
+  free and local: verdict (known-good / suspicious-lookalike / unknown /
+  known-bad), SAFE-ISH / CAUTION / DANGER risk level, and coded findings
+  (lookalike domains, impersonator handles, urgency lures, seed asks,
+  drainer pages, young domains, redirect chains). Curated data ships with
+  the skill (`references/trustlink-data.json`) — as fresh as your installed
+  version; the check warns past the 60-day review window. Seeds and private
+  keys are refused before any processing, never logged. `--no-live` skips
+  the redirect-trace + domain-age fetches for fully offline use.
+- `xrpl-check handle @name` — is this X handle verified, an impersonator,
+  or unknown?
+- `xrpl-check token <issuer> --chain xrpl|solana` / `xrpl-check wallet
+  <address> [--chain xrpl|solana]` — TrustDB identity/label for a token
+  issuer or wallet. "Not in the database" means not verified, never safe.
+- `xrpl-check community <id>` / `xrpl-check member <id> --handle @x |
+  --wallet r… [--chain xrpl|solana]` — community profile and membership
+  check against the curated roster (confirmed / not_met / unknown / stale).
+  Powered by TrustLink: the same pipeline as the paid API
+  (https://trust.terramike.com), which serves always-fresh data per call.
 - `xrpl_to.py keys create --yes` — mint a free xrpl.to API key via a
   wallet-signed login message (nothing submitted on-chain; key stored
   0600 at `~/.xrpl/xrplto.json`). Raises rate limits; most endpoints

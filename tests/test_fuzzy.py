@@ -50,10 +50,14 @@ check("no invented wisdom ('moon' check)",
       not any("moon" in q.lower() and "lambo" in q.lower() for q in quotes))
 
 # ---------- hidden from help ----------
+# (the `fuzzy` easter-egg command itself must stay hidden; the public
+# `fuzzy-deals` command is a different, documented feature)
 h = run("--help")
 check("--help exits 0", h.returncode == 0)
-check("fuzzy absent from --help", "fuzzy" not in h.stdout.lower())
-check("fuzzy absent from --help stderr", "fuzzy" not in h.stderr.lower())
+check("fuzzy easter-egg absent from --help",
+      re.search(r"(?m)^\s+fuzzy(\s|$)", h.stdout.lower()) is None)
+check("fuzzy easter-egg absent from --help stderr",
+      re.search(r"(?m)^\s+fuzzy(\s|$)", h.stderr.lower()) is None)
 
 # ---------- the command works ----------
 r = run("fuzzy")
@@ -90,13 +94,16 @@ finally:
 check("lore file restored", LORE.is_file())
 
 # ---------- SKILL.md and menus stay clean ----------
-# (SKILL.md legitimately mentions the FUZZY token in examples; what must
-# stay out is the easter egg itself: the command, the lore, JoelKatz mode.)
+# (SKILL.md legitimately mentions the FUZZY token in examples and documents
+# the public `fuzzy-deals` command; what must stay out is the easter egg
+# itself: the bare `fuzzy` command, the lore, JoelKatz mode.)
 skill = (REPO / "SKILL.md").read_text(encoding="utf-8")
-for needle in ["fuzzy lore", "joelkatz mode", "fuzzy wisdom", "fuzzy dossier",
-               "xrpl-trade fuzzy", "`fuzzy`"]:
+for needle in ["references/fuzzy-lore", "joelkatz mode", "fuzzy wisdom",
+               "fuzzy dossier", "`fuzzy`"]:
     check(f"SKILL.md has no easter-egg mention: {needle!r}",
           needle not in skill.lower())
+check("SKILL.md has no easter-egg mention: 'xrpl-trade fuzzy' (bare)",
+      re.search(r"xrpl-trade fuzzy(?!-)", skill.lower()) is None)
 
 fails = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(fails)}/{len(PASS)} passed")

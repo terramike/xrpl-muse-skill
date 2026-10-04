@@ -2307,6 +2307,194 @@ def cmd_nft_new(args, cfg, client):
         C.save_favorites(favs)
 
 
+# ---------- FUZZY deal scanner (read-only) ----------
+# FUZZY community NFT collections on xrpl.to (verified 2026-10-03).
+# fuzzybears = "Original Fuzzybears", issuer rw1R8cfHGMySmbj7gJ1HkiCqTY1xhLGYAs
+#   (the official FUZZY project issuer Mike confirmed).
+# fuzzy-bars = "Fuzzy Bars", a second FUZZY community collection.
+FUZZY_COLLECTIONS = ("fuzzybears", "fuzzy-bars")
+FUZZY_DEALS_MAX_TOKENS = 60  # listed tokens scanned per collection
+FUZZY_DEALS_WORKERS = 15     # parallel offer lookups
+
+
+def fuzzy_find_deals(asks, threshold_pct, trim_fraction=0.25):
+    """Pure deal math: asks is [(nft_id, Decimal xrp, offer_index)].
+
+    The median is a *trimmed* median: the top and bottom quartiles of asks are chopped before taking the median, so a few whale listings
+    (or one dust listing) can't drag the reference price around. Floor
+    is still the true minimum ask. Returns (floor, median, deals) where
+    deals is [(nft_id, price, pct_below_median, offer_index, rank)] sorted
+    best-first; rank is the share of asks this price beats (0-100). A deal is priced at least threshold_pct below the trimmed
+    median. Empty asks -> (None, None, [])."""
+    from decimal import Decimal
+    prices = sorted(p for _, p, _ in asks)
+    if not prices:
+        return None, None, []
+    floor = prices[0]
+    # trimmed median: chop the extremes so outliers can't move the
+    # reference price; need at least 3 values left to bother
+    n = len(prices)
+    cut = int(n * trim_fraction)
+    core = prices[cut:n - cut] if n - 2 * cut >= 3 else prices
+    m = len(core)
+    median = (core[m // 2] if m % 2
+              else (core[m // 2 - 1] + core[m // 2]) / 2)
+    deals = []
+    cutoff_factor = Decimal(1) - Decimal(threshold_pct) / Decimal(100)
+    for nid, price, oidx in asks:
+        if median > 0 and price <= median * cutoff_factor:
+            pct = (median - price) / median * 100
+            # percentile rank: share of asks this price beats (0-100)
+            rank = sum(1 for p in prices if p >= price) / len(prices) * 100
+            deals.append((nid, price, pct, oidx, rank))
+    deals.sort(key=lambda d: d[2], reverse=True)
+    return floor, median, deals
+
+
+def cmd_fuzzy_deals(args, cfg, client):
+    """Read-only: FUZZY NFTs listed below market.
+
+    For each FUZZY community collection, pulls listed tokens from xrpl.to,
+    fetches each token's live sell offers, and flags asks at least
+    --threshold percent below the collection's median ask. Stats are
+    per-collection (collections trade at very different tiers). Nothing
+    here proposes, signs, or submits — acting on a deal is the separate
+    nft-buy ceremony, and the ledger is authoritative before acting
+    (offers can be cancelled). Market data by xrpl.to.
+    """
+    from decimal import Decimal
+    threshold = args.threshold
+    if not 1 <= threshold <= 90:
+        sys.exit("--threshold must be between 1 and 90")
+    limit = args.limit
+    if limit is not None and limit < 0:
+        sys.exit("--limit must be 0 (no cap) or a positive number")
+    if xrpl_to is None:
+        print("FUZZY market data unavailable (xrpl.to module not loaded)")
+        return
+    # XRP/USD once per run for USD equivalents (best-effort; XRP-denominated
+    # asks mean different USD values as XRP moves — show both, never USD-only)
+    xrp_usd = C.fetch_xrp_usd()
+
+    def _usd(xrp):
+        if xrp_usd is None:
+            return ""
+        return f" (~${float(xrp) * xrp_usd:,.0f})"
+
+    def _cheapest(tid):
+        """(tid, Decimal|None, offer_index|None) — never raises."""
+        try:
+            r = xrpl_to.api_get(f"/nft/offers/sell/{tid}")
+        except Exception:  # noqa: BLE001 — fail open per token
+            return tid, None, None
+        offers = (r or {}).get("offers") if isinstance(r, dict) else None
+        if not isinstance(offers, list):
+            return tid, None, None
+        best, best_idx = None, None
+        for o in offers:
+            if not isinstance(o, dict):
+                continue
+            try:
+                v = Decimal(o.get("amount", "0")) / Decimal(1_000_000)
+            except Exception:  # noqa: BLE001
+                continue
+            if v <= 0:
+                continue
+            if best is None or v < best:
+                best, best_idx = v, o.get("nft_offer_index")
+        return tid, best, best_idx
+
+    from concurrent.futures import ThreadPoolExecutor
+    all_deals = []
+    markets = []
+    quiet = getattr(args, "json", False)
+    api_failed = []
+    for slug in FUZZY_COLLECTIONS:
+        try:
+            r = xrpl_to.api_get(f"/nft/collections/{slug}/nfts",
+                                {"listed": "true",
+                                 "limit": FUZZY_DEALS_MAX_TOKENS})
+        except Exception:  # noqa: BLE001
+            r = None
+        nfts = (r or {}).get("nfts") if isinstance(r, dict) else None
+        if r is None:
+            api_failed.append(slug)
+            markets.append((slug, 0, None, None))
+            continue
+        if not isinstance(nfts, list) or not nfts:
+            markets.append((slug, 0, None, None))
+            continue
+        tids = [n.get("NFTokenID") for n in nfts
+                if isinstance(n, dict) and n.get("NFTokenID")]
+        if not quiet:
+            print(f"checking {len(tids)} listed {slug} tokens…")
+        asks = []
+        with ThreadPoolExecutor(max_workers=FUZZY_DEALS_WORKERS) as pool:
+            for tid, best, best_idx in pool.map(_cheapest, tids):
+                if best is not None:
+                    asks.append((tid, best, best_idx))
+        if not asks:
+            markets.append((slug, len(tids), None, None))
+            continue
+        floor, median, deals = fuzzy_find_deals(asks, threshold)
+        markets.append((slug, len(tids), floor, median))
+        for d in deals:
+            all_deals.append((slug,) + d)
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps({
+            "threshold_pct": threshold,
+            "xrp_usd": xrp_usd,
+            "collections": [
+                {"slug": slug, "listed_scanned": n,
+                 "floor_xrp": str(fl) if fl else None,
+                 "trimmed_median_xrp": str(md) if md else None}
+                for slug, n, fl, md in markets],
+            "note": "asks are open ledger offers via xrpl.to, not sales; "
+                    "verify on-ledger before acting",
+            "attribution": "Data by xrpl.to (https://xrpl.to)",
+            "deals": [{"collection": slug, "token_id": nid,
+                       "ask_xrp": str(p),
+                       "ask_usd": round(float(p) * xrp_usd, 2)
+                                  if xrp_usd else None,
+                       "pct_below_median": round(float(pct), 1),
+                       "cheaper_than_pct": round(float(rank), 1),
+                       "offer_index": oidx}
+                      for slug, nid, p, pct, oidx, rank in
+                      (all_deals if not limit else all_deals[:limit])],
+        }, indent=2))
+        return
+    print("FUZZY market (Data by xrpl.to"
+          + (f"; XRP ${xrp_usd:,.2f}" if xrp_usd else "") + "):")
+    for slug, n, fl, md in markets:
+        if slug in api_failed:
+            print(f"  {slug}: data unavailable (aggregator unreachable)")
+        elif fl is None:
+            print(f"  {slug}: no open asks in sample ({n} listed checked)")
+        else:
+            print(f"  {slug}: floor {fl} XRP{_usd(fl)} · "
+                  f"trimmed median {md} XRP{_usd(md)} "
+                  f"({n} listed checked)")
+    if not all_deals:
+        if api_failed and len(api_failed) == len(markets):
+            print("  FUZZY market data unavailable (aggregator unreachable)")
+        else:
+            print(f"  no asks ≥{threshold}% below trimmed median right now")
+        return
+    shown = all_deals if not limit else all_deals[:limit]
+    print(f"  DEALS (≥{threshold}% below trimmed median):")
+    for i, (slug, nid, price, pct, oidx, rank) in enumerate(shown, 1):
+        print(f"  {i}. [{slug}] {C.short_addr(nid)} — {price} XRP{_usd(price)} "
+              f"(-{pct:.1f}% vs median, cheaper than {rank:.0f}% of asks)")
+        if oidx:
+            print(f"     buy: xrpl-trade nft-buy --offer-index {oidx}")
+        else:
+            print("     buy: offer index unavailable — recheck before acting")
+    if limit and len(all_deals) > limit:
+        print(f"  (+{len(all_deals) - limit} more — raise with --limit N)")
+    print("  verify on-ledger before acting — offers can be cancelled")
+
+
 def cmd_incoming(args, cfg, client):
     """Read-only: what's coming IN to an account.
 
@@ -4155,6 +4343,15 @@ def main():
                         "(default 25; 0 = no cap)")
     p.add_argument("--no-safety", action="store_true",
                    help="skip the per-mint xrpl.to safety one-liners")
+    p = sub.add_parser("fuzzy-deals", help="FUZZY NFTs listed below market "
+                                          "(read-only)")
+    p.add_argument("--threshold", type=int, default=20,
+                   help="flag asks at least this %% below the median ask "
+                        "(1-90, default 20)")
+    p.add_argument("--limit", type=int, default=10,
+                   help="max deals shown, best first (default 10; 0 = no cap)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
     p = sub.add_parser("incoming", help="incoming NFT offers + recent "
                                         "ledger receipts for an account "
                                         "(read-only)")
@@ -4352,6 +4549,7 @@ def main():
         "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
         "nft-bid": lambda: cmd_nft_bid(args, cfg, client),
         "nft-new": lambda: cmd_nft_new(args, cfg, client),
+        "fuzzy-deals": lambda: cmd_fuzzy_deals(args, cfg, client),
         "incoming": lambda: cmd_incoming(args, cfg, client),
         "collection": lambda: cmd_collection(args, cfg, client),
         "template": lambda: cmd_template(args, cfg, client),
