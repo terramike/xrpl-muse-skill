@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""clavi5-beta: Clavi5 multi-user beta client.
+
+The agent proposes payments via the Clavi5 approval API. The human signs
+with Face ID on their phone. The agent never sees a seed.
+
+Flow:
+  1. clavi5-beta init                    # set approval URL + agent token
+  2. clavi5-beta propose --to r... --amount-xrp 1 --network testnet
+     # -> prints exact terms + sign URL. NOTHING is submitted.
+  3. Human opens the sign URL on their phone, reviews, Face IDs.
+  4. clavi5-beta confirm --request req_...
+     # -> verifies the ledger result.
+
+Config: ~/.clavi5/beta.json (owner-only 0600). Contains the approval API
+URL and the scoped agent token. No seeds, ever.
+"""
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+CONFIG_PATH = os.path.expanduser("~/.clavi5/beta.json")
+XRPL_TESTNET = "https://s.altnet.rippletest.net:51234/"
+XRPL_MAINNET = "https://s1.ripple.com:51234/"
+
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        die(f"not configured. Run: {sys.argv[0]} init")
+    st = os.stat(CONFIG_PATH)
+    if st.st_mode & 0o077:
+        die(f"{CONFIG_PATH} must be owner-only (chmod 600)")
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    for k in ("approval_url", "agent_token"):
+        if k not in cfg:
+            die(f"{CONFIG_PATH} missing '{k}'. Run: {sys.argv[0]} init")
+    return cfg
+
+
+def api_post(url, token, body):
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}",
+                 "User-Agent": "clavi5-beta/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.load(e)
+        except Exception:
+            detail = e.read().decode()[:200]
+        die(f"API {e.code}: {detail}")
+
+
+def xrpl_rpc(network, method, params):
+    url = XRPL_TESTNET if network.upper() == "TESTNET" else XRPL_MAINNET
+    req = urllib.request.Request(
+        url, data=json.dumps({"method": method, "params": params}).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "clavi5-beta/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)["result"]
+
+
+def cmd_init():
+    print("Clavi5 beta setup.")
+    print()
+    url = input("Approval API URL [https://approval.terramike.com]: ").strip()
+    if not url:
+        url = "https://approval.terramike.com"
+    url = url.rstrip("/")
+    token = input("Agent token: ").strip()
+    if not token:
+        die("agent token is required")
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump({"approval_url": url, "agent_token": token}, f, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
+    # Verify the token works
+    cfg = {"approval_url": url, "agent_token": token}
+    try:
+        r = api_post(url + "/request_killswitch_status", token, {})
+        print(f"\nToken verified. Killswitch terminated: {r.get('terminated')}")
+    except SystemExit:
+        print("\nWARNING: token verification failed. Check the URL and token.")
+    print(f"\nConfigured. Config at {CONFIG_PATH} (owner-only).")
+
+
+def cmd_propose(args):
+    import argparse
+    p = argparse.ArgumentParser(prog="clavi5-beta propose")
+    p.add_argument("--to", required=True, help="destination address")
+    p.add_argument("--amount-xrp", required=True, type=float, help="amount in XRP")
+    p.add_argument("--from-account", help="source address (default: your beta wallet)")
+    p.add_argument("--network", default="testnet", help="testnet or mainnet")
+    p.add_argument("--fee-drops", default="12", help="fee in drops")
+    ns = p.parse_args(args)
+
+    cfg = load_config()
+    network = ns.network.upper()
+    if network not in ("TESTNET", "MAINNET"):
+        die("network must be testnet or mainnet")
+
+    # Resolve the source account. If not given, we need it from somewhere.
+    # The agent token is scoped and cannot list wallets, so require --from-account
+    # for now (the user reads it from their phone app).
+    account = ns.from_account
+    if not account:
+        die("specify --from-account (your wallet address, visible in the phone app)")
+
+    if ns.amount_xrp <= 0:
+        die("amount must be positive")
+    amount_drops = str(int(ns.amount_xrp * 1_000_000))
+
+    # Fresh sequence + ledger from the network
+    info = xrpl_rpc(network, "account_info",
+                    [{"account": account, "ledger_index": "validated"}])
+    if "account_data" not in info:
+        die(f"account not found on {network}: {account}")
+    seq = info["account_data"]["Sequence"]
+    balance = info["account_data"]["Balance"]
+    ledger = xrpl_rpc(network, "ledger", [{"ledger_index": "validated"}])["ledger_index"]
+    lls = ledger + 60
+
+    print("Proposal terms (NOTHING submitted yet):")
+    print(f"  Network:     {network}")
+    print(f"  From:        {account}")
+    print(f"  To:          {ns.to}")
+    print(f"  Amount:      {ns.amount_xrp} XRP ({amount_drops} drops)")
+    print(f"  Fee:         {ns.fee_drops} drops")
+    print(f"  Sequence:    {seq}")
+    print(f"  Expires:     ledger {lls} (~{lls - ledger} ledgers)")
+    print(f"  Your balance: {int(balance) / 1_000_000} XRP")
+    print()
+
+    body = {
+        "network": network,
+        "ttl_sec": 600,
+        "tx": {
+            "account": account,
+            "destination": ns.to,
+            "amount_drops": amount_drops,
+            "fee_drops": ns.fee_drops,
+            "sequence": seq,
+            "last_ledger_sequence": lls,
+        },
+    }
+    r = api_post(cfg["approval_url"] + "/request_propose", cfg["agent_token"], body)
+    if not r.get("ok"):
+        die(f"propose failed: {r}")
+
+    print(f"Request ID: {r['request_id']}")
+    print()
+    print("The human must review and sign with Face ID on their phone:")
+    print(f"  {r['sign_url']}")
+    print()
+    print("After they sign, run:")
+    print(f"  {sys.argv[0]} confirm --request {r['request_id']}")
+
+
+def cmd_confirm(args):
+    import argparse
+    p = argparse.ArgumentParser(prog="clavi5-beta confirm")
+    p.add_argument("--request", required=True, help="request ID")
+    ns = p.parse_args(args)
+
+    cfg = load_config()
+    r = api_post(cfg["approval_url"] + "/request_confirm",
+                 cfg["agent_token"], {"request_id": ns.request})
+    if not r.get("ok"):
+        die(f"confirm failed: {r}")
+    print(f"Request {ns.request}: {r['status']}")
+    if r["status"] == "confirmed":
+        print("Payment confirmed on the ledger.")
+    elif r["status"] == "expired":
+        print("Payment expired (never validated). Sequence reservation released.")
+        print("Propose a fresh request if the payment is still wanted.")
+    else:
+        print(f"Status: {r['status']}. Check details with the request ID.")
+
+
+def cmd_status():
+    cfg = load_config()
+    r = api_post(cfg["approval_url"] + "/request_killswitch_status",
+                 cfg["agent_token"], {})
+    print(f"Killswitch terminated: {r.get('terminated')}")
+    if r.get("terminated_at"):
+        print(f"  terminated at:  {r['terminated_at']}")
+    if r.get("reauthorized_at"):
+        print(f"  reauthorized at: {r['reauthorized_at']}")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        print("Commands: init, propose, confirm, status")
+        return
+    cmd = sys.argv[1]
+    if cmd == "init":
+        cmd_init()
+    elif cmd == "propose":
+        cmd_propose(sys.argv[2:])
+    elif cmd == "confirm":
+        cmd_confirm(sys.argv[2:])
+    elif cmd == "status":
+        cmd_status()
+    else:
+        die(f"unknown command: {cmd}")
+
+
+if __name__ == "__main__":
+    main()

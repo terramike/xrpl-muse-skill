@@ -24,6 +24,34 @@ checks the flag independently and refuses (audit-logged) while read-only.
 Existing installs that predate the flag are grandfathered — an upgrade never
 silently changes signing behavior.
 
+## Clavi5 beta: phone-signed payments (v0.12)
+
+For Clavi5 beta users, payments work differently: the agent proposes via the
+Clavi5 approval API, and the human signs with Face ID on their phone. The
+agent **never sees a seed** — there is no local signing path in beta mode.
+
+```
+clavi5-beta init
+# → approval API URL + agent token → ~/.clavi5/beta.json (owner-only 0600)
+
+clavi5-beta propose --to rDEST --amount-xrp 1 --from-account rSRC --network testnet
+# → prints exact terms + a sign URL. NOTHING is submitted.
+
+# Human opens the sign URL on their phone, reviews, Face IDs.
+
+clavi5-beta confirm --request req_...
+# → verifies the ledger result: confirmed, expired, or failed.
+```
+
+Rules:
+- `propose` fetches the live sequence and ledger from the network, sets a
+  60-ledger expiry, and prints every term before calling the API.
+- `confirm` never retries. An `expired` payment releases its sequence; propose
+  fresh if still wanted.
+- `clavi5-beta status` shows the killswitch state.
+- The agent token is scoped to its owner. One user's token cannot read
+  another user's requests, wallets, or policy.
+
 ## Architecture: propose → approve → sign (v0.7)
 
 Two programs. The agent only ever runs the first.
