@@ -3796,6 +3796,84 @@ def fetch_xrp_usd(timeout=10):
     except Exception:  # noqa: BLE001 — price display is best-effort
         return None
 
+
+_XRP_HIST_CACHE = os.path.expanduser("~/.xrpl/xrp_usd_history.json")
+_XRP_HIST_TTL = 7 * 86400  # refresh the yearly chart weekly
+
+
+def fetch_xrp_usd_history():
+    """Daily XRP/USD closes for the last ~365 days, as {date_str: price}.
+
+    One CoinGecko call (free, no key), cached locally for a week. Returns
+    {} on any failure — callers degrade to XRP-only. Never raises."""
+    import time as _time
+    now = _time.time()
+    try:
+        if os.path.isfile(_XRP_HIST_CACHE):
+            age = now - os.path.getmtime(_XRP_HIST_CACHE)
+            if age < _XRP_HIST_TTL:
+                with open(_XRP_HIST_CACHE, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict) and data:
+                    return data
+    except Exception:  # noqa: BLE001 — cache is best-effort
+        pass
+    try:
+        req = urllib.request.Request(
+            "https://api.coingecko.com/api/v3/coins/ripple/market_chart"
+            "?vs_currency=usd&days=365",
+            headers={"User-Agent": "xrpl-muse-skill/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            prices = json.load(resp).get("prices", [])
+        data = {}
+        for ms, px in prices:
+            if px and px > 0:
+                d = _time.strftime("%Y-%m-%d", _time.gmtime(ms / 1000))
+                data[d] = float(px)
+        if data:
+            try:
+                os.makedirs(os.path.dirname(_XRP_HIST_CACHE), exist_ok=True)
+                with open(_XRP_HIST_CACHE, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh)
+                os.chmod(_XRP_HIST_CACHE, 0o600)
+            except Exception:  # noqa: BLE001 — cache write is optional
+                pass
+        return data
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def fetch_xrp_usd_at(when):
+    """XRP/USD on a given day. `when` is a unix timestamp or 'YYYY-MM-DD'.
+
+    Returns the CoinGecko daily close (or nearest available day), or None.
+    Never raises."""
+    import time as _time
+    import datetime as _dt
+    hist = fetch_xrp_usd_history()
+    if not hist:
+        return None
+    try:
+        if isinstance(when, (int, float)):
+            day = _time.strftime("%Y-%m-%d", _time.gmtime(when))
+        else:
+            day = str(when)[:10]
+        if day in hist:
+            return hist[day]
+        # nearest available day (usually today, not yet in the daily chart)
+        target = _dt.date.fromisoformat(day)
+        best, best_px = None, None
+        for d, px in hist.items():
+            try:
+                delta = abs((_dt.date.fromisoformat(d) - target).days)
+            except ValueError:
+                continue
+            if best is None or delta < best:
+                best, best_px = delta, px
+        return best_px
+    except Exception:  # noqa: BLE001
+        return None
+
 def make_client(network):
     import asyncio
     import time as _time

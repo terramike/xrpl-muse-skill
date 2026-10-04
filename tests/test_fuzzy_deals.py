@@ -173,6 +173,35 @@ finally:
     T.C.fetch_xrp_usd = real_fetch
 check("no price feed -> XRP-only, no crash",
       "~$" not in out_no_usd and "20 XRP" in out_no_usd)
+
+# last-sale context shown with then-USD
+class FakeXrplToSales(FakeXrplTo):
+    def nft_last_sale_detail(self, nid, limit=25):
+        return (800.0, 1748736000)  # 2025-06-01
+
+
+def run_cmd_sales(**kw):
+    args = type("A", (), {"threshold": 20, "limit": 10, "json": False, **kw})()
+    real, real_f = T.xrpl_to, T.C.fetch_xrp_usd_at
+    T.xrpl_to = FakeXrplToSales(
+        {"fuzzybears": ["t1", "t2"], "fuzzy-bars": []},
+        {"t1": [offer(20_000_000, "oid1")],
+         "t2": [offer(100_000_000, "oid2")]})
+    T.C.fetch_xrp_usd_at = lambda when: 2.5
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            T.cmd_fuzzy_deals(args, {}, object())
+        return buf.getvalue()
+    finally:
+        T.xrpl_to, T.C.fetch_xrp_usd_at = real, real_f
+
+
+out_sale = run_cmd_sales()
+check("last sale shown", "last sold 800.0 XRP" in out_sale)
+check("then-USD shown", "$2,000" in out_sale and "$2.50 then" in out_sale)
+check("sale date shown", "2025-06-01" in out_sale)
+
 real = T.xrpl_to
 T.xrpl_to = None
 try:

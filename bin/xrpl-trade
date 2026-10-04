@@ -2442,6 +2442,29 @@ def cmd_fuzzy_deals(args, cfg, client):
             all_deals.append((slug,) + d)
     if getattr(args, "json", False):
         import json as _json
+        import time as _jtime
+        jdeals = []
+        for slug, nid, p, pct, oidx, rank in \
+                (all_deals if not limit else all_deals[:limit]):
+            jd = {"collection": slug, "token_id": nid,
+                  "ask_xrp": str(p),
+                  "ask_usd": round(float(p) * xrp_usd, 2)
+                             if xrp_usd else None,
+                  "pct_below_median": round(float(pct), 1),
+                  "cheaper_than_pct": round(float(rank), 1),
+                  "offer_index": oidx}
+            try:
+                det = xrpl_to.nft_last_sale_detail(nid)
+            except Exception:  # noqa: BLE001
+                det = None
+            if det and det[0] and det[1]:
+                rate_then = C.fetch_xrp_usd_at(det[1])
+                jd["last_sale_xrp"] = round(det[0], 2)
+                jd["last_sale_date"] = _jtime.strftime(
+                    "%Y-%m-%d", _jtime.gmtime(det[1]))
+                jd["last_sale_usd_then"] = round(det[0] * rate_then, 2) \
+                    if rate_then else None
+            jdeals.append(jd)
         print(_json.dumps({
             "threshold_pct": threshold,
             "xrp_usd": xrp_usd,
@@ -2451,17 +2474,10 @@ def cmd_fuzzy_deals(args, cfg, client):
                  "trimmed_median_xrp": str(md) if md else None}
                 for slug, n, fl, md in markets],
             "note": "asks are open ledger offers via xrpl.to, not sales; "
+                    "last-sale figures are approximate (derived); "
                     "verify on-ledger before acting",
             "attribution": "Data by xrpl.to (https://xrpl.to)",
-            "deals": [{"collection": slug, "token_id": nid,
-                       "ask_xrp": str(p),
-                       "ask_usd": round(float(p) * xrp_usd, 2)
-                                  if xrp_usd else None,
-                       "pct_below_median": round(float(pct), 1),
-                       "cheaper_than_pct": round(float(rank), 1),
-                       "offer_index": oidx}
-                      for slug, nid, p, pct, oidx, rank in
-                      (all_deals if not limit else all_deals[:limit])],
+            "deals": jdeals,
         }, indent=2))
         return
     print("FUZZY market (Data by xrpl.to"
@@ -2483,9 +2499,32 @@ def cmd_fuzzy_deals(args, cfg, client):
         return
     shown = all_deals if not limit else all_deals[:limit]
     print(f"  DEALS (≥{threshold}% below trimmed median):")
+    # last-sale context per deal (parallel; best-effort, never blocks)
+    def _last_sale(nid):
+        try:
+            return nid, xrpl_to.nft_last_sale_detail(nid)
+        except Exception:  # noqa: BLE001
+            return nid, None
+    sale_map = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for nid, det in pool.map(_last_sale, [d[1] for d in shown]):
+            sale_map[nid] = det
+    import time as _time
     for i, (slug, nid, price, pct, oidx, rank) in enumerate(shown, 1):
         print(f"  {i}. [{slug}] {C.short_addr(nid)} — {price} XRP{_usd(price)} "
               f"(-{pct:.1f}% vs median, cheaper than {rank:.0f}% of asks)")
+        det = sale_map.get(nid)
+        if det and det[0] and det[1]:
+            sale_xrp, sale_unix = det
+            rate_then = C.fetch_xrp_usd_at(sale_unix)
+            sale_date = _time.strftime("%Y-%m-%d", _time.gmtime(sale_unix))
+            if rate_then:
+                sale_usd = sale_xrp * rate_then
+                print(f"     last sold {sale_xrp:.1f} XRP (~${sale_usd:,.0f} "
+                      f"@ ${rate_then:.2f} then, {sale_date})")
+            else:
+                print(f"     last sold {sale_xrp:.1f} XRP ({sale_date}; "
+                      f"historical rate unavailable)")
         if oidx:
             print(f"     buy: xrpl-trade nft-buy --offer-index {oidx}")
         else:

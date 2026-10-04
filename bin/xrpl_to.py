@@ -365,6 +365,65 @@ def nft_last_sale_xrp(nft_id, limit=25):
     trades read as ~0 — callers must label the figure approximate and
     advisory, never an appraisal.
     """
+    d = nft_last_sale_detail(nft_id, limit=limit)
+    return d[0] if d else None
+
+
+def nft_last_sale_detail(nft_id, limit=25):
+    """Last sale as (price_xrp, date_unix), or None.
+
+    Same derivation as nft_last_sale_xrp (buyer's XRP balance decrease
+    minus fee), plus the Ripple-epoch tx date converted to unix. Gifts
+    and wash trades read as ~0 — callers must label the figure
+    approximate and advisory, never an appraisal. Never raises."""
+    try:
+        r = api_get(f"/nft/history/{nft_id}", {"limit": limit})
+    except Exception:
+        return None
+    txs = (r or {}).get("transactions") if isinstance(r, dict) else None
+    if not isinstance(txs, list):
+        return None
+    for e in txs:
+        if not isinstance(e, dict):
+            continue
+        tx = e.get("tx")
+        if not isinstance(tx, dict):
+            continue
+        if tx.get("TransactionType") != "NFTokenAcceptOffer":
+            continue
+        fee = _xrp_float(tx.get("Fee")) or 0.0
+        spent = 0.0
+        meta = e.get("meta")
+        nodes = (meta or {}).get("AffectedNodes") \
+            if isinstance(meta, dict) else None
+        if not isinstance(nodes, list):
+            continue
+        for n in nodes:
+            mod = (n or {}).get("ModifiedNode") \
+                if isinstance(n, dict) else None
+            if not isinstance(mod, dict):
+                continue
+            if mod.get("LedgerEntryType") != "AccountRoot":
+                continue
+            ff = mod.get("FinalFields") or {}
+            pf = mod.get("PreviousFields") or {}
+            b0 = _xrp_float(pf.get("Balance"))
+            b1 = _xrp_float(ff.get("Balance"))
+            if b0 is not None and b1 is not None and b1 < b0:
+                spent = max(spent, b0 - b1)
+        if spent > 0:
+            ripple_date = tx.get("date")
+            unix = (ripple_date + 946684800) \
+                if isinstance(ripple_date, (int, float)) else None
+            return (max(spent - fee, 0.0), unix)
+    return None
+    """Approx last sale price (XRP) from on-chain history, or None.
+
+    Scans newest-first for NFTokenAcceptOffer and derives the price from
+    the buyer's XRP balance decrease minus the tx fee. Gifts and wash
+    trades read as ~0 — callers must label the figure approximate and
+    advisory, never an appraisal.
+    """
     try:
         r = api_get(f"/nft/history/{nft_id}", {"limit": limit})
     except Exception:
