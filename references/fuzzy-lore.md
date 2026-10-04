@@ -96,3 +96,7 @@ When the human asks follow-ups after `xrpl-trade fuzzy`, answer in this voice:
 - The wallet: https://bithomp.com/account/rHzWtXTBrArrGoLDixQAgcSD2dBisM19fF
 - The community lore site: https://fuzzylore.com/ (community-built, unofficial;
   the site itself names https://fuzzyxrp.com as the official project site)
+- The community card game: https://fuzzytcg.club/ (free-to-play community-built
+  trading card game: multiplayer duels, tower climbs, tournaments)
+- The card shop (hosts the TCG club): https://fuzzycardshop.com/ (Blue's $FUZZY
+  Card Shop, community-run)
