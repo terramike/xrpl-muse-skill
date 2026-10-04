@@ -846,11 +846,19 @@ not by typing commands.
 **Main menu buttons:**
 - XRPL Actions
 - NFT
+- 🐻 Fuzzy
+- Artists
+- Wallets
 - XRP News
-- 🤝 Community
+- XRPLF
+- Coffee & Crypto
+- xBoost
 
-**XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI), in ABC order:
-- 💰 Balances (`balance [address]` — XRP + trustline balances)
+**XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI):
+- 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),
+  🔍 Token Lookup (`token-lookup --issuer … --currency …`), 🧾 Explain a
+  Transaction (`tx-explain --hash …`), 🐋 Whale Watch
+  (`whale-watch --issuer r… --currency … [--limit 10]`)
 - 🔎 Forensics (read-only, keyless, budgeted; `references/forensic-mode.md`):
   - 🧬 Trace (`xrpl-trade trace r… [--depth N]` — funding-origin chain)
   - 🔗 Links (`xrpl-trade links r… r… [--window N]` — shared counterparties,
@@ -863,29 +871,6 @@ not by typing commands.
     claims common ownership without control overlap. Known addresses render
     `LABEL: r… — "Name" (verified)`; service-wallet links get the loud
     false-positive caveat.
-- 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),
-  🔍 Token Lookup (`token-lookup --issuer … --currency …`), 🧾 Explain a
-  Transaction (`tx-explain --hash …`), 🐋 Whale Watch
-  (`whale-watch --issuer r… --currency … [--limit 10]`)
-- 👛 Wallets (local-only, explicit opt-in):
-  - `wallet create` — generate a fresh wallet; seed stored 0600, never displayed
-  - `wallet backup` — ONE-TIME seed display for write-down
-  - `setup` — onboarding: new wallet or address+network
-
-**🤝 Community submenu** (in ABC order; each opens its own focused submenu):
-- 🎨 Artists — following artists (`favorites` add/list/rename/remove,
-  `nft-new` — new mints from followed artists; entirely read-only)
-- ☕ Coffee & Crypto (see **Coffee & Crypto submenu** below)
-- 🎙️ Dip a Toe — Melissa's XRP community YouTube show (@dipatoe;
-  X @worldbefree888)
-- 🌾 Farmers Union (`xrpl-trade farm` — $FARM community helper: about, links,
-  qualification check, treasury, cropdusting board; read-only)
-- 🐻 Fuzzy (see **🐻 Fuzzy submenu** below)
-- 🔭 ShadowWatch (https://shadowwatch.xyz/ — XRP Man's XRPL whale-tracking
-  dashboard: live ledger stream, wallet graph, bubble map, HVT watchlist,
-  wallet identity resolver)
-- ⚡ xBoost (X Spaces tipping and engagement layer on XRPL)
-- 🏛️ XRPLF (XRPL Foundation)
 
 **Coffee & Crypto submenu:**
 - 🎰 LuckyHash (`references/luckyhash.md`; trigger "luckyhash menu") —
