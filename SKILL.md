@@ -853,6 +853,7 @@ not by typing commands.
 - XRPLF
 - Coffee & Crypto
 - xBoost
+- 🎙️ Dip a Toe — Melissa's XRP community YouTube show (@dipatoe; X @worldbefree888)
 
 **XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI):
 - 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),

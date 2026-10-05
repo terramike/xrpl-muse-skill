@@ -45,11 +45,13 @@ XRPL Operations
 
 Communities, projects, and tools
 Dip-a-Toe Community
-	●	Category: XRP community
-	●	YouTube: @dipatoe
-	●	Related X account: @worldbefree888
-	●	Related X account: @simonsez_crypto
-	●	Verification: Unverified association between the community and listed X accounts
+	●	Category: XRP community YouTube show
+	●	Host: Melissa (Mike's good friend)
+	●	YouTube: @dipatoe (https://www.youtube.com/@dipatoe)
+	●	X: @worldbefree888 (https://x.com/worldbefree888)
+	●	Show: "Dip a Toe" — XRP community show on YouTube
+	●	Note: Melissa came to XRP Las Vegas just to stream the XRP Shark Tank show — she wasn't on Shark Tank and paid her own way in. Her stream let Mike's uncles watch him on stage.
+	●	Verification: Curator identified (2026-10-05)
 Innit 2 Winnit LLC
 	●	Category: Community or project
 	●	X: @innit2winnitllc
