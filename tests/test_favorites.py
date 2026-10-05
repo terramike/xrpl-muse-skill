@@ -462,8 +462,12 @@ with tempfile.TemporaryDirectory() as td:
           C.extract_mint_token_ids(
               {"nftoken_id": NID2, **created_meta(NID1, URI_HEX)}) == [NID1])
 
+    # close_time_iso is generated fresh (2 days ago) so the entry always
+    # falls inside the 7-day cutoff below — a hardcoded date rots.
+    _two_days_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                  time.gmtime(int(time.time()) - 2 * 86400))
     iso_entry = {"ledger_index": 21030789,
-                 "close_time_iso": "2026-09-25T05:16:51Z",
+                 "close_time_iso": _two_days_ago,
                  "tx_json": {"TransactionType": "NFTokenMint",
                              "Account": GOOD_ADDR, "URI": URI_HEX,
                              "NFTokenTaxon": 7},
