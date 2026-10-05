@@ -2307,6 +2307,105 @@ def cmd_nft_new(args, cfg, client):
         C.save_favorites(favs)
 
 
+# ---------- NFT Radar: drop radar across the curated artist directory ----------
+NFT_RADAR_WORKERS = 10  # parallel artist scans
+
+
+def _artist_directory_path():
+    return Path(__file__).resolve().parent.parent / "references" / "artist-directory.json"
+
+
+def _radar_scan_one(work):
+    """Scan one artist for recent mints. Returns a hit dict or None."""
+    artist, cutoff, client = work
+    addr = (artist.get("address") or "").strip()
+    if not addr:
+        return None
+    mints, _pages, problem = C.scan_artist_mints(
+        client, addr, cutoff_unix=cutoff)
+    if problem or not mints:
+        return None
+    ordered = sorted(mints, key=lambda m: m.get("date_unix") or 0,
+                     reverse=True)
+    newest = ordered[0].get("date_unix")
+    return {
+        "name": artist.get("name") or C.short_addr(addr),
+        "address": addr,
+        "cafe": artist.get("cafe"),
+        "mint_count": len(ordered),
+        "newest_unix": newest,
+        "newest_utc": (time.strftime("%Y-%m-%d %H:%M", time.gmtime(newest))
+                       if newest else "unknown"),
+        "token_ids": [t for m in ordered[:5]
+                      for t in (m.get("token_ids") or [])][:5],
+    }
+
+
+def cmd_nft_radar(args, cfg, client):
+    """Read-only: NFT drop radar across the curated artist directory.
+
+    Scans every artist in references/artist-directory.json for NFTokenMint
+    transactions in the window and reports only artists with new mints —
+    signal, not noise. --days N sets the window (1-30, default 3).
+    --limit N caps artists shown, newest activity first (default 20,
+    0 = no cap). --json emits machine-readable output. No watermarks;
+    every run is a pure window scan. Entirely read-only."""
+    days = args.days
+    if not 1 <= days <= 30:
+        sys.exit("--days must be between 1 and 30")
+    limit = args.limit
+    if limit < 0:
+        sys.exit("--limit must be 0 (no cap) or a positive number")
+    try:
+        artists = json.loads(_artist_directory_path().read_text())
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"could not load artist directory: {e}")
+    if not artists:
+        sys.exit("artist directory is empty")
+    now = int(time.time())
+    cutoff = now - days * 86400
+    validated, problem = C.get_validated_ledger(client)
+    if problem:
+        sys.exit(problem)
+    from concurrent.futures import ThreadPoolExecutor
+    work = [(a, cutoff, client) for a in artists]
+    if not getattr(args, "json", False):
+        print(f"scanning {len(work)} artists (last {days}d)…",
+              flush=True)
+    hits = []
+    with ThreadPoolExecutor(max_workers=NFT_RADAR_WORKERS) as pool:
+        for hit in pool.map(_radar_scan_one, work):
+            if hit:
+                hits.append(hit)
+    scanned = len(work)
+    hits.sort(key=lambda h: h["newest_unix"] or 0, reverse=True)
+    total = len(hits)
+    shown = hits if not limit else hits[:limit]
+    if args.json:
+        print(json.dumps({
+            "days": days,
+            "artists_scanned": scanned,
+            "artists_with_mints": total,
+            "hits": shown,
+        }, indent=1))
+        return
+    window = f"last {days}d"
+    if not hits:
+        print(f"NFT Radar: nothing new from {scanned} artists ({window})")
+        return
+    print(f"NFT Radar: {total} of {scanned} artists minted ({window}):")
+    if total > len(shown):
+        print(f"  (showing {len(shown)} most recent; {total - len(shown)} "
+              f"more — raise with --limit N)")
+    for h in shown:
+        print(f"  • {h['name']} — {h['mint_count']} mint(s), "
+              f"newest {h['newest_utc']} UTC")
+        for tid in h["token_ids"]:
+            print(f"      {tid}")
+        if h.get("cafe"):
+            print(f"      {h['cafe']}")
+
+
 # ---------- FUZZY deal scanner (read-only) ----------
 # FUZZY community NFT collections on xrpl.to (verified 2026-10-03).
 # fuzzybears = "Original Fuzzybears", issuer rw1R8cfHGMySmbj7gJ1HkiCqTY1xhLGYAs
@@ -4382,6 +4481,16 @@ def main():
                         "(default 25; 0 = no cap)")
     p.add_argument("--no-safety", action="store_true",
                    help="skip the per-mint xrpl.to safety one-liners")
+    p = sub.add_parser("nft-radar", help="NFT drop radar: new mints across "
+                                         "the curated artist directory "
+                                         "(read-only)")
+    p.add_argument("--days", type=int, default=3,
+                   help="window in days, 1-30 (default 3)")
+    p.add_argument("--limit", type=int, default=20,
+                   help="max artists shown, newest activity first "
+                        "(default 20; 0 = no cap)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
     p = sub.add_parser("fuzzy-deals", help="FUZZY NFTs listed below market "
                                           "(read-only)")
     p.add_argument("--threshold", type=int, default=20,
@@ -4588,6 +4697,7 @@ def main():
         "nft-buy": lambda: cmd_nft_buy(args, cfg, client),
         "nft-bid": lambda: cmd_nft_bid(args, cfg, client),
         "nft-new": lambda: cmd_nft_new(args, cfg, client),
+        "nft-radar": lambda: cmd_nft_radar(args, cfg, client),
         "fuzzy-deals": lambda: cmd_fuzzy_deals(args, cfg, client),
         "incoming": lambda: cmd_incoming(args, cfg, client),
         "collection": lambda: cmd_collection(args, cfg, client),
