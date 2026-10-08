@@ -2439,5 +2439,13 @@
   "verification": "Curator identified",
   "x": null,
   "source": "Mike's xrp.cafe follow list 2026-10-05"
+ },
+ {
+  "name": "Byron",
+  "cafe": "https://xrp.cafe/profile/rMf25RxNs7kXEASdhphjw3xfLkY9pqNubf",
+  "address": "rMf25RxNs7kXEASdhphjw3xfLkY9pqNubf",
+  "verification": "Curator identified",
+  "x": "artistbyron",
+  "source": "Added by Mike 2026-10-07 (creator of The Horde, 300+ hand-drawn zombies on xrp.cafe)"
  }
 ]
