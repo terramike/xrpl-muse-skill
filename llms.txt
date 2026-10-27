@@ -6,6 +6,7 @@
 > signing requires an explicit typed ceremony. MIT licensed.
 
 Repo: https://github.com/terramike/xrpl-muse-skill
+HOL Guard profile: https://hol.org/guard/extensions/command.xrpl-muse-skill
 
 ## Entry points
 
@@ -13,6 +14,8 @@ Repo: https://github.com/terramike/xrpl-muse-skill
 - `SKILL.md` — the full operator manual (architecture, every command,
   policy model, NFT flows)
 - `SECURITY.md` — the safety model and its limits
+- HOL Guard profile — published command-coverage listing for the proposal,
+  signing, gate-transition, and read-only command classes
 - `AGENTS.md` — contributor guidance: tests, conventions, what never
   to touch
 - `references/` — deep docs per topic: `onboarding-wizard.md`,

@@ -3,6 +3,15 @@
 Trade the XRP Ledger from the terminal — any token pair, with a hard safety
 boundary between proposing a trade and signing it.
 
+## HOL Guard coverage
+
+HOL Guard publishes [XRPL Muse Skill protection](https://hol.org/guard/extensions/command.xrpl-muse-skill),
+a command-coverage profile for this skill. It classifies signing approval and
+gate-transition commands for review, proposal commands for review, and
+read-only queries as inert. The listing documents that external Guard
+coverage; it does not replace this skill's own policy checks or the
+operator's exact-hash approval.
+
 ## Read-only mode: the default (v0.11.0)
 
 Fresh installs start **read-only**: everything keyless works, nothing can

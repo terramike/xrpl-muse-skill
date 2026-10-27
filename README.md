@@ -6,6 +6,10 @@ boundary between **proposing** a trade and **signing** it.
 Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
 terminal).
 
+**HOL Guard coverage:** [XRPL Muse Skill protection](https://hol.org/guard/extensions/command.xrpl-muse-skill)
+— the published HOL Guard extension profile mapping the proposal, signing,
+and gate-transition commands Guard reviews before they run.
+
 ## The idea
 
 Most trading tools ask the agent to "ask the human first" and hope it does.

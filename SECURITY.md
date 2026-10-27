@@ -6,6 +6,15 @@ Open a GitHub issue titled `[security]` or contact the maintainer through the
 profile email on https://github.com/terramike. Do not post exploit details
 publicly before a fix is available.
 
+## External Guard coverage
+
+HOL Guard publishes [XRPL Muse Skill protection](https://hol.org/guard/extensions/command.xrpl-muse-skill),
+which maps the skill's proposal, signing, and gate-transition commands to
+Guard review defaults and read-only queries to allowed/inert handling. The
+profile is documentation of that coverage. As HOL itself states, a maintainer
+profile is not a security certification or an official upstream endorsement,
+and Guard coverage does not replace the safety model below.
+
 ## Known issue — do not trade on versions before c3273e59
 
 Commit `ed8fa202` ("XRPL trading skill for Muse: CLI + docs + installer")
