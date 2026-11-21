@@ -17,6 +17,9 @@ import importlib.util
 import io
 import contextlib
 import json
+import os
+import stat
+import subprocess
 import sys
 from types import SimpleNamespace as ns
 import tempfile
@@ -1140,6 +1143,29 @@ check("installer uses the hash-pinned requirements",
       and 'pip install -r "$DEST/requirements.txt"' not in installsh)
 check("installer prints the testnet-only notice",
       "TESTNET-ONLY" in installsh and "same-user" in installsh)
+
+# Re-running the installer over an older copy must drop the client that
+# used to live in bin/. cp -r does not delete files the source no longer has.
+home = Path(tempfile.mkdtemp(prefix="xrpl-install-"))
+legacy_bin = home / "workspace" / "skills" / "xrpl" / "bin" / "clavi5-beta"
+legacy_test = home / "workspace" / "skills" / "xrpl" / "tests" / "test_clavi5_beta.py"
+legacy_bin.parent.mkdir(parents=True)
+legacy_test.parent.mkdir(parents=True)
+legacy_bin.write_text("#!/bin/sh\necho old-client\n")
+legacy_bin.chmod(stat.S_IRWXU)
+legacy_test.write_text("# old test\n")
+pipdir = Path(tempfile.mkdtemp(prefix="xrpl-pip-"))
+fake_pip = pipdir / "pip"
+fake_pip.write_text("#!/bin/sh\nexit 0\n")
+fake_pip.chmod(stat.S_IRWXU)
+inst = subprocess.run(
+    ["bash", str(REPO / "install.sh")],
+    env=dict(os.environ, HOME=str(home),
+             PATH=str(pipdir) + os.pathsep + os.environ.get("PATH", "")),
+    capture_output=True, text=True)
+check("upgrade install removes the legacy clavi5 client",
+      inst.returncode == 0 and not legacy_bin.exists()
+      and not legacy_test.exists())
 
 # =====================================================================
 # Item 9: giveaway paths get the same treatment

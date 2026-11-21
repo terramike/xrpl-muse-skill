@@ -1,11 +1,14 @@
 # AGENTS.md — contributor guidance for xrpl-muse-skill
 
-This repo is a terminal skill for trading the XRP Ledger, built for AI
-agents. Two programs, one hard boundary: `bin/xrpl-trade` builds
-transactions and **never signs**; `bin/xrpl-sign` is the only program
-that touches a seed, and only with explicit human approval of an exact
-proposal hash. Read `SKILL.md` for the full operator manual and
-`SECURITY.md` for the safety model before changing behavior.
+This repo is a terminal skill for keyless XRPL research and safety, built
+for any agent. Trading is the second job. `bin/xrpl-trade` builds
+transactions and does not submit. The propose path does not read a seed.
+Opt-in commands in that program can store a seed, and `wallet backup` or
+autopilot's backup ceremony can display one once. `bin/xrpl-sign` signs a
+proposal only with explicit human approval of the exact proposal hash, and
+refuses while read-only. Fresh installs stay read-only until someone types
+`go live`. Read `SKILL.md` for the operator manual and `SECURITY.md` for
+the safety model before changing behavior.
 
 ## Setup
 
@@ -25,10 +28,14 @@ python3 -m unittest tests.test_onboarding # wizard spec, no network
 python3 -m unittest tests.test_v04        # 78 adversarial logic tests
 ```
 
-Run the affected suites before every change; keep them green. Known
-issues (don't "fix" by deleting): `tests/test_v060.py` references a
-removed symbol (`C.StateCorruptError` — stale test, needs a real fix);
-`tests/test_wallet.py` needs live network and hangs offline.
+Run the affected files as scripts (`python3 tests/test_readonly.py`).
+`python3 -m unittest` on a script module can exit 5 after a passing run,
+and `unittest discover` is unsafe because several files exit on import.
+Known issues (don't "fix" by deleting): `tests/test_wallet.py` blocks on
+the backup prompt (`input()`), so offline CI does not start it. Network
+end-to-end files `tests/test_e2e_testnet.py` and `tests/test_nft_send_e2e.py`
+are also outside the offline job. `tests/test_v060.py` matches the current
+spend-state error path and belongs in that job.
 
 ## Conventions
 

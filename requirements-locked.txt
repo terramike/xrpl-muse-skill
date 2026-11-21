@@ -1,8 +1,10 @@
-# Pinned, hash-verified dependencies for xrpl-muse-skill v0.4.0.
-# Install with:  pip install --require-hashes -r requirements-locked.txt
+# Pinned, hash-verified dependencies for xrpl-muse-skill.
+# Install with:  pip install -r requirements-locked.txt
 # (requirements.txt keeps the loose pin for readability.)
-# Hashes below are for Linux x86_64 (cp312); regenerate on other platforms
-# with: pip download -r requirements.txt -d pkgs && pip hash pkgs/*
+# Hashes are linux x86_64 wheels. websockets and wrapt list both the
+# cp312 and the cp313 manylinux wheels. Do not regenerate this file from
+# one interpreter; that drops the other interpreter's hashes. Add a
+# platform by appending `pip hash` output on the existing requirement line.
 ECPy==1.2.5 \
     --hash=sha256:559c92e42406d9d1a6b2b8fc26e6ad7bc985f33903b72f426a56cb1073a25ce3
 anyio==4.15.1 \
@@ -28,8 +30,10 @@ types-deprecated==1.3.1.20260728 \
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
 websockets==15.0.1 \
-    --hash=sha256:64dee438fed052b52e4f98f76c5790513235efaa1ef7f3f2192c392cd7c91b65
+    --hash=sha256:64dee438fed052b52e4f98f76c5790513235efaa1ef7f3f2192c392cd7c91b65 \
+    --hash=sha256:0f3c1e2ab208db911594ae5b4f79addeb3501604a165019dd221c0bdcabe4db8
 wrapt==2.4.1 \
-    --hash=sha256:30d11c289b013bf384ff1a1a6553f150d0b855901708a9bef667a5680f8247c9
+    --hash=sha256:30d11c289b013bf384ff1a1a6553f150d0b855901708a9bef667a5680f8247c9 \
+    --hash=sha256:be6cdd7121adc89a6f52e3c2f4e26a2d4dcdc1c0fde47e3156234db8939e4cdc
 xrpl-py==5.2.0 \
     --hash=sha256:a5fb427d83a0590f38714b5eca0341ff0e30443394c7c1e1bc0577adcc66c094

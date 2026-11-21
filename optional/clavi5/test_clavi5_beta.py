@@ -1,4 +1,4 @@
-"""Tests for bin/clavi5-beta: the Clavi5 multi-user beta client.
+"""Tests for optional/clavi5/clavi5-beta: the Clavi5 multi-user beta client.
 
 Behavior specs:
 - init writes owner-only config and verifies the token.
@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-BIN = os.path.join(os.path.dirname(__file__), "..", "bin", "clavi5-beta")
+BIN = os.path.join(os.path.dirname(__file__), "clavi5-beta")
 
 
 def load_module():

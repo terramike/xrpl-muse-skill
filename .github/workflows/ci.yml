@@ -1,0 +1,44 @@
+name: offline
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked requirements and run offline tests
+        run: |
+          set -euo pipefail
+          python -m pip install -r requirements-locked.txt
+          export HOME="${RUNNER_TEMP}/home"
+          mkdir -p "$HOME"
+          # Names only. Values are not printed.
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            unset "$name"
+          done < <(compgen -e | grep -i seed || true)
+          unset PINATA_JWT XRPLTO_API_KEY || true
+          skip=" test_e2e_testnet.py test_nft_send_e2e.py test_wallet.py "
+          for f in tests/test_*.py; do
+            base="$(basename "$f")"
+            case "$skip" in
+              *" $base "*) echo "skip $base"; continue ;;
+            esac
+            echo "run $base"
+            python "$f"
+          done
+          python optional/clavi5/test_clavi5_beta.py

@@ -5,9 +5,14 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/workspace/skills/xrpl"
 mkdir -p "$DEST"
 cp -r "$SRC/SKILL.md" "$SRC/README.md" "$SRC/SECURITY.md" \
+      "$SRC/llms.txt" \
       "$SRC/requirements.txt" "$SRC/requirements-locked.txt" \
       "$SRC/approved.example.json" \
-      "$SRC/policy.example.json" "$SRC/bin" "$SRC/tests" "$DEST/"
+      "$SRC/policy.example.json" "$SRC/bin" "$SRC/tests" \
+      "$SRC/references" "$DEST/"
+# cp -r merges into an existing destination and leaves files that left
+# the source tree. Drop the Clavi5 client copied by installs before v0.15.0.
+rm -f "$DEST/bin/clavi5-beta" "$DEST/tests/test_clavi5_beta.py"
 pip install -r "$DEST/requirements-locked.txt"
 echo ""
 echo "Installed to $DEST"

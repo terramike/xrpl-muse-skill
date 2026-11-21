@@ -69,7 +69,7 @@ try:
     from xrpl.transaction import autofill
     from xrpl.utils import drops_to_xrp, xrp_to_drops
 except ImportError:
-    sys.exit("xrpl-py not installed. Run: pip install -r requirements.txt")
+    sys.exit("xrpl-py not installed. Run: pip install -r requirements-locked.txt")
 
 try:
     import xrpl_pin
@@ -3408,7 +3408,10 @@ Reduce the blast radius:
   - Keep spend caps tight in ~/.xrpl/policy.json.
   - Run `xrpl-trade autopilot disable` the moment you stop needing it.
 
-The seed is stored 0600, never printed, never logged, never echoed.
+The seed is stored 0600 and is never written to the audit log.
+Generating a wallet, or backing up an adopted seed, prints the seed once
+and requires you to type I HAVE WRITTEN IT DOWN, including on mainnet.
+A pasted seed stays on a hidden prompt and is not printed.
 ================================================================
 """
 
@@ -4145,39 +4148,9 @@ def main():
                         "(vault-only again)")
     ap_.add_parser("status",
                    help="show autopilot state (never displays the seed)")
-    p = sub.add_parser("autonomous",
-                       help="autonomous mode (P0: dry-run only): setup / "
-                            "approve / tick / status / pause / resume / stop / "
-                            "report. Separate feature — never touches the main "
-                            "account or policy.")
-    au = p.add_subparsers(dest="autonomous_cmd", required=True)
-    asu = au.add_parser("setup",
-                  help="guided setup: generate the standalone bot wallet "
-                       "(100 XRP max), or use your own via --address; "
-                       "print the exact plan + hash")
-    asu.add_argument(
-        "--force", action="store_true",
-        help="replace an existing autonomous config (abandons the old bot wallet)")
-    asu.add_argument(
-        "--address", default=None,
-        help="bring-your-own wallet (e.g. created in Xaman): skips wallet "
-             "generation and the seed ceremony; no seed is stored or needed "
-             "for P0 dry-run")
-    aa = au.add_parser("approve",
-                       help="activate the printed plan (dry-run only in P0)")
-    aa.add_argument("--plan-hash", required=True,
-                    help="plan hash printed by `autonomous setup`")
-    au.add_parser("tick",
-                  help="run one evaluation cycle — dry-run: evaluates the "
-                       "grid, whitelists, logs; never signs or submits")
-    au.add_parser("status",
-                  help="wallet, offers, bankroll usage, last tick (read-only)")
-    au.add_parser("pause", help="pause the runner (tick refuses to run)")
-    au.add_parser("resume", help="resume a paused runner")
-    au.add_parser("stop",
-                  help="stop autonomous mode (re-approval needed to restart)")
-    au.add_parser("report",
-                  help="activity summary from the autonomous audit log")
+    sub.add_parser(
+        "autonomous",
+        help="not included in this build (local-only, dry-run)")
     p = sub.add_parser("live",
                        help="leave read-only mode: enable signing via an "
                             "explicit typed ceremony")
@@ -4650,6 +4623,13 @@ def main():
     if args.cmd == "read-only":
         # Local-only config flip; no network, no keys.
         cmd_read_only(args)
+        return
+    if args.cmd == "farm" and getattr(args, "farm_cmd", None) in ("about", "links"):
+        # Static copy from references/farm.md. No ledger client.
+        if args.farm_cmd == "about":
+            cmd_farm_about()
+        else:
+            cmd_farm_links()
         return
     cfg = load_config()
     network = args.network or cfg.get("network", "testnet")
