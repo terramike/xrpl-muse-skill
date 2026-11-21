@@ -1,9 +1,9 @@
 # xrpl-muse-skill
 
-> Trade the XRP Ledger from the terminal with a hard safety boundary
-> between proposing a trade and signing it. Built for AI agents; safe
-> for humans. Read-only by default — every market read works keyless,
-> signing requires an explicit typed ceremony. MIT licensed.
+> Keyless XRPL research and safety for any agent with a terminal.
+> Trading is second, behind proposing a transaction and a human
+> approving the exact hash. Fresh installs are read-only until someone
+> types `go live`. MIT licensed.
 
 Repo: https://github.com/terramike/xrpl-muse-skill
 HOL Guard profile: https://hol.org/guard/extensions/command.xrpl-muse-skill
@@ -11,18 +11,18 @@ HOL Guard profile: https://hol.org/guard/extensions/command.xrpl-muse-skill
 ## Entry points
 
 - `README.md` — install, quick start, command map, what's new
-- `SKILL.md` — the full operator manual (architecture, every command,
-  policy model, NFT flows)
+- `SKILL.md` — safety rules, the ceremony, and pointers into `references/`
 - `SECURITY.md` — the safety model and its limits
 - HOL Guard profile — published command-coverage listing for the proposal,
   signing, gate-transition, and read-only command classes
 - `AGENTS.md` — contributor guidance: tests, conventions, what never
   to touch
 - `references/` — deep docs per topic: `onboarding-wizard.md`,
-  `ecosystem-connectors.md`, `trusted-links.md` (verified-link registry),
-  `fuzzy-lore.md`, `farm.md` (Farmers Union explainer + link bundle)
-- `bin/xrpl-trade` — the proposer CLI (builds txs, never signs)
-- `bin/xrpl-sign` — the policy-gated signer (only program that sees a seed)
+  `ecosystem-connectors.md`, `trusted-links.md` (curated links with dates),
+  `farm.md` (Farmers Union explainer + link bundle),
+  `commands.md`, `menu-presentation.md`
+- `bin/xrpl-trade` — keyless reads and proposal builds; does not submit
+- `bin/xrpl-sign` — signs a proposal only with `--approve` of the exact hash, and refuses while read-only
 - `bin/xrpl_eco.py` — ecosystem read modules (validators, amendments,
   stablecoin, oracle)
 
@@ -31,9 +31,12 @@ HOL Guard profile: https://hol.org/guard/extensions/command.xrpl-muse-skill
 1. Fresh installs are read-only. `xrpl-trade live` requires typing
    `go live` at an interactive prompt — there is deliberately no CLI
    flag or env var to skip it.
-2. `xrpl-trade` never sees a seed and never submits. `xrpl-sign` only
-   signs a hash-bound proposal envelope the human approved exactly.
-3. Never request, reveal, or record a seed. Ever.
+2. The propose path does not read a seed and does not submit.
+   `xrpl-sign` signs only with `--approve` of the exact hash and refuses
+   while read-only. Opt-in commands in `xrpl-trade` can store a seed.
+   `wallet backup` and autopilot's backup ceremony can display a seed once.
+3. Do not paste a seed into chat. A backup that prints a seed on the
+   operator's terminal puts that seed in the transcript.
 4. Network reads fail open (clear "unavailable", never fabricated data);
    external data is always attributed, never presented as ledger truth.
 

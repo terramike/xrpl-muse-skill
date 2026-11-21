@@ -77,7 +77,7 @@ try:
     from xrpl.utils import drops_to_xrp
     from xrpl.wallet import Wallet
 except ImportError:
-    sys.exit("xrpl-py not installed. Run: pip install -r requirements.txt")
+    sys.exit("xrpl-py not installed. Run: pip install -r requirements-locked.txt")
 
 
 # ---------- policy ----------

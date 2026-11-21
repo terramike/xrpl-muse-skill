@@ -1,7 +1,8 @@
 # xrpl-muse-skill
 
-Trade the XRP Ledger from the terminal — any token pair, with a hard safety
-boundary between proposing a trade and signing it.
+Keyless research and safety for the XRP Ledger, for any agent with a
+terminal. Trading is the second job. Proposing a transaction and signing
+it stay separate.
 
 ## HOL Guard coverage
 
@@ -40,10 +41,11 @@ Two programs. The agent only ever runs the first.
 1. **`xrpl-trade` — the proposer.** Builds transactions, autofills them against
    the live network, prints the full ceremony (account, network, assets with
    issuers, amounts, limit price, max spend, fee, sequence, expiry), and saves
-   a **hash-bound proposal envelope**. It **never sees the seed** and **never
-   submits**.
-2. **`xrpl-sign` — the policy-gated signer.** The only program that touches the
-   seed. On mainnet it reads the seed from a **named signing profile**
+   a **hash-bound proposal envelope**. The propose path does not read a seed
+   and does not submit. Other commands in this program can store a seed, and
+   `wallet backup` or autopilot's backup ceremony can display one once.
+2. **`xrpl-sign` — the policy-gated signer.** The only program that signs a
+   proposal. On mainnet it reads the seed from a **named signing profile**
    (`~/.xrpl/profiles.json`, owner-only `0600`) that binds account + network +
    credential reference + policy digest + spend-state selection; the seed
    itself lives in the operator's vault (password manager) and is injected
@@ -83,17 +85,20 @@ across accounts, networks, policies, or wallets:
 
 ### Vault-only mainnet (v0.7)
 
-Mainnet never keeps a seed on disk and never prints one to a terminal:
-
-- `xrpl-trade wallet create --network mainnet` and `wallet backup --network
-  mainnet` are refused (creation/backup of mainnet keys happens in the
-  vault, outside this tool).
-- The signer refuses to run on mainnet if legacy seeds remain in
-  `~/.xrpl/config.json` or `~/.xrpl/giveaway.json` — migrate them first
-  (`wallet forget-seed` removes a disk seed only after you type the address
-  to confirm the vault backup).
-- Testnet keeps the convenient local flow (`wallet create` prints the seed
-  once; the faucet no longer does).
+- `wallet create --network mainnet` and `wallet backup --network mainnet`
+  are refused. `wallet create` on testnet stores a seed and prints only the
+  address. `wallet backup` displays that stored seed once when the selected
+  network is not mainnet, and requires the typed backup phrase. A chat
+  transcript of that backup then contains the seed.
+- `setup` can store a seed for the network the operator types, including
+  mainnet, and does not display it. A seed in `~/.xrpl/config.json` or
+  `~/.xrpl/giveaway.json` blocks mainnet signing until `wallet forget-seed`
+  removes it. Faucet files do not block. Adopting a config seed into
+  autopilot does not clear that block.
+- The faucet stores a testnet seed and does not print it. Giveaway setup
+  writes the giveaway policy, stores a donation-wallet seed only when the
+  operator pastes one, does not print it, and otherwise leaves that seed
+  for vault injection.
 
 ### Autopilot — at your own risk (opt-in local mainnet signing)
 
@@ -130,37 +135,16 @@ What Autopilot does and does not protect against — say this plainly:
   deletes the seed from disk after you type the address to confirm) the
   moment you stop needing it.
 
-Never paste a seed into chat to enable this. The seed is entered at a
-hidden terminal prompt, is never printed, logged, or echoed, and the audit
-log records only `seed_source=autopilot` — never the seed.
+Never paste a seed into chat to enable this. A pasted seed stays on a
+hidden terminal prompt. Generating a wallet, or backing up an adopted seed,
+prints the seed once and requires `I HAVE WRITTEN IT DOWN`, including on
+mainnet. The audit log records `seed_source=autopilot` and never the seed.
 
-### Autonomous mode (P0: dry-run only) — separate feature, plan-level approval
+### Autonomous mode
 
-Autonomous mode does **not** change anything above. It is a separate
-feature with its own wallet, config, audit log, and approval model:
-
-- **Standalone bot wallet.** `xrpl-trade autonomous setup` generates a
-  fresh wallet (one-time backup ceremony, seed in
-  `~/.xrpl/autonomous-seed.json` 0600) and writes
-  `~/.xrpl/autonomous.json` (0600). The runner is code-locked to that one
-  address — it can never address the main account.
-- **Approval is per-plan, not per-trade.** Setup prints the exact plan
-  (pair, strategy params, caps, schedule) and its sha256 hash;
-  `autonomous approve --plan-hash <hash>` activates it. Any plan change
-  needs a fresh approval. `pause` / `resume` / `stop` always work; `stop`
-  requires re-approval to restart.
-- **Code-level whitelist** (`xrpl_autonomous.validate_autonomous_tx`,
-  unit-tested in `tests/test_autonomous.py`): OfferCreate/OfferCancel only,
-  Account must equal the bot wallet, XRP/RLUSD with the approved issuer
-  only, per-trade cap, fee cap, no memos. Violations halt the runner.
-- **P0 is dry-run only.** `autonomous tick` reads the validated-ledger
-  mid-book + a Bitstamp sanity bound, evaluates the v1 grid (resting buy
-  X% below / sell X% above mid, re-arm on fill), builds the exact txs,
-  runs them through the whitelist, logs them — and never signs or
-  submits. Live mode is refused until P1.
-- **Bankroll cap 100 XRP** — the tick halts if the wallet ever exceeds it.
-- **Trusted inputs only**: validated ledger + Bitstamp. Never memos/chat.
-- Non-dev setup guide: `references/autonomous-setup.md`.
+Autonomous mode is not included in this build (local-only, dry-run).
+`xrpl-trade autonomous` exits with that sentence. This tree has no setup
+guide for it.
 
 
 ### The envelope (what the hash binds)
@@ -317,232 +301,15 @@ is mandatory and must match the profile the proposal was built for.
   `NFTokenAcceptOffer` to enable NFTs (and set `nft.allow_buy_offers=true`
   for the buy side).
 
-## NFTs (v0.5+): collections, templates, mint, list, inventory, buy, bid
+## NFTs
 
-Minting is a deliberate **two-step** flow — pinning is an external write
-and happens inside the approved action, never before it:
+Mint, list, inventory, buy, and bid flows are in `references/nft-commands.md`.
+The two-step mint is `nft-stage`, then `nft-pin-and-propose`.
+Pinata credentials stay inside the approved action.
 
-```bash
-xrpl-trade nft-stage --file art.png --name "Neon Drift" \
-    --description "Series 1, piece 3" --royalty-bps 1000
-# → validates the artwork locally (approved media dir, size/type/sha256)
-#   and writes a reviewable stage record. ZERO network calls.
+## Following artists
 
-# A human reviews the stage record, then approves the pin + proposal as
-# one action. PINATA_JWT is injected for this single operation only
-# (e.g. PINATA_JWT="$(vault read ...)" xrpl-trade nft-pin-and-propose …)
-# — never exported into a shell, never stored, never logged:
-xrpl-trade nft-pin-and-propose --stage <stage-id>
-# → re-validates the file against the staged hash, pins art + metadata
-#   under YOUR Pinata account, proposes NFTokenMint
-```
-
-### Collections, templates & attribution (v0.9)
-
-Saying "mint an nft" starts a guided chat, not a one-shot command: the
-assistant walks through **collection → template/ad-hoc fields → artwork
-→ values → review**, then the usual stage → pin → propose → approve →
-sign flow. Collections and templates are plain local JSON registries —
-there is no on-ledger "collection" object; a collection is just a named
-**issuer + NFTokenTaxon** pair you reuse, and a template is a reusable
-field schema (v1: string fields only) that is **not** bound to any
-collection — you pick both fresh at each mint.
-
-```bash
-# Register a collection LOCALLY (no ledger transaction — it exists
-# on-ledger only once you mint into its issuer+taxon):
-xrpl-trade collection create --name jets --taxon 200 \
-    [--issuer r...] [--royalty-bps 1000] [--description "..."]
-xrpl-trade collection list
-xrpl-trade collection inspect jets   # issuer, taxon, on-ledger token count
-xrpl-trade collection remove jets
-
-# Reusable metadata field schemas (string values, v1):
-xrpl-trade template create --name jets \
-    --field "attack:required" --field "speed:required" --field "gun1"
-# (omit --name/--field for an interactive walkthrough)
-xrpl-trade template list
-xrpl-trade template show jets
-xrpl-trade template remove jets
-
-# Mint into a collection with a template; extra fields ad-hoc:
-xrpl-trade nft-stage --collection jets --template jets \
-    --meta attack=90 --meta speed=75 --meta gun1=railgun \
-    --file art.png --name "Jet #1"
-# --royalty-bps overrides the collection's default royalty;
-# --taxon is refused together with --collection (the collection owns it);
-# --issuer is for authorized-minter mints (below).
-```
-
-- Registry files live in `~/.xrpl/` (`collections.json`,
-  `nft-templates.json`), written temp-file + atomic rename, mode `0600`.
-  The assistant treats `collection create/remove` and `template
-  create/remove` like policy edits: it shows the **exact diff** and gets
-  an **explicit human yes** before running them — never silent writes.
-- The stage review (and the pin approval ceremony) shows the collection,
-  each template field value, and the attribution state, so a human sees
-  exactly what metadata will be pinned.
-- **Attribution is on by default.** Every staged metadata carries
-  `"minted_with": "XRPL-Muse"` and `"minted_with_url":
-  "https://github.com/terramike/xrpl-muse-skill"` unless the minter
-  passes `--no-attribution`. The pin step re-verifies the attribution
-  block against the stage digest — editing it out of the staged record
-  fails the mint rather than minting silently unattributed.
-- **Minting for someone else's collection:** you can mint as the
-  collection issuer **or** as its on-ledger authorized `NFTokenMinter`
-  (`--issuer r...`). Before staging, the skill reads the issuer's
-  `AccountRoot` from a **validated** ledger and proceeds only if
-  `NFTokenMinter` equals your account — lookup failures, unvalidated
-  data, or a mismatch refuse the mint. The proposed `NFTokenMint`
-  carries the `Issuer` field (self-issued mints never do).
-
-```bash
-xrpl-trade nft-list --token-id <64-hex-id> --price-xrp 25 \
-    [--destination r...] [--expires-in 86400]
-# → proposes an XRP-denominated SELL offer
-```
-
-```bash
-xrpl-trade nft-inventory [r...]      # read-only: every NFT you own
-xrpl-trade nft-buy --offer-index <64-hex>
-# → verifies the SELL offer from the ledger (seller, ISSUER/minter, URI,
-#   taxon), then proposes NFTokenAcceptOffer
-xrpl-trade nft-bid --token-id <64-hex> --seller r... --price-xrp 5 \
-    [--expires-in 86400]
-# → proposes a BUY offer (bid); the bid XRP locks until accepted/cancelled/expired
-
-xrpl-trade nft-send --token-id <64-hex> --to <favorite-name|r...> \
-    [--expires-in 86400]
-# → proposes a 0-XRP TRANSFER offer (gift, NOT a sale); the recipient
-#   must accept before it expires
-```
-
-- **Bring your own Pinata.** Every operator uses their own account and
-  JWT; the publisher hosts no one's media. See `references/nft-pinata.md`.
-- Royalty is `--royalty-bps` (0–5000, default 1000 = 10%), immutable after
-  mint; flags default to burnable + transferable.
-- Listings are XRP-only in v1, always carry a ledger expiration, and are
-  gated by `max_mints_per_day` (rolling 24h) plus `max_transfer_fee`.
-- **Buying: verify the seller, not the picture.** `nft-buy` fetches the
-  sell offer from the ledger and refuses buy offers, non-XRP amounts, and
-  vanished offers. It prints the on-ledger **seller, issuer, token URI,
-  and taxon** before proposing, and the signer re-verifies the offer at
-  signing time — if the offer changed, signing is refused. Anyone can
-  mint the same artwork, so check that the issuer is the artist you
-  expect — the seller is only the current owner. The skill reports
-  on-ledger facts; it never calls a token "authentic". Each NFT is one-of-one: there is no fungible order-book
-  price check, and price sanity is the human's call — but both `nft-buy`
-  and `nft-bid` now append an advisory xrpl.to safety section (issuer
-  scam screen, collection floor, asking × floor multiple, approx last
-  sale; `--no-safety` skips).
-- `top-collections [--sort vol24h|trendingScore] [--limit 10]` — ranked
-  NFT collections with floor, 24h volume, owners, and 24h sales
-  (read-only, "Data by xrpl.to" credit).
-- Accepting a sell offer spends XRP immediately: the offer's price plus
-  fee runs through the per-transaction and rolling-24h spend caps.
-- Bids need `nft.allow_buy_offers: true` and are capped by
-  `nft.max_bid_xrp`; the bid XRP is reserved until the offer resolves.
-- **Transfers are gifts, not sales.** `nft-send` proposes a 0-XRP transfer
-  offer to a favorite name or r-address (`--to` resolves the name locally
-  and prints the resolved address in the proposal). The recipient must
-  accept before expiry; it spends 0 XRP beyond the fee, and the signer
-  ceremony describes it as a transfer, never a sale. Policy allows a
-  0-XRP offer only with the sell flag and a destination — 0-XRP offers
-  without a destination, and 0-amount bids, are refused.
-- Minting, listing, sending, buying, and bidding are separate writes —
-  each needs its own proposal hash and its own human approval.
-
-## Following artists (v0.5): favorites + what's new
-
-Entirely read-only — no proposals, no signing, no approvals.
-
-```bash
-xrpl-trade favorites add lara r… --note "Neon Drift series"
-xrpl-trade favorites add jenna r… --kind friend --label "Jenna X"
-xrpl-trade favorites list
-xrpl-trade favorites rename lara larva
-xrpl-trade favorites remove larva
-
-xrpl-trade nft-new              # new mints since the last check
-xrpl-trade nft-new --days 30    # explicit window (1-90); never moves the watermark
-xrpl-trade nft-new --limit 10   # show newest 10 per artist (default 25; 0 = no cap)
-xrpl-trade nft-new --no-safety  # skip the xrpl.to enrichment
-
-xrpl-trade fuzzy-deals            # FUZZY NFTs below the sample median ask
-xrpl-trade fuzzy-deals --threshold 30  # flag asks 30%+ below median (1-90)
-xrpl-trade fuzzy-deals --json    # machine-readable output
-```
-- `fuzzy-deals` is read-only: it scans the FUZZY community collections
-  (`fuzzybears` — the official project issuer Mike confirmed — plus
-  `fuzzy-bars`), pulls listed tokens and each token's live sell offers via
-  xrpl.to, and flags asks at least `--threshold` percent below the
-  collection's trimmed median ask (top/bottom quartiles chopped so whale
-  listings can't drag the reference). Each deal also shows its percentile
-  rank ("cheaper than N% of asks") — the honest signal when discounts look
-  dramatic. Stats are per-collection samples — never full-collection
-  facts, never "worth." Acting on a deal is the separate
-  `nft-buy --offer-index` ceremony; the scanner never buys, bids, or moves
-  funds. Market data carries the "Data by xrpl.to" credit. Every XRP figure
-  also shows its USD equivalent at the current Bitstamp XRP/USD rate
-  (XRP-denominated asks mean different dollars as XRP moves; XRP stays
-  primary, USD is parenthetical context).
-
-- Names are lowercase `[a-z0-9_-]`, 1–32 chars; addresses get the real
-  base58-checksum validation. Stored in `~/.xrpl/favorites.json`
-  (owner-only `0600`, covered by the signer's protected-file check).
-- Favorites have a `kind`: `artist` (default), `friend`, or `watch`, plus an
-  optional `label` — the plain display name shown next to the address
-  ("Jenna X (rABC…WXYZ)"). Labels accept plain letters, numbers,
-  spaces, and basic punctuation only; emoji and stylized Unicode are
-  rejected. Labels are local notes — not proof of who owns a wallet.
-- `nft-new` walks each **artist** favorite's `account_tx` for
-  `NFTokenMint`s since its per-favorite watermark (first run: last 3
-  days), then advances the watermark to the validated ledger. Friend
-  favorites are never scanned — they're just labels. `--days` is a
-  pure window scan. `--limit N` shows only the newest N mints per artist
-  (default 25, 0 = no cap); older mints beyond the cap are counted, not
-  listed, and the watermark still advances past them.
-- Each new piece shows the token ID, mint time, taxon, decoded URI, the
-  cheapest current listing price if any ("not listed" otherwise), an
-  `https://xrp.cafe/nft/<NFTokenID>` link, and a one-line xrpl.to
-  safety note (issuer scam-blocklist screen + collection/floor,
-  advisory, fail-open; max 20 enriched per run, later rows say so;
-  `--no-safety` skips). "Data by xrpl.to" credit on every run.
-- `xrpl-trade incoming [--account r…] [--watch name] [--all-watched]
-  [--limit 10] [--collection text]
-  [--min-xrp N] [--max-xrp N] [--from name-or-address] [--include-flagged]
-  [--no-safety]` — what's coming IN, read-only: (1) open NFT offers —
-  bids on your NFTs plus sell/gift offers directed at you, with a
-  per-row issuer blocklist screen and floor-vs-bid context; (2) recent
-  ledger receipts/sends from `account_tx` (direction derived from the
-  consumed offer, the validated ledger as authority). Flagged offers
-  are hidden by default (the count is shown). Counterparties render
-  through favorite labels where you have them — an unlabeled wallet
-  gets a 🏷️ "label this wallet" follow-up button. Accepting an offer
-  stays a separate `nft-buy` propose → approve → sign ceremony; offers
-  can be cancelled, so the ledger is authoritative before you act.
-  Zero-XRP offers from wallets you don't recognize print a loud
-  caution: only accept those from people you know.
-  `--watch name` / `--all-watched` read from the watched-wallet list below.
-- **Watched wallets + offer reminders** (read-only, addresses only — a
-  seed can never pass the address checksum, so one can never be stored):
-  ```bash
-  xrpl-trade watch add studio-vault r… --label "Studio Vault"
-  xrpl-trade watch list
-  xrpl-trade watch remove studio-vault
-  xrpl-trade watch check        # sweep for NEW open offers, offers only
-  ```
-  `watch check` queries the xrpl.to offers API per watched wallet, diffs
-  offer indices against a local watermark
-  (`~/.xrpl/hidden_files/watch-seen.json`, `0600`), and prints only NEW
-  offers — the first run per wallet seeds the baseline silently. An
-  hourly reminder job runs `watch check` and pings chat only when new
-  offers appear; acting on one is still the manual `nft-buy` ceremony.
-- Favorite names also work wherever a read command takes an address
-  (`nft-inventory lara`). Among writes, only `nft-send --to` accepts a
-  name — it resolves against the local favorites file (case-insensitive)
-  and prints the resolved address in the proposal; the destination is
-  hash-bound in the envelope like everything else.
+Favorites, what's new, and NFT Radar are in `references/favorites-and-radar.md`.
 
 ## Onboarding: the user profile
 
@@ -620,114 +387,8 @@ injection only, never in chat.
 
 ## Friday community giveaway
 
-Every Friday at 7:37 AM, one random entrant wins a gift — funded by the
-community, drawn in public, verifiable by anyone. This skill covers entry,
-eligibility, the draw, the gift proposal, and the announcement draft. The
-scheduled Friday run lives on a cron; every gift stays human-approved, one
-at a time — **no automatic signing or sending, ever**.
-
-The pot: the **Musegives** donation wallet
-`rnkt27oqgJiRfsuwCogqrLwYx4NNooMFdB` (public by design — publishing it is
-how people find the pot). Anyone can contribute XRP to it.
-`~/.xrpl/giveaway.json` (owner-only `0600`) holds the donation wallet and
-the opt-in tag (defaults: Musegives, tag `777`), plus `max_gift_xrp`
-(default `10` — the largest XRP gift the tool will propose) and
-`network` (default `mainnet`). Every giveaway command takes
-`--donation-wallet r…`, so community leaders can run the same flow
-against their own wallet with no code changes.
-
-### Opting in: 1 drop, destination tag 777
-
-Entry is a single Payment of exactly **1 drop** (0.000001 XRP) to the
-donation wallet with destination tag **777** — it proves the entrant owns
-the address and costs ~nothing. `profile init` offers this as its last
-question (default: skip — silence is never consent). Answering yes first
-checks for an existing on-ledger opt-in, then adds the exact
-(donation wallet, tag 777) pair to the payment destination allowlist and
-creates a normal 1-drop Payment **proposal**. The human still approves it,
-and the profile is marked opted-in (`giveaway.opt_in: true` +
-`giveaway.opt_in_tx`) only after the payment is **validated on-ledger** —
-re-run `giveaway opt-in` after approving to record it. Creating a proposal
-is never treated as opt-in.
-
-```bash
-xrpl-trade giveaway opt-in                 # check for an entry, else PROPOSE one
-xrpl-trade giveaway entrants [--donation-wallet r…]
-xrpl-trade giveaway draw [--donation-wallet r…] [--ledger-offset N]
-xrpl-trade giveaway status [--donation-wallet r…]
-```
-
-### Eligibility + the draw
-
-- `entrants` scans the donation wallet's `account_tx` for incoming
-  successful Payments of exactly 1 drop with tag 777. Each entrant needs
-  ≥1 wallet action besides the opt-in itself: `OfferCreate`,
-  `OfferCancel`, non-opt-in `Payment`, `TrustSet`, `NFTokenMint`,
-  `NFTokenCreateOffer`, `NFTokenAcceptOffer`, `NFTokenCancelOffer`.
-- `draw` waits for validated ledger index + `--ledger-offset` (default
-  20), takes that future ledger's hash, and computes
-  `sha256(ledger_hash + ":" + opt-in tx hashes in address order) mod
-  entrants`. It prints the winner, the ledger index/hash, the digest,
-  and the method — anyone can recompute it independently. **Selection
-  only: no gift proposal is built, signed, or sent.**
-- `status` shows the pot: XRP balance, nonzero trustlines, owned NFTs.
-- `draw` saves its public proof to `~/.xrpl/giveaway_last_draw.json`
-  (ledger index/hash, method, digest, winner) so the announcement can be
-  recomputed later.
-
-### Gifting the prize (always propose → human `--approve` → sign)
-
-`gift` builds the prize proposal from the donation wallet — XRP, an IOU,
-or an NFT. It never signs and never sends; the human approves that exact
-proposal hash, then the donation wallet's key signs it. Three forms:
-
-```bash
-xrpl-trade giveaway gift --to rWinner… --amount 5            # 5 XRP
-xrpl-trade giveaway gift --to rWinner… --amount 25 --ccy USD --issuer r…
-xrpl-trade giveaway gift --to rWinner… --token-id <64-hex>   # 0-XRP NFT transfer offer
-```
-
-- Exactly one of `--amount` / `--token-id`. XRP is the default currency;
-  IOU gifts need `--issuer`. NFT gifts are 0-XRP transfer offers to the
-  winner with a 24h expiry (the wallet must actually own the NFT).
-- IOU gifts are doubly fail-closed at signing: the token must already be
-  in the approved token allowlist (`approved.json`) **and** have a
-  `spend_limits` entry in the giveaway policy — both deliberate human
-  edits, so no surprise token ever leaves the pot.
-- Guards: `--to` must be a valid classic address and cannot be the
-  donation wallet itself; anything seed-like is refused with a loud STOP
-  (a seed is never a destination). XRP gifts above `max_gift_xrp` are
-  refused — the cap is raised by editing `~/.xrpl/giveaway.json`
-  deliberately, never in the heat of the moment. A winner who hasn't
-  opted in gets a warning, not a block (Mike's call can override).
-- `setup` (interactive, local): writes the narrow giveaway signer policy
-  (`~/.xrpl/giveaway_policy.json` — only `Payment` +
-  `NFTokenCreateOffer`, network-locked, XRP spend capped at
-  `max_gift_xrp`, arbitrary winner destinations since the human approved
-  the exact one). It then offers to store the donation wallet's seed:
-  the preferred path is the `XRPL_GIVEAWAY_SEED` environment variable
-  (injected from the secure vault for the exact approved moment); the
-  fallback is a hidden prompt that stores it in `~/.xrpl/giveaway.json`
-  (`0600`). Either way the seed is never printed, logged, or echoed —
-  the CLI verifies it derives the configured donation address before
-  storing anything. The local fallback is deliberate and explicit, and
-  `xrpl-sign`'s `check_protected_files` covers `giveaway.json` and the
-  giveaway policy in giveaway mode — the signer refuses to run if either
-  is not owner-only.
-- `announce [--winner r…] [--prize "5 XRP"]` prints a draft winner
-  announcement from the last draw (winner, prize, ledger index/hash,
-  method, digest, entrant count, pot address, next Friday 7:37 AM). It
-  posts nothing — the draft is for review.
-- The proposal prints its giveaway signing command:
-  `xrpl-sign --hash <hash> --approve --seed-env XRPL_GIVEAWAY_SEED
-  --policy ~/.xrpl/giveaway_policy.json` (the `--approve` flag is never
-  the approval — the human's explicit go-ahead for that exact hash is).
-
-The Friday flow: cron runs `giveaway draw` → Mike picks the prize →
-`giveaway gift` builds the proposal → he approves that exact hash → the
-signer signs with the donation wallet's key under the giveaway policy →
-a validated-ledger result closes it → `giveaway announce` drafts the
-post. `draw` never transacts, and neither does `gift` on its own.
+The giveaway flow is in `references/giveaway.md`.
+`giveaway setup` writes the narrow policy and stores a donation-wallet seed only when the operator pastes one. It does not print that seed.
 
 ## XRPresso discovery: marketplace search (read-only)
 
@@ -818,295 +479,33 @@ and every gift purchase is a payment the user signs in their own wallet
 (Xaman/Joey). Never claim to have placed a bet, and never construct a
 payment pretending it is a LuckyHash bet.
 
-## Menu presentation (standard)
+## Menu presentation
 
-When presenting this skill in chat, **always use clickable button menus
-by default** — not raw command lists. The user navigates by tapping,
-not by typing commands.
-
-**Main menu buttons:**
-- XRPL Actions
-- NFT
-- XRP News
-- 🤝 Community
-
-**XRPL Actions submenu** (tappable; Markets also as `xrpl_to.py` CLI), in ABC order:
-- 💰 Balances (`balance [address]` — XRP + trustline balances)
-- 🔎 Forensics (read-only, keyless, budgeted; `references/forensic-mode.md`):
-  - 🧬 Trace (`xrpl-trade trace r… [--depth N]` — funding-origin chain)
-  - 🔗 Links (`xrpl-trade links r… r… [--window N]` — shared counterparties,
-    issuers, tokens, control overlap)
-  - 🌊 Flow (`xrpl-trade flow r… [--window N]` — top counterparties by volume)
-  - 🖼️ NFT Trail (`xrpl-trade nft-trail <token-id>` — mint → offers → held by)
-  - 🪙 Token Trail (`xrpl-trade token-trail --issuer r… --currency CODE` —
-    issuer profile, holders, issuer-involved movers)
-  - Output discipline: `LINK:` = on-ledger fact, `NOTE:` = caveat; never
-    claims common ownership without control overlap. Known addresses render
-    `LABEL: r… — "Name" (verified)`; service-wallet links get the loud
-    false-positive caveat.
-- 📈 Markets → 📊 Market Movers (`movers --view gainers|losers|volume|trending`),
-  🔍 Token Lookup (`token-lookup --issuer … --currency …`), 🧾 Explain a
-  Transaction (`tx-explain --hash …`), 🐋 Whale Watch
-  (`whale-watch --issuer r… --currency … [--limit 10]`)
-- 👛 Wallets (local-only, explicit opt-in):
-  - `wallet create` — generate a fresh wallet; seed stored 0600, never displayed
-  - `wallet backup` — ONE-TIME seed display for write-down
-  - `setup` — onboarding: new wallet or address+network
-
-**🤝 Community submenu** (in ABC order; each opens its own focused submenu):
-- 🎨 Artists — following artists (`favorites` add/list/rename/remove,
-  `nft-new` — new mints from followed artists; entirely read-only).
-  📡 NFT Radar (`xrpl-trade nft-radar [--days N] [--limit N] [--json]` —
-  new mints across all 307 curated artists, signal-only; read-only).
-  Curated reference: `references/artist-directory.json` (307 artists —
-  Mike's xrp.cafe follow list, 2026-10-05) and
-  `references/xrpcafe-collections.json` (39 xrp.cafe collections
-  with slugs, URLs, and cover images)
-- ☕ Coffee & Crypto (see **Coffee & Crypto submenu** below)
-- 🎙️ Dip a Toe — Melissa's XRP community YouTube show (@dipatoe;
-  X @worldbefree888)
-- 🌾 Farmers Union (`xrpl-trade farm` — $FARM community helper: about, links,
-  qualification check, treasury, cropdusting board; read-only)
-- 🐻 Fuzzy (see **🐻 Fuzzy submenu** below)
-- 🔭 ShadowWatch (https://shadowwatch.xyz/ — XRP Man's XRPL whale-tracking
-  dashboard: live ledger stream, wallet graph, bubble map, HVT watchlist,
-  wallet identity resolver)
-- ⚡ xBoost (X Spaces tipping and engagement layer on XRPL)
-- 🏛️ XRPLF (XRPL Foundation)
-
-**Coffee & Crypto submenu:**
-- 🎰 LuckyHash (`references/luckyhash.md`; trigger "luckyhash menu") —
-  labeled deep links for Dice, Plinko, Slots, Scratchcards, Moonshot,
-  Fireworks, Hex Wheel, ODJ jackpot, Gifts (buy/redeem), Leaderboard,
-  How it works. Hard boundary: the assistant cannot buy or play — no public
-  API; every bet and gift purchase is a payment the user signs in their own
-  wallet (Xaman/Joey). Never claim to have placed a bet.
-
-**🐻 Fuzzy submenu:**
-- 🔍 FUZZY Deals (`xrpl-trade fuzzy-deals [--threshold 20]` — FUZZY NFTs
-  listed below the trimmed median ask across the fuzzybears + fuzzy-bars
-  collections; read-only, buying stays the separate `nft-buy` ceremony)
-- 📖 FUZZY Lore (https://fuzzylore.com/ — community-built lore site)
-- 🃏 FUZZY TCG Club (https://fuzzytcg.club/ — free-to-play community
-  trading card game: multiplayer duels, tower climbs, tournaments)
-- 🏪 $FUZZY Card Shop (https://fuzzycardshop.com/ — community-run shop,
-  hosts the TCG club)
-- 🛒 XRPresso physicals (`xrpl-trade xrpresso listings --q fuzzy
-  --sort price_asc` — FUZZY physicals on XRPresso, cheapest first)
-
-**NFT submenu** adds:
-- Top Collections (`top-collections [--sort vol24h|trendingScore]`)
-- 🐻 FUZZY Deals (`xrpl-trade fuzzy-deals [--threshold 20]` — FUZZY NFTs
-  listed below the sample median ask; read-only, buying stays the
-  separate `nft-buy` ceremony)
-- 📥 Incoming (`xrpl-trade incoming` — bids on your NFTs, sell/gift
-  offers to you, recent ledger receipts; per-row issuer screens;
-  flagged offers hidden by default; friend labels on counterparties)
-
-Market data is read-only and carries a "Data by xrpl.to" credit on every
-surface. Movers print volume + market cap on each row — a +1300%
-micro-cap reads as what it is; discovery, not advice, no trade buttons
-on mover rows. `tx-explain` shows ledger-derived facts and only prints a
-plain-English summary when xrpl.to actually returns one. Whale Watch is
-flow discovery, not advice — 24h volumes are wash-tradable, and rows
-show trade counts + P&L so thin activity reads as thin. Incoming offers
-can be cancelled: the validated ledger is authoritative before acting,
-and accepting an offer is always the separate `nft-buy` ceremony.
-
-Each button opens its own focused submenu of tappable exact-command
-buttons. After showing command results, attach a fresh set of the most
-useful follow-up commands as buttons.
-
-The `xrpl-trade menu` command provides the same navigation in a
-terminal (arrow-key navigable). But in chat, buttons are the standard.
+Say `menu` for the button menu. The rules are in `references/menu-presentation.md`.
 
 ## Commands
 
-Reading (no seed, no proposals):
-
-- `balance [address]` — XRP + trustline balances
-- `quote --pair ARMY/XRP` — order book top-of-book, any pair
-- `offers [address]` — open offers
-- `pairs` — approved pairs
-- `movers [--view gainers|losers|volume|trending] [--limit 10]` — xrpl.to
-  token rankings (read-only). Rows show XRP price, 24h %, 24h volume,
-  and market cap. "Data by xrpl.to" credit on every row set.
-- `token-lookup --issuer r… --currency CODE` — one-screen token brief:
-  XRP + USD price, market cap, holders, trustlines, 24h/7d change,
-  24h volume, verified badge, plus the scam-check + risk score.
-  Read-only; carries the "Data by xrpl.to" credit.
-- `tx-explain --hash <64-hex>` — ledger-derived facts for a transaction
-  (type, account, status, fee, date). Prints xrpl.to's plain-English
-  summary only when the API actually returns one — never invented.
-- `inspect-token --currency FUZZY --issuer r…` — issuer risk: domain,
-  transfer fee, global-freeze / no-freeze flags
-- `token-safety --currency FUZZY --issuer r…` — xrpl.to scam blocklist
-  check + 1–10 token risk score for an IOU (read-only, no key needed).
-  Advisory only: a hit is LOUD but never blocks; the human decides.
-  Buy/sell proposals run this automatically on every IOU leg
-  (`--no-safety` skips). Surfaces carry a "Data by xrpl.to" credit.
-- `xrpl_to.py nft-safety --nft-id <64-hex> [--ask-xrp 40]` — NFT
-  buy-side safety: issuer scam-blocklist screen, tracked collection +
-  floor (24h-ago floor), asking-price × floor multiple, cheapest live
-  ask, and approx last sale from ledger history. `nft-buy` and `nft-bid`
-  proposals run this automatically (`--no-safety` skips); every line is
-  advisory — floors and last-sales can be wash-traded, and the on-ledger
-  seller/issuer/URI/taxon verification stays the authority. Fail-open:
-  an unreachable API prints UNAVAILABLE (unknown, not clean).
-- `xrpl_to.py whale-watch --issuer r… --currency CODE [--limit 10]` —
-  token trader discovery (read-only): top wallets ranked by 24h volume,
-  with 24h trade counts and 24h P&L. Flow discovery, not advice —
-  volumes are wash-tradable; carries the "Data by xrpl.to" credit.
-- `xrpl_to.py incoming-offers --account r… [--limit 10]
-  [--collection text] [--min-xrp N] [--max-xrp N] [--from name-or-address]
-  [--include-flagged] [--no-safety]` — open NFT offers for an account:
-  bids on its NFTs plus sell/gift offers directed at it, newest first,
-  with floor context and a per-row issuer blocklist screen. Flagged
-  offers hidden by default (count shown). `xrpl-trade incoming` wraps
-  this with recent ledger receipts and your favorite labels.
-  Read-only; "Data by xrpl.to" credit.
-- `xrpl-check url <url> [--no-live] [--json]` — TrustLink phishing check,
-  free and local: verdict (known-good / suspicious-lookalike / unknown /
-  known-bad), SAFE-ISH / CAUTION / DANGER risk level, and coded findings
-  (lookalike domains, impersonator handles, urgency lures, seed asks,
-  drainer pages, young domains, redirect chains). Curated data ships with
-  the skill (`references/trustlink-data.json`) — as fresh as your installed
-  version; the check warns past the 60-day review window. Seeds and private
-  keys are refused before any processing, never logged. `--no-live` skips
-  the redirect-trace + domain-age fetches for fully offline use.
-- `xrpl-check handle @name` — is this X handle verified, an impersonator,
-  or unknown?
-- `xrpl-check token <issuer> --chain xrpl|solana` / `xrpl-check wallet
-  <address> [--chain xrpl|solana]` — TrustDB identity/label for a token
-  issuer or wallet. "Not in the database" means not verified, never safe.
-- `xrpl-check community <id>` / `xrpl-check member <id> --handle @x |
-  --wallet r… [--chain xrpl|solana]` — community profile and membership
-  check against the curated roster (confirmed / not_met / unknown / stale).
-  Powered by TrustLink: the same pipeline as the paid API
-  (https://trust.terramike.com), which serves always-fresh data per call.
-- `xrpl_to.py keys create --yes` — mint a free xrpl.to API key via a
-  wallet-signed login message (nothing submitted on-chain; key stored
-  0600 at `~/.xrpl/xrplto.json`). Raises rate limits; most endpoints
-  work without a key. Creating a key accepts xrpl.to's API terms.
-  `keys list` shows keys on the wallet; `keys revoke --id … --yes`
-  revokes one (both wallet-signed; free tier allows one active key,
-  so revoke-then-create rotates).
-- `plan-trade --pair ARMY/XRP --side buy --amount 1000 --price 0.005` —
-  estimated fill, price impact vs mid, max spend (read-only)
-- `farm about` — Farmers Union ($FARM) explainer: harvesting, crop
-  dusting, the Farm Assured Guarantee, how to qualify (static,
-  `references/farm.md`, no network)
-- `farm links` — clean link bundle: farmerunion.meme, the barn trustline
-  checker, the $FARM token page, the Animal Fam NFT collection, issuer +
-  treasury addresses (static, no network)
-- `farm qualify [address]` — 123,000 FARM qualification check: FARM
-  balance + LP-token FARM-equivalent (each AMM valued individually via
-  `amm_info`, fail-open) vs the threshold, plus a trustline audit against
-  the cropdusting board. Defaults to the first profile address. Read-only.
-- `farm treasury` — live read of the 4 published Farmers Union wallets
-  (XRP + FARM each, fail-open per wallet) vs their published ~$148,150
-  site figure (2026-09-30). Read-only.
-- `farm dustings [--refresh]` — the cropdusting board: upcoming ("set
-  your trustlines") vs completed, from a lazy local cache
-  (`~/.xrpl/farm-dustings.json`, refreshed when older than 7 days).
-  Every render prints its data-as-of date. The Union's own disclaimer —
-  inclusion is not an endorsement — is printed too; screen any issuer
-  with `token-safety` before trusting it. Read-only.
-- Every `farm` command ends with a one-paragraph shareable summary
-  (farmers research *and* post with this skill).
-- `reconcile --hash …` — validated outcome of a submitted transaction
-- `trace <address> [--depth N]` — funding-origin trace: who funded this
-  account, and who funded them (default 2 hops, max 3). Prints first-seen
-  ledger, funder, amount, tx hash, plus control signals (RegularKey,
-  signer list, domain). Light by design: hard RPC-call budget, 1h local
-  cache, fail-open. Output discipline: `LINK:` = on-ledger fact,
-  `NOTE:` = caveat; never claims ownership.
-- `links <addressA> <addressB> [--window N]` — shared counterparties,
-  shared trustline issuers, shared tokens (with issuer transfer-fee /
-  freeze flags), and control overlap (same RegularKey, shared
-  signer-list members) from the N most recent validated txs per account
-  (default 200, max 500). Exchange hot wallets can appear as shared
-  counterparties — the known-address label registry (`LABEL:` lines,
-  `references/known-labels.json` + your `~/.xrpl/labels.local.json`
-  overrides) marks them, and every command reminds you that links
-  through service wallets are usually plumbing, never proof of common
-  control. See `references/forensic-mode.md`.
-- `flow <address> [--window N]` — top counterparties by volume in/out
-  over the recent window (default 200, max 500): delivered amounts for
-  Payments, executed fills attributed to makers for DEX trades. Ranked
-  by XRP volume; wash-tradable, so it's discovery, not proof.
-- `nft-trail <token-id>` — NFT provenance: mint → offers →
-  transfers/sales → currently held by (via `nft_history`, with a
-  bounded issuer-scan fallback). On-ledger chain only.
-- `token-trail --issuer r… --currency CODE [--window N]` — issuer
-  profile (domain, transfer fee, freeze flags), top holders from a
-  bounded — explicitly partial — trustline scan, and top movers by
-  token volume in the window (issuer-involved flow only — issuance,
-  redemption, rippling through the issuer; ordinary holder-to-holder
-  transfers are invisible to this scan).
-- `nft-inventory [r…]` — every NFT owned by an account (read-only);
-  accepts a favorite name too (`nft-inventory lara`)
-- `favorites add|remove|list|rename` — named watchlist of artist wallets
-  (local only, no network, no approval)
-- `nft-new [--days N]` — new mints from your favorites since the last
-  check, with listing prices and xrp.cafe links (read-only)
-- `xrpresso listings|nfts|auctions|listing|categories|stats` — search
-  the XRPresso marketplace (read-only, no key, no signup); results
-  print deep links so you buy/bid in XRPresso's UI
-- `giveaway entrants|draw|status|announce [--donation-wallet r…]` —
-  opt-ins + eligibility, the deterministic draw (**selection only — no
-  gift is built or sent**), the pot: XRP balance, nonzero trustlines,
-  NFT inventory, and a draft winner announcement from the last draw
-  (read-only, nothing posted)
-
-Local wallet management (local-only, explicit opt-in — see "Wallets"):
-
-- `wallet create [--force]` — generate a fresh wallet; seed stored 0600,
-  never displayed
-- `wallet backup` — ONE-TIME seed display for write-down; requires typing
-  `I HAVE WRITTEN IT DOWN`, records `seed_backed_up` in config.json
-
-Writing (always propose → human `--approve` → sign):
-
-- `buy --pair P --amount A --price Px` — buy BASE with QUOTE at limit
-- `sell --pair P --amount A --price Px` — sell BASE for QUOTE at limit
-- `trustline --pair P --limit N` — trustline the pair's base token
-- `cancel --seq N` — cancel an open offer
-- `send --to r… --amount A --ccy XRP [--destination-tag N]`
-- `nft-send --token-id <64-hex> --to <favorite|r…>` — gift an owned NFT
-  (0-XRP transfer offer; recipient must accept before expiry)
-- `giveaway opt-in [--donation-wallet r…]` — PROPOSE the 1-drop entry
-  payment to the donation wallet (tag 777); recorded as opted-in only
-  after the payment validates on-ledger
-- `giveaway gift --to r… --amount A [--ccy XRP] [--issuer r…]` |
-  `--token-id <64-hex> [--donation-wallet r…]` — PROPOSE the prize from
-  the donation wallet (XRP under `max_gift_xrp`, an IOU, or a 0-XRP NFT
-  transfer offer); signs only after the human approves that exact hash
-  with the donation wallet's key (`--seed-env XRPL_GIVEAWAY_SEED`) under
-  the giveaway policy
-
-`--amount` is always BASE units, `--price` is always QUOTE per BASE.
-`--pair NAME` resolves through `~/.xrpl/approved.json` (copy
-`approved.example.json` there and add vetted issuers). Explicit
-`--base/--quote/--base-issuer/--quote-issuer` also works — but the signer
-still enforces the allowlist on the resulting tokens.
+The command catalog is in `references/commands.md`.
+The TrustLink checker is not part of this skill.
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-locked.txt
 xrpl-trade setup            # onboarding: generate a wallet, or register an address
 xrpl-sign init-policy       # writes ~/.xrpl/policy.json (testnet-locked)
 ```
 
-The signer reads the seed **only** from `XRPL_SEED`, provided by your
-secret manager or the Muse vault after human approval. Fund a testnet
-wallet: `xrpl-trade faucet --network testnet`.
+`xrpl-sign` reads a seed from the signing profile's env var (often
+`XRPL_SEED`), from a testnet file credential, from `~/.xrpl/autopilot.json`
+after autopilot enable, or from `~/.xrpl/giveaway.json` for a giveaway seed
+on testnet. It signs only with `--approve` of the exact hash and refuses
+while read-only. Do not paste a seed into chat. Fund a testnet wallet:
+`xrpl-trade faucet --network testnet`.
 
 ## Wallets (v0.7): vault-only mainnet, local testnet
 
-Mainnet keys are created and backed up in your vault (password manager),
-outside this tool — the CLI refuses to create or display mainnet seeds:
+`wallet create` and `wallet backup` refuse when the selected network is mainnet. `setup` can store a seed for the network the operator types, including mainnet, without displaying it, and that file then blocks mainnet signing until `wallet forget-seed`:
 
 - `wallet create --network mainnet` → refused (use the vault).
 - `wallet backup --network mainnet` → refused (the vault is the backup).
@@ -1138,7 +537,7 @@ card — fund it first via the companion `changelly_buy` skill. See
 `references/fiat-onramp.md` for the exact commands.
 
 The on-ramp sits **outside** the propose → approve → sign boundary: it only
-generates a buy link, never sees the seed, and never submits ledger
+generates a buy link, does not read a wallet seed, and never submits ledger
 transactions. The buyer completes KYC and payment on Changelly; once the XRP
 lands, continue with the normal ceremony above.
 

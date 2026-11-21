@@ -50,7 +50,7 @@ re-prompts. Write the file temp-file + atomic rename, mode `0600`.
 
 Walk them through these in order; everything here needs zero keys:
 
-1. **Install** — `pip install -r requirements.txt`
+1. **Install** — `pip install -r requirements-locked.txt`
    (from https://github.com/terramike/xrpl-muse-skill)
 2. **Wallet** — `xrpl-trade setup`: generate a fresh wallet or register
    an existing watch-only address.
@@ -200,10 +200,9 @@ Buttons: `[Show advanced]` `[Skip]`
     never the main vault wallet. Enable: `xrpl-trade autopilot enable`,
     typing `ENABLE AUTOPILOT`. Seed at a hidden terminal prompt, never
     in chat.
-  - **Autonomous bot**: separate wallet, dry-run only until P1,
-    approval is per-plan not per-trade. `xrpl-trade autonomous setup`
-    (they run it themselves), then the plan-hash approval ceremony.
-    Full guide: `references/autonomous-setup.md`.
+  - **Autonomous bot**: not included in this build (local-only, dry-run).
+    `xrpl-trade autonomous` exits with that sentence. There is no setup
+    guide in this tree.
   - **Giveaways**: community leaders only — their own donation wallet,
     `giveaway setup` writes the narrow giveaway policy. Every gift stays
     human-approved, one at a time, no auto-send ever.

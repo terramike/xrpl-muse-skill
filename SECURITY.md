@@ -29,8 +29,8 @@ validated ledger result before relying on it.
 
 ## Safety model (v0.7)
 
-The skill is split into a proposer (`xrpl-trade`, never sees the seed) and a
-policy-gated signer (`xrpl-sign`, the only program that touches the seed).
+The skill is split into a proposer (`xrpl-trade`, which does not submit; the propose path does not read a seed) and a
+policy-gated signer (`xrpl-sign`, which signs a proposal only with `--approve` of the exact hash and refuses while read-only). Opt-in commands in `xrpl-trade` can store a seed, and wallet backup or autopilot's backup ceremony can display one once.
 Every write is a hash-bound proposal envelope (v4): the approval hash covers
 the network, account, action, creation time, policy version, bound signing
 profile, policy SHA-256 digest, and the canonical XRPL binary of the complete

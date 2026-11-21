@@ -1,10 +1,11 @@
-# xrpl-muse-skill v0.14.1
+# xrpl-muse-skill v0.15.0
 
-Trade the XRP Ledger from the terminal — any token pair — with a hard safety
-boundary between **proposing** a trade and **signing** it.
+Keyless research and safety for the XRP Ledger, for any agent with a
+terminal. Trading is the second job, behind a hard boundary between
+**proposing** a transaction and **signing** it.
 
-Built for AI agents (Muse, Grok, OpenClaw-style bots — anything with a
-terminal).
+Built for Muse, Grok, OpenClaw-style bots, and anything else with a
+terminal.
 
 **HOL Guard coverage:** [XRPL Muse Skill protection](https://hol.org/guard/extensions/command.xrpl-muse-skill)
 — the published HOL Guard extension profile mapping the proposal, signing,
@@ -18,11 +19,13 @@ This skill splits the job in two:
 - **`xrpl-trade`** builds the transaction, autofills it against the live
   network, shows you *everything* (account, network, assets + issuers,
   amounts, limit price, max spend, fee, expiry), seals it in a **hash-bound
-  proposal envelope**, and stops. It never sees your seed. It cannot submit.
-- **`xrpl-sign`** is the only program that touches the seed. It re-verifies
-  the envelope, enforces the policy (spend caps, allowlisted pairs and
-  destinations, fee cap), and signs **only** with explicit human approval
-  of that exact proposal hash.
+  proposal envelope**, and stops. The propose path does not read a seed and
+  does not submit. Opt-in commands in this program can store a seed.
+  `wallet backup` and autopilot's backup ceremony can display one once.
+- **`xrpl-sign`** re-verifies the envelope, enforces the policy (spend caps,
+  allowlisted pairs and destinations, fee cap), and signs **only** with
+  explicit human approval of that exact proposal hash. It refuses while
+  read-only.
 
 ```bash
 xrpl-trade buy --pair XRP/RLUSD --amount 10 --price 1.50
@@ -66,6 +69,10 @@ xrpl-trade amendments        # live amendment votes + majority countdown
 xrpl-trade stablecoin RLUSD  # supply by chain + price (via DefiLlama)
 xrpl-trade oracle XRP USD    # on-ledger XLS-47 price feeds (Band + DIA)
 ```
+
+## What's new in v0.15.0
+
+Cleanup release. The locked install works on Python 3.12 and 3.13 on linux x86_64, and offline CI runs on both. The manual no longer documents a TrustLink checker that is not in this skill. The Clavi5 beta client is not installed with the skill. Docs match opt-in local signing: a fresh install is read-only until `go live`. Work since v0.14.1 that this notes for the first time: HOL Guard profile links, artist-directory updates, NFT Radar, and the public `fuzzy-deals` scanner.
 
 ## What's new in v0.14.1
 
@@ -156,7 +163,7 @@ Every command documents itself: `xrpl-trade <command> --help`.
 Start with [`llms.txt`](llms.txt) — the curated entry point: what this is,
 the files that matter, the safety invariants. [`AGENTS.md`](AGENTS.md) has
 contributor guidance (tests, conventions, what never to touch).
-[`SKILL.md`](SKILL.md) is the full operator manual (971 lines).
+[`SKILL.md`](SKILL.md) is the operator manual (564 lines). Long command, menu, NFT, giveaway, and favorites sections live in `references/` and are linked from that file.
 
 ## Deployment profiles
 
